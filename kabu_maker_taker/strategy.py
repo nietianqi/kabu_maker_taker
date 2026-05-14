@@ -48,9 +48,17 @@ def entry_layer_diagnostics(
     momentum = sign * signal.micro_momentum_raw >= config.mom_long_threshold
     opposite_light = _opposite_depth(snapshot, direction) <= _same_side_depth(snapshot, direction)
     integrated = sign * signal.integrated_ofi > 0.0
+    # Microprice streak bonus (+1 direction score when recent microprice consistently moves our way)
+    streak_min = config.microprice_streak_min
+    streak_bonus = (
+        1 if streak_min > 0 and (
+            (sign > 0 and signal.microprice_up_streak >= streak_min)
+            or (sign < 0 and signal.microprice_down_streak >= streak_min)
+        ) else 0
+    )
     return EntryLayerDiagnostics(
         direction=direction,
-        direction_score=(2 if book else 0) + (2 if tilt else 0),
+        direction_score=(2 if book else 0) + (2 if tilt else 0) + streak_bonus,
         confirmation_score=(2 if lob else 0) + (3 if tape else 0),
         trigger_score=2 if momentum else 0,
         filter_score=(1 if opposite_light else 0) + (1 if integrated else 0),
@@ -196,12 +204,29 @@ class MakerStrategy:
         working_side: int,
         working_price: float,
         market_state: MarketState = MarketState.NORMAL,
+        *,
+        current_spread: float = 0.0,
+        order_age_ns: int = 0,
     ) -> str:
-        """Return a non-empty string if the working maker order should be cancelled."""
+        """Return a non-empty string if the working maker order should be cancelled.
+
+        Urgent market-quality checks (abnormal_market, spread_expanded) are evaluated
+        before the min-order-age guard so they can fire immediately on order placement.
+        Signal-based cancels (alpha, ofi, book, microprice, fair) are suppressed until
+        the order has been alive for at least min_order_age_ms milliseconds.
+        """
+        # Urgent: abnormal market state
         if market_state == MarketState.ABNORMAL:
             return "abnormal_market"
         sign = working_side
         if sign == 0:
+            return ""
+        # Urgent: spread expanded beyond acceptable threshold
+        if current_spread > 0 and self.config.spread_expanded_ticks > 0:
+            if current_spread / self.tick_size >= self.config.spread_expanded_ticks:
+                return "spread_expanded"
+        # Min order age guard — suppress signal-based cancels during order's min lifetime
+        if self.config.min_order_age_ms > 0 and 0 < order_age_ns < self.config.min_order_age_ms * 1_000_000:
             return ""
         if sign * signal.composite < -self.config.alpha_exit_threshold:
             return "alpha_flip"

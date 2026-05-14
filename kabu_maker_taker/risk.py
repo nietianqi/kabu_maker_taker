@@ -15,6 +15,9 @@ class RiskManager:
         self.lot_size = max(lot_size, 1)
         self._consecutive_losses: int = 0
         self._cooling_until_ns: int = 0
+        # Daily loss tracking — resets at JST midnight
+        self._daily_pnl: float = 0.0
+        self._daily_date: str = ""  # "YYYY-MM-DD" in JST
 
     def can_enter(
         self,
@@ -27,6 +30,9 @@ class RiskManager:
     ) -> tuple[bool, str]:
         if not decision.allow:
             return False, decision.reason
+        # Daily loss limit
+        if self.config.daily_loss_limit > 0 and self._daily_pnl <= -self.config.daily_loss_limit:
+            return False, "daily_loss_limit"
         # Consecutive loss cooldown
         if self.config.consecutive_loss_limit > 0:
             if self._consecutive_losses >= self.config.consecutive_loss_limit:
@@ -54,7 +60,14 @@ class RiskManager:
             return False, "inventory_limit"
         return True, "ok"
 
-    def record_trade_result(self, won: bool, now_ns: int) -> None:
+    def record_trade_result(self, won: bool, now_ns: int, *, pnl: float = 0.0) -> None:
+        # Daily PnL reset at JST midnight
+        if now_ns > 0:
+            today = datetime.fromtimestamp(now_ns / 1_000_000_000, JST).strftime("%Y-%m-%d")
+            if today != self._daily_date:
+                self._daily_date = today
+                self._daily_pnl = 0.0
+        self._daily_pnl += pnl
         if won:
             self._consecutive_losses = 0
         else:
@@ -74,11 +87,22 @@ class RiskManager:
         if now_ns <= 0:
             return True
         now = datetime.fromtimestamp(now_ns / 1_000_000_000, JST).time()
-        start_hour, start_minute = _parse_hhmm(self.config.open_start_hhmm)
-        end_hour, end_minute = _parse_hhmm(self.config.open_end_hhmm)
-        start = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
-        end = now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
-        return start <= now <= end
+        # Window 1 (morning, e.g. 09:00–11:30)
+        s1h, s1m = _parse_hhmm(self.config.open_start_hhmm)
+        e1h, e1m = _parse_hhmm(self.config.open_end_hhmm)
+        start1 = now.replace(hour=s1h, minute=s1m, second=0, microsecond=0)
+        end1 = now.replace(hour=e1h, minute=e1m, second=0, microsecond=0)
+        if start1 <= now <= end1:
+            return True
+        # Window 2 — optional (e.g. TSE afternoon 12:30–15:30)
+        if self.config.open_start_hhmm_2 and self.config.open_end_hhmm_2:
+            s2h, s2m = _parse_hhmm(self.config.open_start_hhmm_2)
+            e2h, e2m = _parse_hhmm(self.config.open_end_hhmm_2)
+            start2 = now.replace(hour=s2h, minute=s2m, second=0, microsecond=0)
+            end2 = now.replace(hour=e2h, minute=e2m, second=0, microsecond=0)
+            if start2 <= now <= end2:
+                return True
+        return False
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:

@@ -79,12 +79,19 @@ class CombinedMakerTakerStrategy:
             exit_intent = self._track_intent(exit_intent, role=ORDER_ROLE_EXIT, now_ns=ts)
 
         if self.entry_order_active:
-            entry_cancel_signal = self.maker.calc_cancel_reason(
-                signal,
-                self._working_entry_side,
-                self._working_entry_price,
-                market_state,
-            ) if self._working_entry_side != 0 else ""
+            if self._working_entry_side != 0:
+                entry_orders = self.orders.active_by_role(ORDER_ROLE_ENTRY)
+                order_age_ns = ts - entry_orders[-1].submitted_ts_ns if entry_orders else 0
+                entry_cancel_signal = self.maker.calc_cancel_reason(
+                    signal,
+                    self._working_entry_side,
+                    self._working_entry_price,
+                    market_state,
+                    current_spread=snapshot.spread,
+                    order_age_ns=order_age_ns,
+                )
+            else:
+                entry_cancel_signal = ""
             result = StrategyResult(
                 None,
                 EntryDecision(False, "working_entry"),
@@ -285,7 +292,9 @@ class CombinedMakerTakerStrategy:
         self.position.qty = max(0, self.position.qty - qty)
         if self.position.qty == 0:
             won = (price > prev_avg) if prev_side > 0 else (price < prev_avg)
-            self.risk.record_trade_result(won, now_ns)
+            # pnl: signed realized profit in price units × qty (positive = win)
+            pnl = (price - prev_avg) * qty * prev_side
+            self.risk.record_trade_result(won, now_ns, pnl=pnl)
             self.position = PositionState()
             self.lollipop.on_exit_fill()
             return "exit"

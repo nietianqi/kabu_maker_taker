@@ -112,6 +112,12 @@ class StrategyConfig:
     max_half_spread_ticks: float = 2.0
     # v2: reduce order qty by half when vol_expansion=True
     vol_aware_sizing: bool = False
+    # v2: cancel signal — spread (ticks) above which spread_expanded is triggered (0 = disabled)
+    spread_expanded_ticks: float = 4.0
+    # v2: suppress signal-based cancels within N ms of order placement (0 = disabled)
+    min_order_age_ms: int = 100
+    # v2: microprice streak (+1 direction score when streak >= this; 0 = disabled)
+    microprice_streak_min: int = 3
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "StrategyConfig":
@@ -147,6 +153,9 @@ class StrategyConfig:
             mid_half_spread_ticks=float(payload.get("mid_half_spread_ticks", 1.0)),
             max_half_spread_ticks=float(payload.get("max_half_spread_ticks", 2.0)),
             vol_aware_sizing=bool(payload.get("vol_aware_sizing", False)),
+            spread_expanded_ticks=float(payload.get("spread_expanded_ticks", 4.0)),
+            min_order_age_ms=int(payload.get("min_order_age_ms", 100)),
+            microprice_streak_min=int(payload.get("microprice_streak_min", 3)),
         )
 
 
@@ -162,6 +171,12 @@ class RiskConfig:
     # Consecutive loss cooldown (0 = disabled)
     consecutive_loss_limit: int = 0
     cooling_seconds: int = 120
+    # Daily loss limit in JPY (0 = disabled; resets at JST midnight)
+    daily_loss_limit: float = 0.0
+    # TSE split session: second window (empty = single window)
+    # e.g. open_start_hhmm_2="12:30", open_end_hhmm_2="15:30" for TSE afternoon
+    open_start_hhmm_2: str = ""
+    open_end_hhmm_2: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "RiskConfig":
@@ -176,6 +191,9 @@ class RiskConfig:
             open_end_hhmm=str(payload.get("open_end_hhmm", "15:25")),
             consecutive_loss_limit=int(payload.get("consecutive_loss_limit", 0)),
             cooling_seconds=int(payload.get("cooling_seconds", 120)),
+            daily_loss_limit=float(payload.get("daily_loss_limit", 0.0)),
+            open_start_hhmm_2=str(payload.get("open_start_hhmm_2", "")),
+            open_end_hhmm_2=str(payload.get("open_end_hhmm_2", "")),
         )
 
 
