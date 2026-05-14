@@ -16,5 +16,6 @@ env/
 logs/
 
 .claude/
+.idea/
 .DS_Store
 Thumbs.db

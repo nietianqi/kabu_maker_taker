@@ -50,7 +50,13 @@
     "open_start_hhmm": "09:00",
     "open_end_hhmm": "11:30",
     "open_start_hhmm_2": "12:30",
-    "open_end_hhmm_2": "15:30"
+    "open_end_hhmm_2": "15:30",
+    "max_entry_orders_per_minute": 0,
+    "max_cancel_requests_per_minute": 0,
+    "api_error_limit": 0,
+    "api_cooling_seconds": 120,
+    "fee_per_share": 0.0,
+    "slippage_ticks_default": 0.0
   },
   "signals": {
     "book_depth_levels": 5,
@@ -86,4 +92,3 @@
     "abnormal_price_jump_ticks": 4.0
   }
 }
-

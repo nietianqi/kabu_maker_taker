@@ -63,6 +63,7 @@ class DailyLossLimitTests(unittest.TestCase):
     def test_no_block_when_limit_disabled(self) -> None:
         rm = _risk(daily_loss_limit=0.0, max_spread_ticks=5.0)
         rm._daily_pnl = -9999.0
+        rm._daily_date = "1970-01-01"
         ok, reason = rm.can_enter(
             snapshot=_snapshot(), decision=_decision(),
             position=PositionState(), now_ns=1_000_000_000, expected_price=101.0,
@@ -73,6 +74,7 @@ class DailyLossLimitTests(unittest.TestCase):
         rm = _risk(daily_loss_limit=5000.0, max_spread_ticks=5.0)
         # Force the daily pnl below the limit
         rm._daily_pnl = -5000.0
+        rm._daily_date = "1970-01-01"
         ok, reason = rm.can_enter(
             snapshot=_snapshot(), decision=_decision(),
             position=PositionState(), now_ns=1_000_000_000, expected_price=101.0,
@@ -83,6 +85,7 @@ class DailyLossLimitTests(unittest.TestCase):
     def test_allows_when_just_below_limit(self) -> None:
         rm = _risk(daily_loss_limit=5000.0, max_spread_ticks=5.0)
         rm._daily_pnl = -4999.0
+        rm._daily_date = "1970-01-01"
         ok, reason = rm.can_enter(
             snapshot=_snapshot(), decision=_decision(),
             position=PositionState(), now_ns=1_000_000_000, expected_price=101.0,

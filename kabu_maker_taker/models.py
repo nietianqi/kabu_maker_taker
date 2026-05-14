@@ -289,6 +289,7 @@ class StrategyResult:
     # Outbound signal to execution layer: non-empty → cancel the working entry order.
     # Named distinctly from OrderState.cancel_reason (which records what the broker did).
     entry_cancel_signal: str = ""
+    entry_cancel_blocked_reason: str = ""
     market_state: MarketState = MarketState.NORMAL
 
     def to_dict(self) -> dict[str, Any]:
@@ -300,6 +301,7 @@ class StrategyResult:
             "confirm_progress": self.confirm_progress,
             "signal": asdict(self.signal) if self.signal else None,
             "entry_cancel_signal": self.entry_cancel_signal,
+            "entry_cancel_blocked_reason": self.entry_cancel_blocked_reason,
             "market_state": self.market_state.value,
         }
 

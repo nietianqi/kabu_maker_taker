@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .config import AppConfig
 from .lollipop import LollipopTPManager
+from .metrics import MetricsCollector
 from .models import (
     BoardSnapshot,
     BrokerFillEvent,
@@ -41,6 +42,7 @@ class CombinedMakerTakerStrategy:
         self.lollipop = LollipopTPManager(config.lollipop, config.tick_size, config.lot_size)
         self.market_state_detector = MarketStateDetector(config.market_state, config.tick_size)
         self.orders = OrderLedger()
+        self.metrics = MetricsCollector(tick_size=config.tick_size)
         self.last_result: StrategyResult | None = None
         self.entry_order_active = False
         self._working_entry_side: int = 0
@@ -65,8 +67,8 @@ class CombinedMakerTakerStrategy:
 
         market_state = self.market_state_detector.update(snapshot, ts)
         signal = self.signals.on_board(snapshot)
+        self.metrics.on_board(snapshot)
 
-        # Always tick the lollipop TP manager first — it manages exit for open positions
         lollipop_action = self.lollipop.tick(
             snapshot,
             self.position,
@@ -79,10 +81,12 @@ class CombinedMakerTakerStrategy:
             exit_intent = self._track_intent(exit_intent, role=ORDER_ROLE_EXIT, now_ns=ts)
 
         if self.entry_order_active:
+            entry_cancel_signal = ""
+            entry_cancel_blocked_reason = ""
             if self._working_entry_side != 0:
                 entry_orders = self.orders.active_by_role(ORDER_ROLE_ENTRY)
                 order_age_ns = ts - entry_orders[-1].submitted_ts_ns if entry_orders else 0
-                entry_cancel_signal = self.maker.calc_cancel_reason(
+                raw_cancel_signal = self.maker.calc_cancel_reason(
                     signal,
                     self._working_entry_side,
                     self._working_entry_price,
@@ -90,8 +94,16 @@ class CombinedMakerTakerStrategy:
                     current_spread=snapshot.spread,
                     order_age_ns=order_age_ns,
                 )
-            else:
-                entry_cancel_signal = ""
+                if raw_cancel_signal:
+                    allowed_cancel, blocked_reason = self.risk.can_send_cancel_signal(raw_cancel_signal, ts)
+                    if allowed_cancel:
+                        entry_cancel_signal = raw_cancel_signal
+                        self.risk.record_cancel_request(raw_cancel_signal, ts)
+                        self.metrics.record_cancel_signal()
+                    else:
+                        entry_cancel_blocked_reason = blocked_reason
+                        self.metrics.record_cancel_signal(blocked_reason=blocked_reason)
+
             result = StrategyResult(
                 None,
                 EntryDecision(False, "working_entry"),
@@ -99,12 +111,12 @@ class CombinedMakerTakerStrategy:
                 blocked_reason="working_entry",
                 exit_intent=exit_intent,
                 entry_cancel_signal=entry_cancel_signal,
+                entry_cancel_blocked_reason=entry_cancel_blocked_reason,
                 market_state=market_state,
             )
             self.last_result = result
             return result
 
-        # Block new entry while a position is open and lollipop is managing the exit
         if self.position.qty > 0 and self.lollipop.is_busy:
             result = StrategyResult(
                 None,
@@ -133,7 +145,6 @@ class CombinedMakerTakerStrategy:
             return result
 
         base_qty = self.risk.order_qty(base_qty=self.config.strategy.trade_qty, position=self.position)
-        # ATR-aware sizing: halve order qty when volatility is expanding
         if self.config.strategy.vol_aware_sizing and signal.vol_expansion and base_qty > self.config.lot_size:
             base_qty = max(self.config.lot_size, (base_qty // 2 // self.config.lot_size) * self.config.lot_size)
         if base_qty <= 0:
@@ -160,6 +171,7 @@ class CombinedMakerTakerStrategy:
         )
         if not allowed:
             self.confirmation.reset()
+            self.metrics.record_risk_block(reason)
             result = StrategyResult(
                 None,
                 decision,
@@ -194,9 +206,10 @@ class CombinedMakerTakerStrategy:
                 position=self.position,
                 max_inventory_qty=self.risk.config.max_inventory_qty,
             )
-        # _track_intent sets entry_order_active, _working_entry_side, _working_entry_price
-        # for both taker and maker paths — no redundant setter needed here.
+
         intent = self._track_intent(intent, role=ORDER_ROLE_ENTRY, now_ns=ts)
+        self.risk.record_entry_order(ts)
+        self.metrics.record_entry_intent(intent)
         result = StrategyResult(
             intent,
             decision,
@@ -213,11 +226,6 @@ class CombinedMakerTakerStrategy:
         raise RuntimeError("manual apply_fill is disabled; use on_broker_fill() or on_broker_order_event()")
 
     def on_broker_order_event(self, event: BrokerOrderEvent) -> str:
-        """Apply a broker order snapshot/ack/reject/cancel event.
-
-        Position changes happen only from fill deltas reported by this event.
-        The event may use either the local client order id or the broker order id.
-        """
         order, fill_qty, fill_price = self.orders.apply_order_event(event)
         if order is None:
             return "unknown_order"
@@ -227,11 +235,6 @@ class CombinedMakerTakerStrategy:
         return result
 
     def on_broker_fill(self, event: BrokerFillEvent) -> str:
-        """Apply an explicit broker fill event.
-
-        This is the preferred path for live fills. Duplicate or over-sized fills
-        are clamped by the order ledger before the position is touched.
-        """
         order, fill_qty, fill_price = self.orders.apply_fill_event(event)
         if order is None:
             return "unknown_order"
@@ -245,22 +248,58 @@ class CombinedMakerTakerStrategy:
         self._refresh_working_entry_state()
         return order
 
+    def restore_position(
+        self,
+        *,
+        side: int,
+        qty: int,
+        avg_price: float,
+        entry_mode: str = "maker",
+        now_ns: int = 0,
+        manage_exit: bool = True,
+    ) -> PositionState:
+        if side not in (-1, 1):
+            raise ValueError("side must be -1 or 1")
+        if qty <= 0:
+            raise ValueError("qty must be positive")
+        if avg_price <= 0:
+            raise ValueError("avg_price must be positive")
+        self.position = PositionState(side=side, qty=qty, avg_price=avg_price, entry_mode=entry_mode, entry_ts_ns=now_ns)
+        self.entry_order_active = False
+        self._working_entry_side = 0
+        self._working_entry_price = 0.0
+        if manage_exit:
+            self.lollipop.on_entry_fill(avg_price, entry_mode, now_ns, entry_side=side)
+        else:
+            self.lollipop.reset()
+        return self.position
+
+    def on_api_error(self, now_ns: int = 0) -> bool:
+        opened = self.risk.record_api_error(now_ns)
+        if opened:
+            self.metrics.record_api_circuit_open()
+        return opened
+
+    def on_api_success(self) -> None:
+        self.risk.record_api_success()
+
     def _apply_broker_fill(self, order: OrderState, qty: int, price: float, now_ns: int = 0) -> str:
         if qty <= 0:
             return "none"
-        return self._apply_position_fill(
+        outcome = self._apply_position_fill(
             side=order.intent.side,
             qty=qty,
             price=price,
             now_ns=now_ns,
             entry_mode=order.intent.strategy,
         )
+        self.metrics.record_fill(order, outcome)
+        return outcome
 
     def _apply_position_fill(self, *, side: int, qty: int, price: float, now_ns: int = 0, entry_mode: str = "") -> str:
         if qty <= 0:
             return "none"
 
-        # Flat → opening a new position (entry fill)
         if self.position.qty == 0:
             self.position.side = side
             self.position.qty = qty
@@ -270,14 +309,10 @@ class CombinedMakerTakerStrategy:
             self.lollipop.on_entry_fill(price, entry_mode, now_ns, entry_side=side)
             return "entry"
 
-        # Same side → scale-in (treat as entry, reschedule TP)
         if self.position.side == side:
             new_qty = self.position.qty + qty
-            self.position.avg_price = (
-                self.position.avg_price * self.position.qty + price * qty
-            ) / new_qty
+            self.position.avg_price = (self.position.avg_price * self.position.qty + price * qty) / new_qty
             self.position.qty = new_qty
-            # Update TP target for the new average price
             self.lollipop.on_entry_fill(
                 self.position.avg_price,
                 self.position.entry_mode or entry_mode,
@@ -286,15 +321,14 @@ class CombinedMakerTakerStrategy:
             )
             return "entry"
 
-        # Opposite side → exit fill
         prev_avg = self.position.avg_price
         prev_side = self.position.side
+        entry_ts_ns = self.position.entry_ts_ns
         self.position.qty = max(0, self.position.qty - qty)
         if self.position.qty == 0:
-            won = (price > prev_avg) if prev_side > 0 else (price < prev_avg)
-            # pnl: signed realized profit in price units × qty (positive = win)
-            pnl = (price - prev_avg) * qty * prev_side
-            self.risk.record_trade_result(won, now_ns, pnl=pnl)
+            gross_pnl = (price - prev_avg) * qty * prev_side
+            net_pnl = self.risk.record_trade_result(gross_pnl > 0, now_ns, pnl=gross_pnl, qty=qty)
+            self.metrics.record_trade_close(pnl=net_pnl, hold_ns=now_ns - entry_ts_ns if now_ns > 0 else 0)
             self.position = PositionState()
             self.lollipop.on_exit_fill()
             return "exit"

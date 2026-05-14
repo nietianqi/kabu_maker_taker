@@ -9,7 +9,8 @@ from typing import Any
 
 from .combined import CombinedMakerTakerStrategy
 from .config import AppConfig, load_config
-from .models import BoardSnapshot, TradePrint
+from .models import BoardSnapshot, BrokerFillEvent, BrokerOrderEvent, OrderIntent, TradePrint
+from .simulator import DryRunSimulator
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -21,6 +22,10 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(args.config)
     strategy = CombinedMakerTakerStrategy(config)
+    simulator = DryRunSimulator(
+        tick_size=config.tick_size,
+        slippage_ticks=config.risk.slippage_ticks_default,
+    )
 
     if args.events:
         events = _read_jsonl(Path(args.events))
@@ -40,13 +45,38 @@ def main(argv: list[str] | None = None) -> int:
             kabu_bidask_reversed=config.signals.kabu_bidask_reversed,
             auto_fix_negative_spread=config.signals.auto_fix_negative_spread,
         )
+        for fill_event in simulator.on_board(snapshot, snapshot.ts_ns):
+            strategy.on_broker_fill(fill_event)
         result = strategy.on_board(snapshot, now_ns=snapshot.ts_ns)
         if result.intent is not None:
             print(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
+            _submit_to_simulator(strategy, simulator, result.intent, snapshot, snapshot.ts_ns)
+        if result.exit_intent is not None:
+            _submit_to_simulator(strategy, simulator, result.exit_intent, snapshot, snapshot.ts_ns)
 
     final = strategy.last_result.to_dict() if strategy.last_result else {}
-    print(json.dumps({"status": "done", "last": final}, ensure_ascii=False, separators=(",", ":")))
+    print(
+        json.dumps(
+            {"status": "done", "last": final, "metrics": strategy.metrics.to_dict()},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
     return 0
+
+
+def _submit_to_simulator(
+    strategy: CombinedMakerTakerStrategy,
+    simulator: DryRunSimulator,
+    intent: OrderIntent,
+    snapshot: BoardSnapshot,
+    now_ns: int,
+) -> None:
+    for event in simulator.submit(intent, snapshot, now_ns):
+        if isinstance(event, BrokerOrderEvent):
+            strategy.on_broker_order_event(event)
+        elif isinstance(event, BrokerFillEvent):
+            strategy.on_broker_fill(event)
 
 
 def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -93,4 +123,3 @@ def _sample_events(config: AppConfig) -> list[dict[str, Any]]:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

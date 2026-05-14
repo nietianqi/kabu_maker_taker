@@ -177,6 +177,14 @@ class RiskConfig:
     # e.g. open_start_hhmm_2="12:30", open_end_hhmm_2="15:30" for TSE afternoon
     open_start_hhmm_2: str = ""
     open_end_hhmm_2: str = ""
+    # P1 live-safety gates (0 = disabled)
+    max_entry_orders_per_minute: int = 0
+    max_cancel_requests_per_minute: int = 0
+    api_error_limit: int = 0
+    api_cooling_seconds: int = 120
+    # Cost model for dry-run accounting/backtest estimates
+    fee_per_share: float = 0.0
+    slippage_ticks_default: float = 0.0
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "RiskConfig":
@@ -194,6 +202,12 @@ class RiskConfig:
             daily_loss_limit=float(payload.get("daily_loss_limit", 0.0)),
             open_start_hhmm_2=str(payload.get("open_start_hhmm_2", "")),
             open_end_hhmm_2=str(payload.get("open_end_hhmm_2", "")),
+            max_entry_orders_per_minute=int(payload.get("max_entry_orders_per_minute", 0)),
+            max_cancel_requests_per_minute=int(payload.get("max_cancel_requests_per_minute", 0)),
+            api_error_limit=int(payload.get("api_error_limit", 0)),
+            api_cooling_seconds=int(payload.get("api_cooling_seconds", 120)),
+            fee_per_share=float(payload.get("fee_per_share", 0.0)),
+            slippage_ticks_default=float(payload.get("slippage_ticks_default", 0.0)),
         )
 
 
