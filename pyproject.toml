@@ -1,0 +1,10 @@
+[project]
+name = "kabu-maker-taker"
+version = "0.1.0"
+description = "Python maker/taker microstructure strategy scaffold for kabu-style equities."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.ruff]
+line-length = 110
+

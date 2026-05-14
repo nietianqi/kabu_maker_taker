@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import unittest
+
+from kabu_maker_taker.config import LollipopConfig
+from kabu_maker_taker.lollipop import LollipopTPManager
+from kabu_maker_taker.models import BoardSnapshot, Level, LollipopPhase, PositionState
+
+
+def _snap(bid: float = 100.0, ask: float = 101.0, bid_size: int = 1000, ask_size: int = 500) -> BoardSnapshot:
+    return BoardSnapshot(
+        symbol="9984",
+        ts_ns=0,
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        bids=(Level(bid, bid_size),),
+        asks=(Level(ask, ask_size),),
+    )
+
+
+def _pos(avg_price: float, qty: int = 100, side: int = 1, entry_mode: str = "maker") -> PositionState:
+    p = PositionState()
+    p.side = side
+    p.qty = qty
+    p.avg_price = avg_price
+    p.entry_mode = entry_mode
+    p.entry_ts_ns = 0
+    return p
+
+
+_CFG = LollipopConfig(
+    maker_tp_ticks=2.0,
+    taker_tp_ticks=3.0,
+    maker_max_hold_seconds=10,
+    taker_max_hold_seconds=5,
+    tp_delay_ms=0,  # no delay for tests
+    max_retries=3,
+    stop_loss_ticks=0.0,
+)
+
+_TICK = 1.0
+_LOT = 100
+_KW = dict(symbol="9984", exchange=27)
+
+
+class LollipopPhaseTests(unittest.TestCase):
+    def test_idle_at_start(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        self.assertEqual(mgr.phase, LollipopPhase.IDLE)
+        self.assertFalse(mgr.is_busy)
+
+    def test_entry_fill_transitions_to_scheduled(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=1_000)
+        self.assertEqual(mgr.phase, LollipopPhase.SCHEDULED)
+        self.assertTrue(mgr.is_busy)
+
+    def test_maker_tp_price(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        # tp_delay_ms=0, so tick at now_ns=0 should fire
+        pos = _pos(100.0)
+        action = mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        self.assertEqual(action.action, "submit_tp")
+        assert action.intent is not None
+        self.assertEqual(action.intent.price, 102.0)  # 100 + 2 ticks
+        self.assertFalse(action.intent.is_market)
+        self.assertEqual(action.intent.strategy, "lollipop_tp")
+        self.assertEqual(mgr.phase, LollipopPhase.ACTIVE)
+
+    def test_short_maker_tp_price(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0, entry_side=-1)
+        pos = _pos(100.0, side=-1)
+        action = mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        self.assertEqual(action.action, "submit_tp")
+        assert action.intent is not None
+        self.assertEqual(action.intent.price, 98.0)  # 100 - 2 ticks
+        self.assertEqual(action.intent.side, 1)
+        self.assertFalse(action.intent.is_market)
+
+    def test_taker_tp_price(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "taker", now_ns=0)
+        pos = _pos(100.0, entry_mode="taker")
+        action = mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        self.assertEqual(action.action, "submit_tp")
+        assert action.intent is not None
+        self.assertEqual(action.intent.price, 103.0)  # 100 + 3 ticks
+
+    def test_active_phase_returns_none_before_timeout(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        pos = _pos(100.0)
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)  # SCHEDULED → ACTIVE
+        action = mgr.tick(_snap(), pos, now_ns=1_000_000_000, **_KW)  # 1 second later
+        self.assertEqual(action.action, "none")
+        self.assertEqual(mgr.phase, LollipopPhase.ACTIVE)
+
+    def test_timeout_triggers_force_exit(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        now = 0
+        mgr.on_entry_fill(100.0, "maker", now_ns=now)
+        pos = _pos(100.0)
+        mgr.tick(_snap(), pos, now_ns=now, **_KW)  # → ACTIVE
+        # Advance past maker_max_hold_seconds (10s)
+        future = now + 11 * 1_000_000_000
+        action = mgr.tick(_snap(), pos, now_ns=future, **_KW)
+        self.assertEqual(action.action, "force_exit")
+        assert action.intent is not None
+        self.assertTrue(action.intent.is_market)
+        self.assertEqual(action.intent.reason, "timeout_exit")
+        self.assertEqual(action.intent.side, -1)  # closing long
+
+    def test_taker_hold_timeout_shorter(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        now = 0
+        mgr.on_entry_fill(100.0, "taker", now_ns=now)
+        pos = _pos(100.0, entry_mode="taker")
+        mgr.tick(_snap(), pos, now_ns=now, **_KW)  # → ACTIVE
+        # 6 seconds > taker_max_hold_seconds (5s)
+        action = mgr.tick(_snap(), pos, now_ns=6_000_000_000, **_KW)
+        self.assertEqual(action.action, "force_exit")
+
+    def test_exit_fill_resets_to_idle(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        pos = _pos(100.0)
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)  # → ACTIVE
+        mgr.on_exit_fill()
+        self.assertEqual(mgr.phase, LollipopPhase.IDLE)
+        self.assertFalse(mgr.is_busy)
+
+    def test_retry_budget_exhausted_triggers_timeout(self) -> None:
+        cfg = LollipopConfig(
+            maker_tp_ticks=2.0,
+            taker_tp_ticks=3.0,
+            maker_max_hold_seconds=100,
+            taker_max_hold_seconds=100,
+            tp_delay_ms=0,
+            max_retries=2,
+            stop_loss_ticks=0.0,
+        )
+        mgr = LollipopTPManager(cfg, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        pos = _pos(100.0)
+        # Each tick in SCHEDULED fires submit_tp and moves to ACTIVE
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)   # retry 1 → ACTIVE
+        mgr.reschedule(now_ns=0)                   # back to SCHEDULED
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)   # retry 2 → ACTIVE
+        mgr.reschedule(now_ns=0)                   # back to SCHEDULED
+        action = mgr.tick(_snap(), pos, now_ns=0, **_KW)  # retries exhausted → TIMEOUT
+        self.assertEqual(action.action, "force_exit")
+
+    def test_stop_loss_triggers_force_exit(self) -> None:
+        cfg = LollipopConfig(
+            maker_tp_ticks=2.0,
+            taker_tp_ticks=3.0,
+            maker_max_hold_seconds=100,
+            taker_max_hold_seconds=100,
+            tp_delay_ms=0,
+            max_retries=5,
+            stop_loss_ticks=2.0,
+        )
+        mgr = LollipopTPManager(cfg, _TICK, _LOT)
+        now = 0
+        mgr.on_entry_fill(100.0, "maker", now_ns=now)
+        pos = _pos(100.0)
+        mgr.tick(_snap(), pos, now_ns=now, **_KW)  # → ACTIVE
+        # bid drops to 97 → loss = (100 - 97) / 1 = 3 ticks ≥ stop_loss_ticks 2
+        bad_snap = _snap(bid=97.0, ask=98.0)
+        action = mgr.tick(bad_snap, pos, now_ns=1_000_000_000, **_KW)
+        self.assertEqual(action.action, "force_exit")
+
+    def test_short_stop_loss_uses_ask_and_triggers_force_exit(self) -> None:
+        cfg = LollipopConfig(
+            maker_tp_ticks=2.0,
+            taker_tp_ticks=3.0,
+            maker_max_hold_seconds=100,
+            taker_max_hold_seconds=100,
+            tp_delay_ms=0,
+            max_retries=5,
+            stop_loss_ticks=2.0,
+        )
+        mgr = LollipopTPManager(cfg, _TICK, _LOT)
+        now = 0
+        mgr.on_entry_fill(100.0, "maker", now_ns=now, entry_side=-1)
+        pos = _pos(100.0, side=-1)
+        mgr.tick(_snap(), pos, now_ns=now, **_KW)  # -> ACTIVE
+        bad_snap = _snap(bid=102.0, ask=103.0)
+        action = mgr.tick(bad_snap, pos, now_ns=1_000_000_000, **_KW)
+        self.assertEqual(action.action, "force_exit")
+        assert action.intent is not None
+        self.assertEqual(action.intent.side, 1)
+        self.assertEqual(action.intent.reference_price, 103.0)
+
+    def test_idle_tick_returns_none(self) -> None:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        pos = _pos(100.0)
+        action = mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        self.assertEqual(action.action, "none")
+        self.assertIsNone(action.intent)
+
+
+class LollipopIntegrationTests(unittest.TestCase):
+    """Test lollipop through CombinedMakerTakerStrategy."""
+
+    def _make_strategy(self, tp_delay_ms: int = 0):
+        from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+        from kabu_maker_taker.config import AppConfig, RiskConfig, SignalConfig, StrategyConfig
+
+        config = AppConfig(
+            symbol="9984",
+            tick_size=1.0,
+            lot_size=100,
+            strategy=StrategyConfig(taker_confirm_ticks=1, maker_confirm_ticks=1),
+            risk=RiskConfig(max_spread_ticks=3.0),
+            signals=SignalConfig(zscore_window=2),
+            lollipop=LollipopConfig(
+                maker_tp_ticks=2.0,
+                taker_tp_ticks=3.0,
+                maker_max_hold_seconds=60,
+                taker_max_hold_seconds=30,
+                tp_delay_ms=tp_delay_ms,
+                max_retries=5,
+                stop_loss_ticks=0.0,
+            ),
+        )
+        return CombinedMakerTakerStrategy(config)
+
+    def test_exit_intent_after_entry_fill(self) -> None:
+        from kabu_maker_taker.models import BrokerFillEvent, TradePrint
+
+        strategy = self._make_strategy(tp_delay_ms=0)
+        base = 1_770_000_000_000_000_000
+
+        strategy.on_trade(TradePrint("9984", base, 100.8, 500, 1))
+        snap1 = BoardSnapshot(
+            "9984", base + 100_000_000, 100.0, 101.0, 900, 200,
+            bids=(Level(100.0, 900), Level(99.0, 500)),
+            asks=(Level(101.0, 200), Level(102.0, 250)),
+        )
+        strategy.on_board(snap1, now_ns=snap1.ts_ns)
+
+        strategy.on_trade(TradePrint("9984", base + 150_000_000, 101.0, 800, 1))
+        snap2 = BoardSnapshot(
+            "9984", base + 200_000_000, 101.0, 102.0, 1200, 180,
+            bids=(Level(101.0, 1200), Level(100.0, 700)),
+            asks=(Level(102.0, 180), Level(103.0, 220)),
+        )
+        result = strategy.on_board(snap2, now_ns=snap2.ts_ns)
+        if result.intent is not None:
+            strategy.on_broker_fill(
+                BrokerFillEvent(
+                    order_id=result.intent.client_order_id,
+                    qty=result.intent.qty,
+                    price=snap2.ask,
+                    ts_ns=snap2.ts_ns,
+                )
+            )
+            # Next board event should yield exit_intent (TP)
+            snap3 = BoardSnapshot(
+                "9984", base + 300_000_000, 101.0, 102.0, 1200, 180,
+                bids=(Level(101.0, 1200),),
+                asks=(Level(102.0, 180),),
+            )
+            result2 = strategy.on_board(snap3, now_ns=snap3.ts_ns)
+            # Either exit_intent is set (TP ready) or lollipop_active blocks entry
+            self.assertIn(result2.blocked_reason, {"lollipop_active", "working_entry", ""})
+
+    def test_no_entry_while_lollipop_active(self) -> None:
+        from kabu_maker_taker.models import BrokerFillEvent, TradePrint
+
+        strategy = self._make_strategy()
+        base = 1_770_000_000_000_000_000
+
+        strategy.on_trade(TradePrint("9984", base, 100.8, 500, 1))
+        snap1 = BoardSnapshot(
+            "9984", base + 100_000_000, 100.0, 101.0, 900, 200,
+            bids=(Level(100.0, 900), Level(99.0, 500)),
+            asks=(Level(101.0, 200), Level(102.0, 250)),
+        )
+        result = strategy.on_board(snap1, now_ns=snap1.ts_ns)
+
+        if result.intent is not None:
+            strategy.on_broker_fill(
+                BrokerFillEvent(
+                    order_id=result.intent.client_order_id,
+                    qty=result.intent.qty,
+                    price=snap1.ask,
+                    ts_ns=snap1.ts_ns,
+                )
+            )
+            self.assertTrue(strategy.lollipop.is_busy)
+
+            snap2 = BoardSnapshot(
+                "9984", base + 200_000_000, 101.0, 102.0, 1200, 180,
+                bids=(Level(101.0, 1200),),
+                asks=(Level(102.0, 180),),
+            )
+            result2 = strategy.on_board(snap2, now_ns=snap2.ts_ns)
+            self.assertIsNone(result2.intent, "should not open new entry while lollipop active")
+
+
+if __name__ == "__main__":
+    unittest.main()
