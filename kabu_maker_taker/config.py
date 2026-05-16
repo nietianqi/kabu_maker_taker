@@ -334,7 +334,7 @@ class OrderProfile:
 @dataclass(frozen=True, slots=True)
 class KabuConfig:
     base_url: str = "http://localhost:18080"
-    api_password: str = ""
+    api_password: str = "japan202303"
     order_rate_per_sec: float = 4.0
     poll_rate_per_sec: float = 4.0
     poll_interval_ms: int = 250
@@ -366,6 +366,14 @@ class AppConfig:
     lollipop: LollipopConfig = field(default_factory=LollipopConfig)
     market_state: MarketStateConfig = field(default_factory=MarketStateConfig)
     kabu: KabuConfig = field(default_factory=KabuConfig)
+    # Trade journal: write trades.csv + markouts.csv to log_dir
+    log_dir: str = "logs"
+    enable_journal: bool = False
+    # Decision trace: append per-board JSONL to log_dir/decisions.jsonl
+    enable_decision_trace: bool = False
+    # Kill-switch files: touch to halt new entries (soft) or force-exit + stop (hard)
+    kill_switch_path: str = "halt.txt"
+    kill_switch_hard_path: str = "halt_hard.txt"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "AppConfig":
@@ -381,6 +389,11 @@ class AppConfig:
             lollipop=LollipopConfig.from_dict(payload.get("lollipop")),
             market_state=MarketStateConfig.from_dict(payload.get("market_state")),
             kabu=KabuConfig.from_dict(payload.get("kabu")),
+            log_dir=str(payload.get("log_dir", "logs")),
+            enable_journal=bool(payload.get("enable_journal", False)),
+            enable_decision_trace=bool(payload.get("enable_decision_trace", False)),
+            kill_switch_path=str(payload.get("kill_switch_path", "halt.txt")),
+            kill_switch_hard_path=str(payload.get("kill_switch_hard_path", "halt_hard.txt")),
         )
 
 

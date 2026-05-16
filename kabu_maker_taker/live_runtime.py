@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable
+from pathlib import Path
 
 from .combined import CombinedMakerTakerStrategy
 from .config import AppConfig
@@ -70,6 +71,21 @@ def sleep_before_live_poll(config: AppConfig) -> None:
     poll_interval_ms = max(config.kabu.poll_interval_ms, 0)
     if poll_interval_ms:
         time.sleep(poll_interval_ms / 1000)
+
+
+def check_kill_switch(config: AppConfig) -> str:
+    """Check for kill-switch files and return the signal level.
+
+    Returns:
+        ``"hard"``  — halt_hard.txt exists: cancel all, force-exit, stop.
+        ``"soft"``  — halt.txt exists: block new entries, keep exits running.
+        ``""``      — no kill-switch file found, continue normally.
+    """
+    if Path(config.kill_switch_hard_path).exists():
+        return "hard"
+    if Path(config.kill_switch_path).exists():
+        return "soft"
+    return ""
 
 
 def live_halted(strategy: CombinedMakerTakerStrategy, reason: str) -> int:

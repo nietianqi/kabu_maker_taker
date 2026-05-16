@@ -47,6 +47,15 @@ class RiskManager:
         self._latency_last_ms: dict[str, float] = {kind: 0.0 for kind in LATENCY_REQUEST_KINDS}
         self._latency_breach_counts: dict[str, int] = {kind: 0 for kind in LATENCY_REQUEST_KINDS}
         self._latency_circuit_open_until_ns: int = 0
+        self._soft_kill_active: bool = False
+
+    def set_soft_kill(self, active: bool) -> None:
+        """Activate or deactivate the soft kill switch.
+
+        While active, ``can_enter()`` returns ``(False, "kill_switch_soft")``.
+        Existing positions and exit orders are unaffected.
+        """
+        self._soft_kill_active = active
 
     def can_enter(
         self,
@@ -59,6 +68,8 @@ class RiskManager:
     ) -> tuple[bool, str]:
         if not decision.allow:
             return False, decision.reason
+        if self._soft_kill_active:
+            return False, "kill_switch_soft"
         self._ensure_daily_date(now_ns or snapshot.ts_ns)
         if self._api_circuit_open(now_ns):
             return False, "api_circuit_open"

@@ -11,7 +11,9 @@ from .broker import JsonBrokerSnapshotAdapter
 from .combined import CombinedMakerTakerStrategy
 from .config import AppConfig, load_config
 from .execution import KabuApiError, KabuRestExecutor
+from .journal import TradeJournal
 from .live_runtime import (
+    check_kill_switch as _check_kill_switch,
     handle_live_execution as _handle_live_execution,
     live_halted as _live_halted,
     poll_live as _poll_live,
@@ -21,6 +23,7 @@ from .live_runtime import (
 from .models import BoardSnapshot, BrokerFillEvent, BrokerOrderEvent, OrderIntent, TradePrint
 from .simulator import DryRunSimulator
 from .strategy import ORDER_ROLE_ENTRY, ORDER_ROLE_EXIT
+from .telemetry import DecisionTraceWriter
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,7 +40,27 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Send intents to kabu Station REST instead of dry-run simulation.",
     )
+    parser.add_argument(
+        "--evolve",
+        action="store_true",
+        help="Run parameter grid search instead of single-pass replay.",
+    )
+    parser.add_argument(
+        "--param-grid",
+        dest="param_grid",
+        help="JSON file with parameter grid for --evolve (e.g. {\"strategy.tape_imbalance_long\": [0.10, 0.15]}).",
+    )
     args = parser.parse_args(argv)
+
+    # Delegate to evolution CLI when --evolve is requested
+    if args.evolve:
+        from .evolution import run_cli as _run_evolve
+        evolve_argv = ["--config", args.config]
+        if args.events:
+            evolve_argv += ["--events", args.events]
+        if args.param_grid:
+            evolve_argv += ["--param-grid", args.param_grid]
+        return _run_evolve(evolve_argv)
 
     config = load_config(args.config)
     if args.live and args.sample:
@@ -54,6 +77,22 @@ def main(argv: list[str] | None = None) -> int:
         tick_size=config.tick_size,
         slippage_ticks=config.risk.slippage_ticks_default,
     )
+
+    # Optional journal (trades.csv + markouts.csv)
+    if config.enable_journal:
+        strategy.journal = TradeJournal(
+            log_dir=config.log_dir,
+            symbol=config.symbol,
+            tick_size=config.tick_size,
+        )
+
+    # Optional decision trace (decisions.jsonl)
+    tracer = DecisionTraceWriter(
+        log_dir=config.log_dir,
+        symbol=config.symbol,
+        enabled=config.enable_decision_trace,
+    )
+
     live_executor: KabuRestExecutor | None = None
     if args.live:
         live_executor = KabuRestExecutor(config)
@@ -116,6 +155,14 @@ def main(argv: list[str] | None = None) -> int:
             kabu_bidask_reversed=config.signals.kabu_bidask_reversed,
             auto_fix_negative_spread=config.signals.auto_fix_negative_spread,
         )
+
+        # Kill-switch check (live mode): update soft-kill flag or force-exit
+        if live_executor is not None:
+            ks = _check_kill_switch(config)
+            if ks == "hard":
+                return _live_halted(strategy, "kill_switch_hard")
+            strategy.risk.set_soft_kill(ks == "soft")
+
         if live_executor is None:
             for fill_event in simulator.on_board(snapshot, snapshot.ts_ns):
                 strategy.on_broker_fill(fill_event)
@@ -124,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             if halt_reason:
                 return _live_halted(strategy, halt_reason)
         result = strategy.on_board(snapshot, now_ns=snapshot.ts_ns)
+        tracer.record(result, strategy.position, snapshot.ts_ns)
         if result.entry_cancel_signal:
             for oid in strategy.working_entry_ids:
                 order = strategy.request_cancel(oid, reason=result.entry_cancel_signal, now_ns=snapshot.ts_ns)
@@ -171,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if halt_reason:
                     return _live_halted(strategy, halt_reason)
+
+    # Flush journal markouts and close diagnostic files
+    if strategy.journal is not None:
+        strategy.journal.flush()
+        strategy.journal.close()
+    tracer.close()
 
     final = strategy.last_result.to_dict() if strategy.last_result else {}
     print(

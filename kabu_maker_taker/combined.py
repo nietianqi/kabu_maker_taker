@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from .broker import BrokerReconciliationSnapshot
 from .config import AppConfig
+from .journal import TradeJournal
 from .lollipop import LollipopTPManager
 from .metrics import MetricsCollector
 from .models import (
@@ -62,6 +63,8 @@ class CombinedMakerTakerStrategy:
         self.orders = OrderLedger()
         self.metrics = MetricsCollector(tick_size=config.tick_size)
         self.last_result: StrategyResult | None = None
+        self.journal: TradeJournal | None = None   # set by app.py when enable_journal=True
+        self._last_entry_signal: object = None     # SignalPacket at time of entry fill
         self.entry_order_active = False
         self._working_entry_side: int = 0
         self._working_entry_price: float = 0.0
@@ -88,6 +91,8 @@ class CombinedMakerTakerStrategy:
         market_state = self.market_state_detector.update(snapshot, ts)
         signal = self.signals.on_board(snapshot)
         self.metrics.on_board(snapshot)
+        if self.journal is not None:
+            self.journal.on_board(snapshot)
 
         lollipop_action = self.lollipop.tick(
             snapshot,
@@ -362,6 +367,10 @@ class CombinedMakerTakerStrategy:
             self.position.entry_ts_ns = now_ns
             self._open_trade_realized_pnl = 0.0
             self._partial_loss_counted_for_position = False
+            # Capture the signal at entry time for the journal
+            self._last_entry_signal = (
+                self.last_result.signal if self.last_result is not None else None
+            )
             self.lollipop.on_entry_fill(price, entry_mode, now_ns, entry_side=side)
             return "entry"
 
@@ -400,10 +409,24 @@ class CombinedMakerTakerStrategy:
                 hold_ns=now_ns - entry_ts_ns if now_ns > 0 else 0,
                 classification_pnl=total_trade_pnl,
             )
+            entry_mode_for_log = self.position.entry_mode
             self.position = PositionState()
             self._open_trade_realized_pnl = 0.0
             self._partial_loss_counted_for_position = False
             self.lollipop.on_exit_fill()
+            if self.journal is not None:
+                self.journal.on_trade_closed(
+                    entry_ts_ns=entry_ts_ns,
+                    exit_ts_ns=now_ns,
+                    side=prev_side,
+                    qty=qty,
+                    entry_price=prev_avg,
+                    exit_price=price,
+                    exit_reason=self.last_result.blocked_reason if self.last_result else "",
+                    entry_mode=entry_mode_for_log,
+                    signal=self._last_entry_signal,  # type: ignore[arg-type]
+                    realized_pnl=net_pnl,
+                )
             return "exit"
         # Partial exit: realize PnL for the exited portion immediately so that
         # daily loss limits and realized PnL metrics stay current.
