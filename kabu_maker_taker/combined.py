@@ -1,5 +1,22 @@
+"""Combined maker/taker strategy coordinator.
+
+``CombinedMakerTakerStrategy`` is the single public entry point for the
+execution layer.  On every board tick ``on_board()`` runs the full pipeline:
+
+  1. Signal engine  → ``SignalPacket``
+  2. Lollipop TP   → optional exit intent
+  3. Entry cancel  → optional cancel of working limit order
+  4. Confirmation  → require N consecutive matching ticks
+  5. Risk gates    → spread, position size, session, circuit breakers
+  6. Entry policy  → taker (aggressive) first, maker (passive) fallback
+  7. Return        → ``StrategyResult`` with at most one entry intent
+
+The strategy never mutates broker state.  All fills and order events arrive
+via ``on_broker_fill()`` / ``on_broker_order_event()``.
+"""
 from __future__ import annotations
 
+from .broker import BrokerReconciliationSnapshot
 from .config import AppConfig
 from .lollipop import LollipopTPManager
 from .metrics import MetricsCollector
@@ -19,6 +36,7 @@ from .models import (
 from .orders import OrderLedger
 from .risk import RiskManager
 from .signals import MicrostructureSignalEngine
+from .reconciliation import reconcile_strategy_from_broker
 from .strategy import (
     ConfirmationTracker,
     ENTRY_MODE_TAKER,
@@ -47,6 +65,8 @@ class CombinedMakerTakerStrategy:
         self.entry_order_active = False
         self._working_entry_side: int = 0
         self._working_entry_price: float = 0.0
+        self._open_trade_realized_pnl: float = 0.0
+        self._partial_loss_counted_for_position = False
 
     def on_trade(self, trade: TradePrint) -> None:
         if trade.symbol != self.config.symbol:
@@ -79,6 +99,7 @@ class CombinedMakerTakerStrategy:
         exit_intent = lollipop_action.intent if lollipop_action.action != "none" else None
         if exit_intent is not None:
             exit_intent = self._track_intent(exit_intent, role=ORDER_ROLE_EXIT, now_ns=ts)
+            self.metrics.record_exit_intent(exit_intent)
 
         if self.entry_order_active:
             entry_cancel_signal = ""
@@ -209,7 +230,7 @@ class CombinedMakerTakerStrategy:
 
         intent = self._track_intent(intent, role=ORDER_ROLE_ENTRY, now_ns=ts)
         self.risk.record_entry_order(ts)
-        self.metrics.record_entry_intent(intent)
+        self.metrics.record_entry_intent(intent, now_ns=ts)
         result = StrategyResult(
             intent,
             decision,
@@ -268,11 +289,37 @@ class CombinedMakerTakerStrategy:
         self.entry_order_active = False
         self._working_entry_side = 0
         self._working_entry_price = 0.0
+        self._open_trade_realized_pnl = 0.0
+        self._partial_loss_counted_for_position = False
         if manage_exit:
             self.lollipop.on_entry_fill(avg_price, entry_mode, now_ns, entry_side=side)
         else:
             self.lollipop.reset()
         return self.position
+
+    def restore_daily_pnl(self, pnl: float, now_ns: int = 0) -> None:
+        """Restore today's realized PnL from broker account summary at startup.
+
+        Syncs both the risk manager (daily loss gate) and the metrics collector
+        so ``metrics.to_dict()`` reflects the real session state from the start.
+
+        Typical startup sequence::
+
+            strategy.restore_position(side, qty, avg_price, entry_mode, now_ns)
+            strategy.restore_daily_pnl(pnl=today_net_pnl, now_ns=now_ns)
+            # Feed in-flight BrokerOrderEvent(status=WORKING) for open orders
+        """
+        self.risk.restore_daily_pnl(pnl, now_ns)
+        self.metrics.realized_pnl = float(pnl)
+
+    def reconcile_from_broker(
+        self,
+        snapshot: BrokerReconciliationSnapshot,
+        *,
+        now_ns: int = 0,
+        manage_exit: bool = True,
+    ) -> dict[str, int | float | bool]:
+        return reconcile_strategy_from_broker(self, snapshot, now_ns=now_ns, manage_exit=manage_exit)
 
     def on_api_error(self, now_ns: int = 0) -> bool:
         opened = self.risk.record_api_error(now_ns)
@@ -282,6 +329,13 @@ class CombinedMakerTakerStrategy:
 
     def on_api_success(self) -> None:
         self.risk.record_api_success()
+
+    def on_rest_latency(self, request_kind: str, latency_ms: float, now_ns: int = 0) -> bool:
+        self.metrics.record_rest_latency(request_kind, latency_ms)
+        opened = self.risk.record_latency(request_kind, latency_ms, now_ns)
+        if opened:
+            self.metrics.record_latency_circuit_open()
+        return opened
 
     def _apply_broker_fill(self, order: OrderState, qty: int, price: float, now_ns: int = 0) -> str:
         if qty <= 0:
@@ -306,6 +360,8 @@ class CombinedMakerTakerStrategy:
             self.position.avg_price = price
             self.position.entry_mode = entry_mode
             self.position.entry_ts_ns = now_ns
+            self._open_trade_realized_pnl = 0.0
+            self._partial_loss_counted_for_position = False
             self.lollipop.on_entry_fill(price, entry_mode, now_ns, entry_side=side)
             return "entry"
 
@@ -313,6 +369,7 @@ class CombinedMakerTakerStrategy:
             new_qty = self.position.qty + qty
             self.position.avg_price = (self.position.avg_price * self.position.qty + price * qty) / new_qty
             self.position.qty = new_qty
+            self._partial_loss_counted_for_position = False
             self.lollipop.on_entry_fill(
                 self.position.avg_price,
                 self.position.entry_mode or entry_mode,
@@ -327,12 +384,51 @@ class CombinedMakerTakerStrategy:
         self.position.qty = max(0, self.position.qty - qty)
         if self.position.qty == 0:
             gross_pnl = (price - prev_avg) * qty * prev_side
-            net_pnl = self.risk.record_trade_result(gross_pnl > 0, now_ns, pnl=gross_pnl, qty=qty)
-            self.metrics.record_trade_close(pnl=net_pnl, hold_ns=now_ns - entry_ts_ns if now_ns > 0 else 0)
+            final_net_pnl = gross_pnl - self.risk.estimate_round_trip_cost(qty)
+            total_trade_pnl = self._open_trade_realized_pnl + final_net_pnl
+            update_loss_streak = total_trade_pnl > 0 or not self._partial_loss_counted_for_position
+            net_pnl = self.risk.record_trade_result(
+                gross_pnl > 0,
+                now_ns,
+                pnl=gross_pnl,
+                qty=qty,
+                classification_pnl=total_trade_pnl,
+                update_loss_streak=update_loss_streak,
+            )
+            self.metrics.record_trade_close(
+                pnl=net_pnl,
+                hold_ns=now_ns - entry_ts_ns if now_ns > 0 else 0,
+                classification_pnl=total_trade_pnl,
+            )
             self.position = PositionState()
+            self._open_trade_realized_pnl = 0.0
+            self._partial_loss_counted_for_position = False
             self.lollipop.on_exit_fill()
             return "exit"
+        # Partial exit: realize PnL for the exited portion immediately so that
+        # daily loss limits and realized PnL metrics stay current.
+        gross_pnl = (price - prev_avg) * qty * prev_side
+        should_count_partial_loss = not self._partial_loss_counted_for_position
+        net_pnl = self.risk.record_partial_pnl(
+            pnl=gross_pnl,
+            qty=qty,
+            now_ns=now_ns,
+            count_loss=should_count_partial_loss,
+        )
+        if net_pnl < 0:
+            self._partial_loss_counted_for_position = True
+        self._open_trade_realized_pnl += net_pnl
+        self.metrics.record_partial_exit(pnl=net_pnl)
         return "partial_exit"
+
+    @property
+    def working_entry_ids(self) -> list[str]:
+        """Client order IDs of all active (non-final) entry orders.
+
+        The execution layer uses this to send cancel requests to the broker
+        or simulator when entry_cancel_signal fires.
+        """
+        return [o.client_order_id for o in self.orders.active_by_role(ORDER_ROLE_ENTRY)]
 
     def clear_entry_order(self) -> None:
         for order in self.orders.active_by_role(ORDER_ROLE_ENTRY):

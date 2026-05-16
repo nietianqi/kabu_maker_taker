@@ -1,3 +1,22 @@
+"""Configuration schema and JSON loader for the kabu maker/taker strategy.
+
+All config dataclasses are frozen and use ``__slots__``.  The canonical source
+of truth is a JSON file loaded via ``load_config(path)``.  Every ``from_dict``
+classmethod provides defaults for every field so older JSON files remain
+compatible when new fields are added.
+
+Config hierarchy::
+
+    AppConfig
+    ├── SignalConfig     (signals.py — microstructure signal parameters)
+    │   └── SignalWeights
+    ├── StrategyConfig   (strategy.py — entry thresholds, sizing, cancel logic)
+    ├── RiskConfig       (risk.py — gates, limits, circuit breakers)
+    ├── LollipopConfig   (lollipop.py — TP/stop/timeout parameters)
+    ├── MarketStateConfig (strategy.py — abnormal-market detection)
+    └── KabuConfig       (app.py / kabu_rest — API credentials and polling)
+        └── OrderProfile (execution/ — margin/equity/SOR order parameters)
+"""
 from __future__ import annotations
 
 import json
@@ -47,6 +66,10 @@ class SignalConfig:
     # Volatility expansion (T-09)
     vol_expansion_ratio: float = 2.0
     vol_ema_alpha: float = 0.05
+    # Integrated OFI blend: weight for lob_ofi; (1 - lob_tape_ofi_weight) goes to tape_ofi
+    lob_tape_ofi_weight: float = 0.5
+    # Microprice EMA smoothing: microprice_ema = alpha*mp + (1-alpha)*prev_ema
+    microprice_ema_alpha: float = 0.2
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "SignalConfig":
@@ -68,6 +91,8 @@ class SignalConfig:
             breakout_buffer_ticks=float(payload.get("breakout_buffer_ticks", 0.0)),
             vol_expansion_ratio=float(payload.get("vol_expansion_ratio", 2.0)),
             vol_ema_alpha=float(payload.get("vol_ema_alpha", 0.05)),
+            lob_tape_ofi_weight=float(payload.get("lob_tape_ofi_weight", 0.5)),
+            microprice_ema_alpha=float(payload.get("microprice_ema_alpha", 0.2)),
         )
 
 
@@ -118,6 +143,9 @@ class StrategyConfig:
     min_order_age_ms: int = 100
     # v2: microprice streak (+1 direction score when streak >= this; 0 = disabled)
     microprice_streak_min: int = 3
+    # Inventory skew amplifier: |inventory_ratio| >= high_threshold → multiply skew_ticks by high_multiplier
+    inventory_high_threshold: float = 0.66
+    inventory_high_multiplier: float = 1.5
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "StrategyConfig":
@@ -156,6 +184,8 @@ class StrategyConfig:
             spread_expanded_ticks=float(payload.get("spread_expanded_ticks", 4.0)),
             min_order_age_ms=int(payload.get("min_order_age_ms", 100)),
             microprice_streak_min=int(payload.get("microprice_streak_min", 3)),
+            inventory_high_threshold=float(payload.get("inventory_high_threshold", 0.66)),
+            inventory_high_multiplier=float(payload.get("inventory_high_multiplier", 1.5)),
         )
 
 
@@ -182,6 +212,10 @@ class RiskConfig:
     max_cancel_requests_per_minute: int = 0
     api_error_limit: int = 0
     api_cooling_seconds: int = 120
+    order_latency_limit_ms: int = 3000
+    cancel_latency_limit_ms: int = 3000
+    poll_latency_limit_ms: int = 3000
+    latency_breach_limit: int = 3
     # Cost model for dry-run accounting/backtest estimates
     fee_per_share: float = 0.0
     slippage_ticks_default: float = 0.0
@@ -206,6 +240,10 @@ class RiskConfig:
             max_cancel_requests_per_minute=int(payload.get("max_cancel_requests_per_minute", 0)),
             api_error_limit=int(payload.get("api_error_limit", 0)),
             api_cooling_seconds=int(payload.get("api_cooling_seconds", 120)),
+            order_latency_limit_ms=int(payload.get("order_latency_limit_ms", 3000)),
+            cancel_latency_limit_ms=int(payload.get("cancel_latency_limit_ms", 3000)),
+            poll_latency_limit_ms=int(payload.get("poll_latency_limit_ms", 3000)),
+            latency_breach_limit=int(payload.get("latency_breach_limit", 3)),
             fee_per_share=float(payload.get("fee_per_share", 0.0)),
             slippage_ticks_default=float(payload.get("slippage_ticks_default", 0.0)),
         )
@@ -256,6 +294,66 @@ class LollipopConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderProfile:
+    mode: str = "margin"
+    allow_short: bool = False
+    account_type: int = 4
+    cash_buy_fund_type: str = "02"
+    cash_buy_deliv_type: int = 2
+    cash_sell_fund_type: str = ""
+    cash_sell_deliv_type: int = 0
+    margin_trade_type: int = 1
+    margin_open_fund_type: str = "11"
+    margin_open_deliv_type: int = 0
+    margin_close_deliv_type: int = 2
+    front_order_type_limit: int = 20
+    front_order_type_market: int = 10
+    front_order_type_ioc_limit: int = 27
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "OrderProfile":
+        payload = payload or {}
+        return cls(
+            mode=str(payload.get("mode", "margin")),
+            allow_short=bool(payload.get("allow_short", False)),
+            account_type=int(payload.get("account_type", 4)),
+            cash_buy_fund_type=str(payload.get("cash_buy_fund_type", "02")),
+            cash_buy_deliv_type=int(payload.get("cash_buy_deliv_type", 2)),
+            cash_sell_fund_type=str(payload.get("cash_sell_fund_type", "")),
+            cash_sell_deliv_type=int(payload.get("cash_sell_deliv_type", 0)),
+            margin_trade_type=int(payload.get("margin_trade_type", 1)),
+            margin_open_fund_type=str(payload.get("margin_open_fund_type", "11")),
+            margin_open_deliv_type=int(payload.get("margin_open_deliv_type", 0)),
+            margin_close_deliv_type=int(payload.get("margin_close_deliv_type", 2)),
+            front_order_type_limit=int(payload.get("front_order_type_limit", 20)),
+            front_order_type_market=int(payload.get("front_order_type_market", 10)),
+            front_order_type_ioc_limit=int(payload.get("front_order_type_ioc_limit", 27)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class KabuConfig:
+    base_url: str = "http://localhost:18080"
+    api_password: str = ""
+    order_rate_per_sec: float = 4.0
+    poll_rate_per_sec: float = 4.0
+    poll_interval_ms: int = 250
+    order_profile: OrderProfile = field(default_factory=OrderProfile)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "KabuConfig":
+        payload = payload or {}
+        return cls(
+            base_url=str(payload.get("base_url", "http://localhost:18080")),
+            api_password=str(payload.get("api_password", "")),
+            order_rate_per_sec=float(payload.get("order_rate_per_sec", 4.0)),
+            poll_rate_per_sec=float(payload.get("poll_rate_per_sec", 4.0)),
+            poll_interval_ms=int(payload.get("poll_interval_ms", 250)),
+            order_profile=OrderProfile.from_dict(payload.get("order_profile")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     symbol: str = "9984"
     exchange: int = 27
@@ -267,6 +365,7 @@ class AppConfig:
     signals: SignalConfig = field(default_factory=SignalConfig)
     lollipop: LollipopConfig = field(default_factory=LollipopConfig)
     market_state: MarketStateConfig = field(default_factory=MarketStateConfig)
+    kabu: KabuConfig = field(default_factory=KabuConfig)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "AppConfig":
@@ -281,6 +380,7 @@ class AppConfig:
             signals=SignalConfig.from_dict(payload.get("signals")),
             lollipop=LollipopConfig.from_dict(payload.get("lollipop")),
             market_state=MarketStateConfig.from_dict(payload.get("market_state")),
+            kabu=KabuConfig.from_dict(payload.get("kabu")),
         )
 
 

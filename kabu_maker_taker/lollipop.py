@@ -1,3 +1,18 @@
+"""Take-profit (TP) state machine — the "lollipop" exit manager.
+
+State transitions::
+
+    IDLE ──on_entry_fill()──► SCHEDULED ──(tp_delay expires)──► ACTIVE
+                                                                    │
+                              ◄──────── on_exit_fill() ────────────┘
+                              │
+                              ◄──────── timeout ──────────► (force-exit market order)
+
+In ACTIVE state the manager emits a passive limit TP order each tick.
+If the limit order is canceled the manager reschedules (re-enters SCHEDULED).
+If it is rejected the manager immediately force-exits with a market order.
+After ``max_retries`` the strategy falls back to a market order regardless.
+"""
 from __future__ import annotations
 
 import math
@@ -58,6 +73,27 @@ class LollipopTPManager:
 
     def reset(self) -> None:
         self.state = LollipopState()
+
+    def restore_active_exit(
+        self,
+        *,
+        tp_price: float,
+        entry_mode: str,
+        entry_side: int,
+        entry_ts_ns: int,
+        retry_count: int = 1,
+    ) -> None:
+        """Restore an already-working TP order from broker reconciliation."""
+        self.state = LollipopState(
+            phase=LollipopPhase.ACTIVE,
+            tp_price=tp_price,
+            entry_mode=entry_mode,
+            entry_side=entry_side,
+            entry_ts_ns=entry_ts_ns,
+            submit_after_ns=0,
+            retry_count=max(retry_count, 1),
+            force_exit_requested=False,
+        )
 
     # ------------------------------------------------------------------
     # Main tick — called on every board event

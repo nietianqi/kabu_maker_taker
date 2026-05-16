@@ -1,3 +1,17 @@
+"""Entry policy layer — MakerStrategy, TakerStrategy, and supporting utilities.
+
+Responsibilities:
+- ``MakerStrategy``:  Evaluates whether conditions favour a passive limit order
+  and computes a fair/reservation price, quote price, and cancel signals.
+- ``TakerStrategy``:  Evaluates breakout conditions for aggressive market-order entry.
+- ``ConfirmationTracker``:  Counts consecutive ticks satisfying entry criteria.
+- ``MarketStateDetector``:  Flags abnormal market conditions (wide spread, high
+  event rate, large price jumps).
+
+Module-level constants exposed for cross-module use:
+  ``ENTRY_MODE_MAKER / ENTRY_MODE_TAKER`` — order strategy label strings.
+  ``ORDER_ROLE_ENTRY / ORDER_ROLE_EXIT``  — order ledger role labels.
+"""
 from __future__ import annotations
 
 import math
@@ -260,7 +274,11 @@ class MakerStrategy:
             return fair_price
         signed_qty = position.side * position.qty
         inventory_ratio = signed_qty / max_inventory_qty
-        multiplier = 1.5 if abs(inventory_ratio) >= 0.66 else 1.0
+        multiplier = (
+            self.config.inventory_high_multiplier
+            if abs(inventory_ratio) >= self.config.inventory_high_threshold
+            else 1.0
+        )
         skew_ticks = self.config.inventory_skew_ticks * multiplier * inventory_ratio
         return fair_price - skew_ticks * self.tick_size
 

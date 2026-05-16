@@ -141,6 +141,59 @@ class P1RiskControlTests(unittest.TestCase):
         recovered = strategy.on_board(_snapshot(base + 3_000_000_000), now_ns=base + 3_000_000_000)
         self.assertIsNotNone(recovered.intent)
 
+    def test_latency_circuit_opens_after_consecutive_submit_breaches(self) -> None:
+        base = 1_000_000_000
+        strategy = _strategy(
+            risk=RiskConfig(
+                max_spread_ticks=5.0,
+                order_latency_limit_ms=10,
+                latency_breach_limit=2,
+                api_cooling_seconds=2,
+            )
+        )
+
+        self.assertFalse(strategy.on_rest_latency("submit", 11.0, base))
+        self.assertEqual(strategy.risk.latency_breach_count("submit"), 1)
+        self.assertTrue(strategy.on_rest_latency("submit", 12.0, base + 1))
+        self.assertEqual(strategy.metrics.latency_circuit_opens, 1)
+
+        blocked = strategy.on_board(_snapshot(base + 10), now_ns=base + 10)
+        self.assertIsNone(blocked.intent)
+        self.assertEqual(blocked.blocked_reason, "latency_circuit_open")
+        self.assertEqual(strategy.metrics.latency_blocks, 1)
+
+        recovered = strategy.on_board(_snapshot(base + 3_000_000_000), now_ns=base + 3_000_000_000)
+        self.assertIsNotNone(recovered.intent)
+        self.assertEqual(strategy.risk.latency_breach_count("submit"), 0)
+
+    def test_latency_circuit_tracks_cancel_and_poll_independently(self) -> None:
+        base = 1_000_000_000
+        strategy = _strategy(
+            risk=RiskConfig(
+                max_spread_ticks=5.0,
+                cancel_latency_limit_ms=10,
+                poll_latency_limit_ms=20,
+                latency_breach_limit=2,
+                api_cooling_seconds=2,
+            )
+        )
+
+        self.assertFalse(strategy.on_rest_latency("cancel", 11.0, base))
+        self.assertFalse(strategy.on_rest_latency("poll", 21.0, base + 1))
+        self.assertEqual(strategy.risk.latency_breach_count("cancel"), 1)
+        self.assertEqual(strategy.risk.latency_breach_count("poll"), 1)
+        self.assertFalse(strategy.on_rest_latency("cancel", 5.0, base + 2))
+        self.assertEqual(strategy.risk.latency_breach_count("cancel"), 0)
+
+        self.assertTrue(strategy.on_rest_latency("poll", 22.0, base + 3))
+        blocked = strategy.on_board(_snapshot(base + 10), now_ns=base + 10)
+        self.assertEqual(blocked.blocked_reason, "latency_circuit_open")
+
+        metrics = strategy.metrics.to_dict()
+        self.assertEqual(metrics["cancel_latency_ms_count"], 2)
+        self.assertEqual(metrics["poll_latency_ms_count"], 2)
+        self.assertEqual(metrics["poll_latency_ms_max"], 22.0)
+
     def test_restore_position_long_and_short_start_lollipop_exit_management(self) -> None:
         strategy = _strategy()
         restored = strategy.restore_position(side=1, qty=100, avg_price=101.0, now_ns=1_000_000_000)

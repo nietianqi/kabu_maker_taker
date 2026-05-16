@@ -15,7 +15,7 @@ without coupling strategy logic to a broker gateway.
 - `CombinedMakerTakerStrategy` gives taker priority, falls back to maker, applies confirmation
   counters, position sizing, and risk gates, then emits one `OrderIntent`.
 
-This project currently emits dry-run order intents. The live kabu REST adapter should be added at
+By default this project emits dry-run order intents. The optional live kabu REST adapter sits at
 the `OrderIntent` boundary, so the strategy layer stays testable.
 
 ## Run
@@ -41,3 +41,38 @@ Then run:
 python main.py --config config.example.json --events events.jsonl
 ```
 
+## Live kabu REST execution
+
+Live mode is explicit and guarded:
+
+```powershell
+python main.py --config config.json --events events.jsonl --live
+```
+
+Requirements:
+
+- `config.json` must set `"dry_run": false`.
+- `config.json` must include `kabu.api_password`.
+- `risk.api_error_limit` must be greater than `0`, so live REST failures can trip the API circuit breaker.
+- `risk.order_latency_limit_ms`, `risk.cancel_latency_limit_ms`, `risk.poll_latency_limit_ms`,
+  and `risk.latency_breach_limit` protect live mode from slow REST responses. The default is
+  `3000ms` for each request class and `3` consecutive breaches.
+- `--live --sample` is rejected so embedded sample events cannot place real orders.
+
+The live adapter starts by fetching a kabu Station token, checking broker positions/orders, and
+reconciling positions into the strategy. It refuses to start if kabu Station already has active
+orders that this process cannot safely own.
+
+Live execution has two independent stop circuits. API failures trip the existing API circuit,
+while slow `submit`, `cancel`, or order-poll REST calls trip the latency circuit after consecutive
+breaches. Either circuit stops live execution with `status=live_halted`; during the latency cooling
+window, new entries are blocked with `latency_circuit_open`. The latency cooling duration reuses
+`risk.api_cooling_seconds`.
+
+In live mode, aggressive taker intents and lollipop timeout/stop exits are mapped to kabu
+`IOC指値` orders (`FrontOrderType=27`) with a limit price derived from `reference_price` plus
+`strategy.max_slip_ticks` (or the intent's `max_slip_ticks` when set). This preserves the strategy
+meaning of `OrderIntent.is_market=true` while avoiding unbounded live market-order slippage.
+
+This remains a REST execution validation mode for controlled `--events` input; it does not yet
+provide a full WebSocket market-data loop or unattended live-trading runtime.

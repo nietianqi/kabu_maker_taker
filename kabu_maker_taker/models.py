@@ -1,3 +1,17 @@
+"""Core domain models — immutable data structures shared across all layers.
+
+Key types:
+- ``BoardSnapshot`` / ``TradePrint`` — raw market data (from kabu Station push)
+- ``SignalPacket``  — computed microstructure signals from ``MicrostructureSignalEngine``
+- ``OrderIntent``  — what the strategy wants to submit (side, price, qty, market/limit)
+- ``OrderState``   — mutable order tracking state (status, cum_qty, fills)
+- ``BrokerOrderEvent`` / ``BrokerFillEvent`` — broker acknowledgements and fills
+- ``StrategyResult`` — on_board() output: intent + decision + signal + diagnostics
+
+All value-object dataclasses use ``frozen=True, slots=True`` for immutability
+and fast attribute access.  Mutable order state (``OrderState``) uses ``slots=True``
+only.
+"""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field

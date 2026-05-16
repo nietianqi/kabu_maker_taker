@@ -1,3 +1,15 @@
+"""Order ledger — tracks every order from intent through final status.
+
+Responsibilities:
+- Assign and track client order IDs (sequential, prefixed by role).
+- Record broker order IDs returned after submission.
+- Apply incremental and cumulative fill events; deduplicate by ``trade_id``.
+- Maintain a bounded history of completed orders (``max_final_history``).
+
+The ledger never touches position state — that is the strategy's job after
+it calls ``apply_fill_event()`` or ``apply_order_event()`` and receives back
+the net fill qty.
+"""
 from __future__ import annotations
 
 from collections import deque
@@ -22,6 +34,9 @@ class OrderLedger:
         self._broker_to_client: dict[str, str] = {}
         self._max_final_history = max(0, int(max_final_history))
         self._next_sequence = 1
+        # Per-order set of already-applied fill trade_ids for replay deduplication.
+        # Cleaned up when an order is pruned from final history.
+        self._order_fill_ids: dict[str, set[str]] = {}
 
     def next_client_order_id(self, prefix: str = "local") -> str:
         value = f"{prefix}-{self._next_sequence}"
@@ -32,6 +47,7 @@ class OrderLedger:
         client_order_id = intent.client_order_id or self.next_client_order_id(role)
         if intent.client_order_id != client_order_id:
             intent = replace(intent, client_order_id=client_order_id)
+        self._bump_sequence_from_id(client_order_id)
         state = OrderState(
             client_order_id=client_order_id,
             intent=intent,
@@ -43,16 +59,58 @@ class OrderLedger:
         self._active_ids.add(client_order_id)
         return state
 
+    def restore_order(
+        self,
+        intent: OrderIntent,
+        *,
+        role: str,
+        status: OrderStatus | str = OrderStatus.WORKING,
+        broker_order_id: str = "",
+        submitted_ts_ns: int = 0,
+        updated_ts_ns: int = 0,
+        cum_qty: int = 0,
+        avg_fill_price: float = 0.0,
+    ) -> OrderState:
+        """Restore an already-submitted broker order without applying position fills."""
+        client_order_id = intent.client_order_id or self.next_client_order_id(role)
+        if intent.client_order_id != client_order_id:
+            intent = replace(intent, client_order_id=client_order_id)
+        self._bump_sequence_from_id(client_order_id)
+        normalized_status = _coerce_status(status)
+        normalized_cum = min(max(cum_qty, 0), intent.qty)
+        if normalized_cum >= intent.qty:
+            normalized_status = OrderStatus.FILLED
+        elif normalized_cum > 0 and normalized_status in {OrderStatus.NEW_PENDING, OrderStatus.WORKING, OrderStatus.UNKNOWN}:
+            normalized_status = OrderStatus.PARTIALLY_FILLED
+        state = OrderState(
+            client_order_id=client_order_id,
+            intent=intent,
+            role=role,
+            status=normalized_status,
+            broker_order_id=broker_order_id,
+            submitted_ts_ns=submitted_ts_ns,
+            updated_ts_ns=updated_ts_ns or submitted_ts_ns,
+            cum_qty=normalized_cum,
+            avg_fill_price=avg_fill_price if normalized_cum > 0 else 0.0,
+        )
+        self._orders[client_order_id] = state
+        if broker_order_id:
+            self._broker_to_client[broker_order_id] = client_order_id
+        self._sync_active(state)
+        return state
+
     def get(self, order_id: str) -> OrderState | None:
         return self._orders.get(self._resolve(order_id))
 
     def active(self) -> list[OrderState]:
-        return [self._orders[oid] for oid in list(self._active_ids) if oid in self._orders]
+        # Iterate the set directly — no intermediate list allocation.
+        return [self._orders[oid] for oid in self._active_ids if oid in self._orders]
 
     def active_by_role(self, role: str) -> list[OrderState]:
+        # Iterate the set directly — no intermediate list allocation.
         return [
             self._orders[oid]
-            for oid in list(self._active_ids)
+            for oid in self._active_ids
             if oid in self._orders and self._orders[oid].role == role
         ]
 
@@ -93,7 +151,9 @@ class OrderLedger:
 
         if order.cum_qty >= order.intent.qty:
             order.status = OrderStatus.FILLED
-        elif order.cum_qty > 0 and order.status not in {OrderStatus.CANCELED, OrderStatus.REJECTED}:
+        elif status in {OrderStatus.CANCELED, OrderStatus.REJECTED}:
+            order.status = status
+        elif order.cum_qty > 0:
             order.status = OrderStatus.PARTIALLY_FILLED
 
         order.updated_ts_ns = event.ts_ns or order.updated_ts_ns
@@ -109,10 +169,17 @@ class OrderLedger:
             self._broker_to_client[event.broker_order_id] = order.client_order_id
         if event.price <= 0:
             return order, 0, 0.0
+        # Deduplicate fills by trade_id to handle broker replays.
+        if event.trade_id:
+            seen = self._order_fill_ids.get(order.client_order_id)
+            if seen is not None and event.trade_id in seen:
+                return order, 0, event.price  # duplicate — already applied
         fill_qty = min(max(event.qty, 0), order.leaves_qty)
         if fill_qty <= 0 or order.is_final:
             return order, 0, event.price
         self._apply_incremental_fill(order, fill_qty, event.price)
+        if event.trade_id:
+            self._order_fill_ids.setdefault(order.client_order_id, set()).add(event.trade_id)
         order.updated_ts_ns = event.ts_ns or order.updated_ts_ns
         self._sync_active(order)
         return order, fill_qty, event.price
@@ -142,6 +209,14 @@ class OrderLedger:
             order = self._orders.pop(order_id, None)
             if order is not None and order.broker_order_id:
                 self._broker_to_client.pop(order.broker_order_id, None)
+            self._order_fill_ids.pop(order_id, None)  # prevent unbounded growth
+
+    def _bump_sequence_from_id(self, client_order_id: str) -> None:
+        try:
+            suffix = int(str(client_order_id).rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return
+        self._next_sequence = max(self._next_sequence, suffix + 1)
 
     def _apply_cumulative_fill(self, order: OrderState, cum_qty: int, avg_price: float) -> tuple[int, float]:
         normalized_cum = min(max(cum_qty, 0), order.intent.qty)

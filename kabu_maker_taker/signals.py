@@ -1,3 +1,20 @@
+"""Microstructure signal engine — computes all per-tick alpha signals.
+
+Signal pipeline (called on every board snapshot):
+  1. ``_book_imbalance()``  — decay-weighted OBI from L2 bids/asks
+  2. ``_lob_ofi()``         — LOB order-flow imbalance vs. previous snapshot
+  3. ``TapePressure``       — tape OFI over 15 s / 1 s / 500 ms windows
+  4. ``_micro_signals()``   — microprice, momentum EMA, tilt
+  5. ``RollingZScore``      — z-score normalization for five raw signals
+  6. ``WallDetector``       — large resting-order detection and consumption
+  7. ``CancelImbalanceTracker`` — bid/ask cancel ratio estimation
+  8. ``BreakoutTracker``    — recent-high/low price breakout detection
+  9. ``VolExpansionDetector`` — volatility expansion flag
+ 10. ``MicropriceStreakTracker`` — consecutive directional microprice moves
+
+All helper classes use ``__slots__`` for faster attribute access and
+reduced per-instance memory overhead.
+"""
 from __future__ import annotations
 
 import math
@@ -8,6 +25,13 @@ from .models import BoardSnapshot, Level, SignalPacket, TradePrint
 
 
 class RollingZScore:
+    """Streaming z-score with Welford-style running sums (O(1) per update).
+
+    Returns 0.0 until ``min_samples`` are accumulated; clamps output to [-4, 4].
+    """
+
+    __slots__ = ("window", "min_samples", "values", "sum_x", "sum_x2")
+
     def __init__(self, window: int):
         self.window = max(int(window), 1)
         self.min_samples = min(self.window, 20)
@@ -37,6 +61,13 @@ class RollingZScore:
 
 
 class RollingStdTicks:
+    """Rolling standard deviation expressed in tick units.
+
+    Returns 0.0 until at least 5 samples are present.
+    """
+
+    __slots__ = ("window", "tick_size", "values", "sum_x", "sum_x2")
+
     def __init__(self, window: int, tick_size: float):
         self.window = max(int(window), 2)
         self.tick_size = max(tick_size, 1e-9)
@@ -61,6 +92,23 @@ class RollingStdTicks:
 
 
 class TapePressure:
+    """Tape order-flow imbalance across three time windows.
+
+    - ``current`` — full window (``window_seconds``, default 15 s)
+    - ``ofi_1s``  — last 1 second
+    - ``burst``   — last 500 ms (trade-burst indicator)
+
+    All three are OFI ratios in [-1, +1]: (buys − sells) / (buys + sells).
+    """
+
+    __slots__ = (
+        "window_ns", "win1s_ns", "burst_window_ns",
+        "events", "events_1s", "burst_events",
+        "buy_qty", "sell_qty",
+        "buy_qty_1s", "sell_qty_1s",
+        "burst_buy_qty", "burst_sell_qty",
+    )
+
     def __init__(self, window_seconds: int):
         self.window_ns = max(window_seconds, 1) * 1_000_000_000
         self.win1s_ns = 1_000_000_000
@@ -121,7 +169,14 @@ class TapePressure:
 
 
 class WallDetector:
-    """Detects large resting orders (walls) and tracks whether they were consumed by trades."""
+    """Detects large resting orders (walls) and tracks whether they were consumed by trades.
+
+    A wall is defined as L1 size ≥ ``ratio_threshold × EMA(L1_size)``.
+    Consumption requires both a size drop *and* actual fills at that level —
+    a pure cancel (size drop without fills) is not counted as consumption.
+    """
+
+    __slots__ = ("alpha", "ratio", "_ask_ema", "_bid_ema", "_prev_ask1", "_prev_bid1")
 
     def __init__(self, ema_alpha: float, ratio_threshold: float):
         self.alpha = max(min(float(ema_alpha), 1.0), 1e-6)
@@ -176,7 +231,13 @@ class WallDetector:
 
 
 class CancelImbalanceTracker:
-    """Estimates how much of a bid/ask size drop is due to cancellations vs. fills."""
+    """Estimates how much of a bid/ask size drop is due to cancellations vs. fills.
+
+    cancel_qty = max(0, prev_size − curr_size − fills_at_side)
+    cancel_ratio = cancel_qty / prev_size   (clamped to [0, 1])
+    """
+
+    __slots__ = ()
 
     def update(
         self,
@@ -196,7 +257,13 @@ class CancelImbalanceTracker:
 
 
 class BreakoutTracker:
-    """Tracks whether mid price has broken above recent high or below recent low."""
+    """Tracks whether mid price has broken above recent high or below recent low.
+
+    Returns ``(breakout_long, breakout_short)``.  Both are False until the
+    history deque is fully populated (``lookback_bars`` boards).
+    """
+
+    __slots__ = ("lookback", "buffer", "history")
 
     def __init__(self, lookback_bars: int, buffer_ticks: float, tick_size: float):
         self.lookback = max(int(lookback_bars), 2)
@@ -217,7 +284,13 @@ class BreakoutTracker:
 
 
 class VolExpansionDetector:
-    """Detects when current volatility is significantly above its recent EMA."""
+    """Detects when current volatility is significantly above its recent EMA.
+
+    Triggers when ``mid_std_ticks >= vol_ema * ratio`` (and ``vol_ema > 0``).
+    Returns False on the first call (no history yet).
+    """
+
+    __slots__ = ("alpha", "ratio", "_vol_ema")
 
     def __init__(self, ema_alpha: float, ratio: float):
         self.alpha = max(min(float(ema_alpha), 1.0), 1e-6)
@@ -235,7 +308,12 @@ class VolExpansionDetector:
 
 
 class MicropriceStreakTracker:
-    """Counts consecutive board ticks where microprice moved up or down."""
+    """Counts consecutive board ticks where microprice moved up or down.
+
+    A flat tick (microprice unchanged) resets both streaks to 0.
+    """
+
+    __slots__ = ("_prev", "_up_streak", "_down_streak")
 
     def __init__(self) -> None:
         self._prev: float | None = None
@@ -262,6 +340,17 @@ class MicropriceStreakTracker:
 
 
 class MicrostructureSignalEngine:
+    """Top-level signal engine: wraps all sub-components and produces a SignalPacket per tick.
+
+    Call ``on_trade()`` for every tape print and ``on_board()`` for every
+    board snapshot.  ``on_board()`` returns the fully-populated SignalPacket.
+    """
+
+    # Note: __slots__ intentionally omitted here so tests can monkey-patch
+    # ``on_board`` (and other methods) without triggering AttributeError.
+    # The lightweight sub-components (RollingZScore, TapePressure, etc.) all
+    # use __slots__ where it matters most.
+
     def __init__(self, *, tick_size: float, config: SignalConfig):
         self.tick_size = max(tick_size, 1e-9)
         self.config = config
@@ -288,6 +377,13 @@ class MicrostructureSignalEngine:
         # Accumulated fills between board snapshots (reset on each on_board call)
         self._acc_fill_at_ask: int = 0
         self._acc_fill_at_bid: int = 0
+        # Pre-computed constants to avoid per-tick attribute lookups
+        alpha = max(min(float(config.microprice_ema_alpha), 1.0), 1e-6)
+        self._microprice_ema_alpha: float = alpha
+        self._microprice_ema_beta: float = 1.0 - alpha
+        w = max(min(float(config.lob_tape_ofi_weight), 1.0), 0.0)
+        self._lob_ofi_weight: float = w
+        self._tape_ofi_weight: float = 1.0 - w
 
     def on_trade(self, trade: TradePrint) -> float:
         result = self.tape.on_trade(trade)
@@ -305,7 +401,7 @@ class MicrostructureSignalEngine:
         tape_ofi_1s = self.tape.ofi_1s
         microprice, micro_momentum_raw, microprice_tilt_raw = self._micro_signals(snapshot)
         mid_std_ticks = self.mid_std.update(snapshot.mid)
-        integrated_ofi = 0.5 * lob_ofi_raw + 0.5 * tape_ofi_raw
+        integrated_ofi = self._lob_ofi_weight * lob_ofi_raw + self._tape_ofi_weight * tape_ofi_raw
 
         obi_z = self.z_obi.update(obi_raw)
         lob_z = self.z_lob.update(lob_ofi_raw)
@@ -459,6 +555,6 @@ class MicrostructureSignalEngine:
             momentum = 0.0
         else:
             momentum = (microprice - self.micro_ema) / self.tick_size
-            self.micro_ema = 0.2 * microprice + 0.8 * self.micro_ema
+            self.micro_ema = self._microprice_ema_alpha * microprice + self._microprice_ema_beta * self.micro_ema
         tilt = (microprice - snapshot.mid) / self.tick_size if self.config.use_microprice_tilt else 0.0
         return microprice, momentum, tilt

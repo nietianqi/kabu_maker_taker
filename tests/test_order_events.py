@@ -193,6 +193,61 @@ class BrokerOrderEventTests(unittest.TestCase):
         assert order is not None
         self.assertEqual(order.reject_reason, "broker_reject")
 
+    def test_cancel_pending_order_can_still_fill_and_become_filled(self) -> None:
+        strategy = _strategy()
+        result = strategy.on_board(_snapshot(), now_ns=1_000_000_000)
+        assert result.intent is not None
+        strategy.on_broker_order_event(
+            BrokerOrderEvent(order_id=result.intent.client_order_id, status=OrderStatus.WORKING, ts_ns=1_000_000_010)
+        )
+
+        strategy.request_cancel(result.intent.client_order_id, reason="alpha_flip", now_ns=1_000_000_020)
+        outcome = strategy.on_broker_fill(
+            BrokerFillEvent(order_id=result.intent.client_order_id, qty=100, price=100.0, ts_ns=1_000_000_030)
+        )
+
+        order = strategy.orders.get(result.intent.client_order_id)
+        assert order is not None
+        self.assertEqual(outcome, "entry")
+        self.assertEqual(order.status, OrderStatus.FILLED)
+        self.assertEqual(strategy.position.qty, 100)
+
+    def test_partial_fill_then_cancel_keeps_fill_and_finalizes_remaining_qty(self) -> None:
+        strategy = _strategy()
+        result = strategy.on_board(_snapshot(), now_ns=1_000_000_000)
+        assert result.intent is not None
+
+        self.assertEqual(
+            strategy.on_broker_order_event(
+                BrokerOrderEvent(
+                    order_id=result.intent.client_order_id,
+                    status=OrderStatus.PARTIALLY_FILLED,
+                    cum_qty=40,
+                    avg_fill_price=100.0,
+                    ts_ns=1_000_000_010,
+                )
+            ),
+            "entry",
+        )
+        outcome = strategy.on_broker_order_event(
+            BrokerOrderEvent(
+                order_id=result.intent.client_order_id,
+                status=OrderStatus.CANCELED,
+                cum_qty=40,
+                avg_fill_price=100.0,
+                ts_ns=1_000_000_020,
+                reason="cancel_ack",
+            )
+        )
+
+        order = strategy.orders.get(result.intent.client_order_id)
+        assert order is not None
+        self.assertEqual(outcome, OrderStatus.CANCELED.value)
+        self.assertEqual(order.status, OrderStatus.CANCELED)
+        self.assertEqual(order.cum_qty, 40)
+        self.assertEqual(strategy.position.qty, 40)
+        self.assertFalse(strategy.entry_order_active)
+
     def test_exit_order_fill_closes_position_from_broker_event(self) -> None:
         strategy = _strategy()
         entry = strategy.on_board(_snapshot(), now_ns=1_000_000_000)

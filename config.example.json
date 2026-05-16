@@ -4,6 +4,25 @@
   "tick_size": 1.0,
   "lot_size": 100,
   "dry_run": true,
+  "kabu": {
+    "base_url": "http://localhost:18080",
+    "api_password": "",
+    "order_rate_per_sec": 4.0,
+    "poll_rate_per_sec": 4.0,
+    "poll_interval_ms": 250,
+    "order_profile": {
+      "mode": "margin",
+      "allow_short": false,
+      "account_type": 4,
+      "margin_trade_type": 1,
+      "margin_open_fund_type": "11",
+      "margin_open_deliv_type": 0,
+      "margin_close_deliv_type": 2,
+      "front_order_type_limit": 20,
+      "front_order_type_market": 10,
+      "front_order_type_ioc_limit": 27
+    }
+  },
   "strategy": {
     "trade_qty": 100,
     "allow_short": false,
@@ -55,6 +74,10 @@
     "max_cancel_requests_per_minute": 0,
     "api_error_limit": 0,
     "api_cooling_seconds": 120,
+    "order_latency_limit_ms": 3000,
+    "cancel_latency_limit_ms": 3000,
+    "poll_latency_limit_ms": 3000,
+    "latency_breach_limit": 3,
     "fee_per_share": 0.0,
     "slippage_ticks_default": 0.0
   },
