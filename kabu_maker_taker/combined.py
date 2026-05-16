@@ -26,6 +26,7 @@ from .models import (
     BrokerFillEvent,
     BrokerOrderEvent,
     EntryDecision,
+    LollipopPhase,
     MarketState,
     OrderIntent,
     OrderState,
@@ -101,10 +102,14 @@ class CombinedMakerTakerStrategy:
             symbol=self.config.symbol,
             exchange=self.config.exchange,
         )
-        exit_intent = lollipop_action.intent if lollipop_action.action != "none" else None
-        if exit_intent is not None:
-            exit_intent = self._track_intent(exit_intent, role=ORDER_ROLE_EXIT, now_ns=ts)
-            self.metrics.record_exit_intent(exit_intent)
+        exit_cancel_signal = ""
+        exit_intent = None
+        if lollipop_action.intent is not None:
+            if lollipop_action.action == "force_exit" and self.orders.active_by_role(ORDER_ROLE_EXIT):
+                exit_cancel_signal = "replace_active_exit_before_force_exit"
+            else:
+                exit_intent = self._track_intent(lollipop_action.intent, role=ORDER_ROLE_EXIT, now_ns=ts)
+                self.metrics.record_exit_intent(exit_intent)
 
         if self.entry_order_active:
             entry_cancel_signal = ""
@@ -138,6 +143,7 @@ class CombinedMakerTakerStrategy:
                 exit_intent=exit_intent,
                 entry_cancel_signal=entry_cancel_signal,
                 entry_cancel_blocked_reason=entry_cancel_blocked_reason,
+                exit_cancel_signal=exit_cancel_signal,
                 market_state=market_state,
             )
             self.last_result = result
@@ -150,6 +156,7 @@ class CombinedMakerTakerStrategy:
                 signal,
                 blocked_reason="lollipop_active",
                 exit_intent=exit_intent,
+                exit_cancel_signal=exit_cancel_signal,
                 market_state=market_state,
             )
             self.last_result = result
@@ -165,6 +172,7 @@ class CombinedMakerTakerStrategy:
                 blocked_reason=decision.reason or "confirming",
                 confirm_progress=progress,
                 exit_intent=exit_intent,
+                exit_cancel_signal=exit_cancel_signal,
                 market_state=market_state,
             )
             self.last_result = result
@@ -182,6 +190,7 @@ class CombinedMakerTakerStrategy:
                 blocked_reason="qty_zero",
                 confirm_progress=progress,
                 exit_intent=exit_intent,
+                exit_cancel_signal=exit_cancel_signal,
                 market_state=market_state,
             )
             self.last_result = result
@@ -205,6 +214,7 @@ class CombinedMakerTakerStrategy:
                 blocked_reason=reason,
                 confirm_progress=progress,
                 exit_intent=exit_intent,
+                exit_cancel_signal=exit_cancel_signal,
                 market_state=market_state,
             )
             self.last_result = result
@@ -242,6 +252,7 @@ class CombinedMakerTakerStrategy:
             signal,
             confirm_progress=progress,
             exit_intent=exit_intent,
+            exit_cancel_signal=exit_cancel_signal,
             market_state=market_state,
         )
         self.entry_order_active = True
@@ -453,6 +464,28 @@ class CombinedMakerTakerStrategy:
         """
         return [o.client_order_id for o in self.orders.active_by_role(ORDER_ROLE_ENTRY)]
 
+    @property
+    def working_exit_ids(self) -> list[str]:
+        """Client order IDs of all active (non-final) exit orders."""
+        return [o.client_order_id for o in self.orders.active_by_role(ORDER_ROLE_EXIT)]
+
+    def release_deferred_force_exit(self, snapshot: BoardSnapshot, *, now_ns: int) -> OrderIntent | None:
+        """Release a force-exit intent after active exit orders have been cleared."""
+        if self.position.qty <= 0 or self.working_exit_ids:
+            return None
+        action = self.lollipop.tick(
+            snapshot,
+            self.position,
+            now_ns,
+            symbol=self.config.symbol,
+            exchange=self.config.exchange,
+        )
+        if action.action != "force_exit" or action.intent is None:
+            return None
+        intent = self._track_intent(action.intent, role=ORDER_ROLE_EXIT, now_ns=now_ns)
+        self.metrics.record_exit_intent(intent)
+        return intent
+
     def clear_entry_order(self) -> None:
         for order in self.orders.active_by_role(ORDER_ROLE_ENTRY):
             self.orders.mark_cancel_pending(order.client_order_id, reason="clear_entry_order")
@@ -481,7 +514,11 @@ class CombinedMakerTakerStrategy:
         if not order.is_final or order.role != ORDER_ROLE_EXIT or self.position.qty <= 0:
             return
         if order.status == OrderStatus.CANCELED:
-            self.lollipop.reschedule(now_ns)
+            if self.lollipop.phase == LollipopPhase.TIMEOUT:
+                # Force-exit was cancelled — allow re-emission on next tick
+                self.lollipop.reset_force_exit()
+            else:
+                self.lollipop.reschedule(now_ns)
         elif order.status == OrderStatus.REJECTED:
             self.lollipop.force_exit_next_tick()
 

@@ -304,5 +304,155 @@ class LollipopIntegrationTests(unittest.TestCase):
             self.assertIsNone(result2.intent, "should not open new entry while lollipop active")
 
 
+class ForceExitOneShotTests(unittest.TestCase):
+    """Verify that TIMEOUT emits force_exit exactly once until reset."""
+
+    def _make_timeout_mgr(self) -> LollipopTPManager:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        # Advance to ACTIVE
+        pos = _pos(100.0)
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        # Manually push to TIMEOUT
+        mgr.force_exit_next_tick()
+        return mgr
+
+    def test_force_exit_emitted_only_once_per_timeout(self) -> None:
+        """First tick in TIMEOUT → force_exit; second tick → none (already emitted)."""
+        mgr = self._make_timeout_mgr()
+        pos = _pos(100.0)
+
+        action1 = mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        self.assertEqual(action1.action, "force_exit")
+        self.assertIsNotNone(action1.intent)
+        self.assertTrue(action1.intent.is_market)
+
+        action2 = mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        self.assertEqual(action2.action, "none")
+
+    def test_force_exit_emitted_again_after_reset(self) -> None:
+        """After reset_force_exit(), next tick re-emits force_exit."""
+        mgr = self._make_timeout_mgr()
+        pos = _pos(100.0)
+
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)  # first emission
+        mgr.reset_force_exit()
+
+        action = mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        self.assertEqual(action.action, "force_exit")
+        self.assertIsNotNone(action.intent)
+
+    def test_position_flat_in_timeout_resets_to_idle(self) -> None:
+        """position.qty=0 while in TIMEOUT → tick() returns none and state goes IDLE."""
+        mgr = self._make_timeout_mgr()
+        flat_pos = PositionState()  # qty=0
+
+        action = mgr.tick(_snap(), flat_pos, now_ns=0, **_KW)
+        self.assertEqual(action.action, "none")
+        self.assertEqual(mgr.phase, LollipopPhase.IDLE)
+        self.assertFalse(mgr.is_busy)
+
+    def test_canceled_exit_in_timeout_resets_force_exit_flag(self) -> None:
+        """CANCELED exit order while in TIMEOUT: force_exit_requested becomes False."""
+        from kabu_maker_taker.models import BrokerFillEvent, BrokerOrderEvent, OrderStatus, TradePrint
+
+        from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+        from kabu_maker_taker.config import AppConfig, LollipopConfig, RiskConfig, StrategyConfig
+
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            tick_size=1.0,
+            lot_size=100,
+            lollipop=LollipopConfig(
+                maker_tp_ticks=2.0,
+                taker_tp_ticks=3.0,
+                tp_delay_ms=0,
+                maker_max_hold_seconds=0,
+                taker_max_hold_seconds=0,
+                max_retries=3,
+            ),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+
+        # Simulate an entry fill to put lollipop into ACTIVE, then TIMEOUT
+        strategy.lollipop.on_entry_fill(100.0, "maker", now_ns=0, entry_side=1)
+        pos = _pos(100.0)
+        strategy.position.side = 1
+        strategy.position.qty = 100
+        strategy.position.avg_price = 100.0
+
+        # Manually enter TIMEOUT
+        strategy.lollipop.force_exit_next_tick()
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.TIMEOUT)
+
+        # Emit the force_exit (sets force_exit_requested=True)
+        strategy.lollipop.tick(_snap(), strategy.position, 0, **_KW)
+        self.assertTrue(strategy.lollipop.state.force_exit_requested)
+
+        # Add a fake working exit order to the ledger so on_broker_order_event can find it
+        from kabu_maker_taker.models import OrderIntent
+        from kabu_maker_taker.strategy import ORDER_ROLE_EXIT
+
+        intent = OrderIntent(
+            symbol="9984", exchange=27, side=-1, qty=100,
+            price=0.0, is_market=True, strategy="lollipop_tp",
+            reason="timeout_exit", score=0, reference_price=100.0,
+        )
+        tracked = strategy.orders.add_intent(intent, role=ORDER_ROLE_EXIT, now_ns=0)
+        oid = tracked.client_order_id
+
+        cancel_event = BrokerOrderEvent(order_id=oid, status=OrderStatus.CANCELED)
+        strategy.on_broker_order_event(cancel_event)
+
+        # force_exit_requested should be cleared so we can retry
+        self.assertFalse(strategy.lollipop.state.force_exit_requested)
+
+    def test_canceled_exit_in_active_reschedules(self) -> None:
+        """CANCELED exit order while in ACTIVE phase → lollipop goes back to SCHEDULED."""
+        from kabu_maker_taker.models import BrokerOrderEvent, OrderStatus, OrderIntent
+        from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+        from kabu_maker_taker.config import AppConfig, LollipopConfig
+        from kabu_maker_taker.strategy import ORDER_ROLE_EXIT
+
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            tick_size=1.0,
+            lot_size=100,
+            lollipop=LollipopConfig(
+                maker_tp_ticks=2.0,
+                taker_tp_ticks=3.0,
+                tp_delay_ms=0,
+                maker_max_hold_seconds=300,
+                taker_max_hold_seconds=300,
+                max_retries=3,
+            ),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.lollipop.on_entry_fill(100.0, "maker", now_ns=0, entry_side=1)
+        strategy.position.side = 1
+        strategy.position.qty = 100
+        strategy.position.avg_price = 100.0
+
+        # Advance to ACTIVE via tick
+        strategy.lollipop.tick(_snap(), strategy.position, 0, **_KW)
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.ACTIVE)
+
+        # Add a fake working exit order and cancel it
+        intent = OrderIntent(
+            symbol="9984", exchange=27, side=-1, qty=100,
+            price=102.0, is_market=False, strategy="lollipop_tp",
+            reason="limit_tp", score=0, reference_price=100.0,
+        )
+        tracked = strategy.orders.add_intent(intent, role=ORDER_ROLE_EXIT, now_ns=0)
+        oid = tracked.client_order_id
+
+        cancel_event = BrokerOrderEvent(order_id=oid, status=OrderStatus.CANCELED)
+        strategy.on_broker_order_event(cancel_event)
+
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.SCHEDULED)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -334,7 +334,7 @@ class OrderProfile:
 @dataclass(frozen=True, slots=True)
 class KabuConfig:
     base_url: str = "http://localhost:18080"
-    api_password: str = "japan202303"
+    api_password: str = ""
     order_rate_per_sec: float = 4.0
     poll_rate_per_sec: float = 4.0
     poll_interval_ms: int = 250

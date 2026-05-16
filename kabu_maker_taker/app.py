@@ -14,6 +14,7 @@ from .execution import KabuApiError, KabuRestExecutor
 from .journal import TradeJournal
 from .live_runtime import (
     check_kill_switch as _check_kill_switch,
+    emergency_flatten as _emergency_flatten,
     handle_live_execution as _handle_live_execution,
     live_halted as _live_halted,
     poll_live as _poll_live,
@@ -156,11 +157,11 @@ def main(argv: list[str] | None = None) -> int:
             auto_fix_negative_spread=config.signals.auto_fix_negative_spread,
         )
 
-        # Kill-switch check (live mode): update soft-kill flag or force-exit
+        # Kill-switch check: works in both dry-run and live modes
+        ks = _check_kill_switch(config)
+        if ks == "hard":
+            return _halt_live(strategy, live_executor, config, snapshot, "kill_switch_hard", snapshot.ts_ns, simulator=simulator)
         if live_executor is not None:
-            ks = _check_kill_switch(config)
-            if ks == "hard":
-                return _live_halted(strategy, "kill_switch_hard")
             strategy.risk.set_soft_kill(ks == "soft")
 
         if live_executor is None:
@@ -169,9 +170,21 @@ def main(argv: list[str] | None = None) -> int:
         else:
             halt_reason = _poll_live(strategy, live_executor, now_ns=snapshot.ts_ns)
             if halt_reason:
-                return _live_halted(strategy, halt_reason)
+                return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
         result = strategy.on_board(snapshot, now_ns=snapshot.ts_ns)
         tracer.record(result, strategy.position, snapshot.ts_ns)
+        if result.exit_cancel_signal:
+            halt_reason = _handle_exit_cancel_signal(
+                strategy,
+                simulator,
+                live_executor,
+                result.exit_cancel_signal,
+                snapshot,
+                snapshot.ts_ns,
+                config,
+            )
+            if halt_reason:
+                return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
         if result.entry_cancel_signal:
             for oid in strategy.working_entry_ids:
                 order = strategy.request_cancel(oid, reason=result.entry_cancel_signal, now_ns=snapshot.ts_ns)
@@ -185,11 +198,11 @@ def main(argv: list[str] | None = None) -> int:
                         now_ns=snapshot.ts_ns,
                     )
                     if halt_reason:
-                        return _live_halted(strategy, halt_reason)
+                        return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
                     _sleep_before_live_poll(config)
                     halt_reason = _poll_live(strategy, live_executor, now_ns=snapshot.ts_ns)
                     if halt_reason:
-                        return _live_halted(strategy, halt_reason)
+                        return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
         if result.intent is not None:
             print(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
             if live_executor is None:
@@ -204,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                 )
                 if halt_reason:
-                    return _live_halted(strategy, halt_reason)
+                    return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
         if result.exit_intent is not None:
             if live_executor is None:
                 _submit_to_simulator(strategy, simulator, result.exit_intent, snapshot, snapshot.ts_ns)
@@ -218,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                 )
                 if halt_reason:
-                    return _live_halted(strategy, halt_reason)
+                    return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
 
     # Flush journal markouts and close diagnostic files
     if strategy.journal is not None:
@@ -249,6 +262,103 @@ def _submit_to_simulator(
             strategy.on_broker_order_event(event)
         elif isinstance(event, BrokerFillEvent):
             strategy.on_broker_fill(event)
+
+
+def _handle_exit_cancel_signal(
+    strategy: CombinedMakerTakerStrategy,
+    simulator: DryRunSimulator,
+    live_executor: KabuRestExecutor | None,
+    reason: str,
+    snapshot: BoardSnapshot,
+    now_ns: int,
+    config: AppConfig,
+) -> str:
+    if live_executor is None:
+        for oid in list(strategy.working_exit_ids):
+            order = strategy.request_cancel(oid, reason=reason, now_ns=now_ns)
+            if order is not None:
+                for cancel_event in simulator.cancel(oid, now_ns):
+                    strategy.on_broker_order_event(cancel_event)
+        deferred = strategy.release_deferred_force_exit(snapshot, now_ns=now_ns)
+        if deferred is None:
+            return ""
+        _submit_to_simulator(strategy, simulator, deferred, snapshot, now_ns)
+        return ""
+
+    for oid in list(strategy.working_exit_ids):
+        order = strategy.request_cancel(oid, reason=reason, now_ns=now_ns)
+        if order is None:
+            continue
+        halt_reason = _handle_live_execution(strategy, live_executor.cancel(order, now_ns=now_ns), now_ns=now_ns)
+        if halt_reason:
+            return halt_reason
+    _sleep_before_live_poll(config)
+    halt_reason = _poll_live(strategy, live_executor, now_ns=now_ns)
+    if halt_reason:
+        return halt_reason
+    deferred = strategy.release_deferred_force_exit(snapshot, now_ns=now_ns)
+    if deferred is None:
+        return ""
+    halt_reason = _submit_to_live(
+        strategy,
+        live_executor,
+        deferred,
+        ORDER_ROLE_EXIT,
+        now_ns,
+        config,
+    )
+    return halt_reason
+
+
+def _emergency_flatten_simulator(
+    strategy: CombinedMakerTakerStrategy,
+    simulator: DryRunSimulator,
+    snapshot: BoardSnapshot,
+    now_ns: int,
+) -> None:
+    """Cancel all working orders and force-close any open position in the simulator."""
+    for oid in list(strategy.working_exit_ids) + list(strategy.working_entry_ids):
+        order = strategy.request_cancel(oid, reason="emergency_flatten", now_ns=now_ns)
+        if order is not None:
+            for ev in simulator.cancel(oid, now_ns):
+                strategy.on_broker_order_event(ev)
+    if strategy.position.qty > 0:
+        strategy.lollipop.force_exit_next_tick()
+        action = strategy.lollipop.tick(
+            snapshot,
+            strategy.position,
+            now_ns,
+            symbol=strategy.config.symbol,
+            exchange=strategy.config.exchange,
+        )
+        if action.intent is not None:
+            tracked = strategy.orders.add_intent(action.intent, role=ORDER_ROLE_EXIT, now_ns=now_ns)
+            _submit_to_simulator(strategy, simulator, tracked.intent, snapshot, now_ns)
+
+
+def _halt_live(
+    strategy: CombinedMakerTakerStrategy,
+    live_executor: KabuRestExecutor | None,
+    config: AppConfig,
+    snapshot: BoardSnapshot,
+    reason: str,
+    now_ns: int,
+    *,
+    simulator: DryRunSimulator | None = None,
+) -> int:
+    cleanup = None
+    if live_executor is not None:
+        cleanup = _emergency_flatten(
+            strategy,
+            live_executor,
+            config,
+            snapshot,
+            now_ns=now_ns,
+            reason=reason,
+        )
+    elif simulator is not None:
+        _emergency_flatten_simulator(strategy, simulator, snapshot, now_ns)
+    return _live_halted(strategy, reason, cleanup=cleanup)
 
 
 def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:

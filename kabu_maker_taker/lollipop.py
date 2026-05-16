@@ -175,9 +175,13 @@ class LollipopTPManager:
         if position.qty <= 0:
             self.state = LollipopState()
             return LollipopAction(action="none")
+        if self.state.force_exit_requested:
+            # Already emitted once; wait for fill or an explicit reset_force_exit() call.
+            return LollipopAction(action="none")
         intent = self._build_force_exit_intent(snapshot, position, symbol=symbol, exchange=exchange)
         if intent is None:
             return LollipopAction(action="none")
+        self.state.force_exit_requested = True
         return LollipopAction(action="force_exit", intent=intent)
 
     # ------------------------------------------------------------------
@@ -283,6 +287,15 @@ class LollipopTPManager:
             delay_ns = self.config.tp_delay_ms * 1_000_000
             self.state.phase = LollipopPhase.SCHEDULED
             self.state.submit_after_ns = now_ns + delay_ns
+
+    def reset_force_exit(self) -> None:
+        """Allow re-emitting force_exit on the next tick.
+
+        Call after a force-exit order is cancelled so the manager retries.
+        No-op when not in TIMEOUT phase.
+        """
+        if self.state.phase == LollipopPhase.TIMEOUT:
+            self.state.force_exit_requested = False
 
     def force_exit_next_tick(self) -> None:
         """Move an active exit workflow to the taker escape path."""
