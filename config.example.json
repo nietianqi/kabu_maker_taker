@@ -55,7 +55,10 @@
     "vol_aware_sizing": false,
     "spread_expanded_ticks": 4.0,
     "min_order_age_ms": 100,
-    "microprice_streak_min": 3
+    "microprice_streak_min": 3,
+    "max_quote_drift_ticks": 1.0,
+    "queue_min_top_qty": 0,
+    "queue_retreat_ticks": 1.0
   },
   "risk": {
     "max_inventory_qty": 300,
@@ -71,7 +74,8 @@
     "open_start_hhmm_2": "12:30",
     "open_end_hhmm_2": "15:30",
     "max_entry_orders_per_minute": 0,
-    "max_cancel_requests_per_minute": 0,
+    "max_cancel_requests_per_minute": 30,
+    "stale_board_ms": 30000,
     "api_error_limit": 0,
     "api_cooling_seconds": 120,
     "order_latency_limit_ms": 3000,

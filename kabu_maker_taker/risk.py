@@ -27,7 +27,7 @@ from .models import BoardSnapshot, EntryDecision, PositionState
 
 JST = timezone(timedelta(hours=9))
 ONE_MINUTE_NS = 60_000_000_000
-URGENT_CANCEL_REASONS = {"abnormal_market", "spread_expanded"}
+URGENT_CANCEL_REASONS = {"abnormal_market", "spread_expanded", "stale_board"}
 LATENCY_REQUEST_KINDS = ("submit", "cancel", "poll")
 
 
@@ -48,6 +48,18 @@ class RiskManager:
         self._latency_breach_counts: dict[str, int] = {kind: 0 for kind in LATENCY_REQUEST_KINDS}
         self._latency_circuit_open_until_ns: int = 0
         self._soft_kill_active: bool = False
+        self._last_board_ts_ns: int = 0
+
+    def update_board_ts(self, ts_ns: int) -> None:
+        """Record the latest board timestamp for inter-board gap tracking."""
+        if ts_ns > 0:
+            self._last_board_ts_ns = ts_ns
+
+    def is_stale_board(self, ts_ns: int) -> bool:
+        """Return True if the gap from the previous board exceeds stale_board_ms."""
+        if self.config.stale_board_ms <= 0 or self._last_board_ts_ns <= 0:
+            return False
+        return (ts_ns - self._last_board_ts_ns) / 1_000_000 > self.config.stale_board_ms
 
     def set_soft_kill(self, active: bool) -> None:
         """Activate or deactivate the soft kill switch.
@@ -70,6 +82,8 @@ class RiskManager:
             return False, decision.reason
         if self._soft_kill_active:
             return False, "kill_switch_soft"
+        if self.is_stale_board(snapshot.ts_ns):
+            return False, "stale_board"
         self._ensure_daily_date(now_ns or snapshot.ts_ns)
         if self._api_circuit_open(now_ns):
             return False, "api_circuit_open"

@@ -212,6 +212,16 @@ class MakerStrategy:
             reference_price=reference_price,
         )
 
+    def compute_quote_price(
+        self,
+        snapshot: BoardSnapshot,
+        signal: SignalPacket,
+        side: int,
+    ) -> float:
+        """Recompute the ideal quote price (no inventory skew) for drift detection."""
+        fair = self._calc_fair_price(signal, snapshot.mid)
+        return self._select_quote_price(snapshot, signal, side, fair, self.tick_size)
+
     def calc_cancel_reason(
         self,
         signal: SignalPacket,
@@ -221,6 +231,8 @@ class MakerStrategy:
         *,
         current_spread: float = 0.0,
         order_age_ns: int = 0,
+        desired_price: float = 0.0,
+        board_stale: bool = False,
     ) -> str:
         """Return a non-empty string if the working maker order should be cancelled.
 
@@ -232,6 +244,9 @@ class MakerStrategy:
         # Urgent: abnormal market state
         if market_state == MarketState.ABNORMAL:
             return "abnormal_market"
+        # Urgent: stale board (inter-board gap exceeded threshold)
+        if board_stale:
+            return "stale_board"
         sign = working_side
         if sign == 0:
             return ""
@@ -258,6 +273,9 @@ class MakerStrategy:
             fair = self._calc_fair_price(signal, signal.mid)
             if abs(fair - working_price) / self.tick_size >= self.config.max_fair_drift_ticks:
                 return "fair_drift"
+        if desired_price > 0 and working_price > 0 and self.config.max_quote_drift_ticks > 0:
+            if abs(desired_price - working_price) / self.tick_size >= self.config.max_quote_drift_ticks:
+                return "quote_drift"
         return ""
 
     def _calc_fair_price(self, signal: SignalPacket, mid: float) -> float:
@@ -299,6 +317,11 @@ class MakerStrategy:
     ) -> float:
         half_spread_ticks = self._calc_half_spread(signal)
         extra_retreat_ticks = max(0.0, half_spread_ticks - self.config.min_half_spread_ticks)
+        # Queue-depth retreat: back away from a thin top-of-book to avoid adverse selection
+        if self.config.queue_min_top_qty > 0:
+            top_qty = snapshot.bid_size if side > 0 else snapshot.ask_size
+            if 0 < top_qty < self.config.queue_min_top_qty:
+                extra_retreat_ticks += self.config.queue_retreat_ticks
         if side > 0:
             base = snapshot.bid if self.config.maker_join_best else snapshot.bid - self.config.maker_retreat_ticks * tick
             base -= extra_retreat_ticks * tick

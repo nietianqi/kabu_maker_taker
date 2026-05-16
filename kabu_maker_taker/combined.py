@@ -89,6 +89,8 @@ class CombinedMakerTakerStrategy:
             self.last_result = result
             return result
 
+        board_stale = self.risk.is_stale_board(snapshot.ts_ns)
+        self.risk.update_board_ts(snapshot.ts_ns)
         market_state = self.market_state_detector.update(snapshot, ts)
         signal = self.signals.on_board(snapshot)
         self.metrics.on_board(snapshot)
@@ -117,6 +119,7 @@ class CombinedMakerTakerStrategy:
             if self._working_entry_side != 0:
                 entry_orders = self.orders.active_by_role(ORDER_ROLE_ENTRY)
                 order_age_ns = ts - entry_orders[-1].submitted_ts_ns if entry_orders else 0
+                desired_price = self.maker.compute_quote_price(snapshot, signal, self._working_entry_side)
                 raw_cancel_signal = self.maker.calc_cancel_reason(
                     signal,
                     self._working_entry_side,
@@ -124,6 +127,8 @@ class CombinedMakerTakerStrategy:
                     market_state,
                     current_spread=snapshot.spread,
                     order_age_ns=order_age_ns,
+                    desired_price=desired_price,
+                    board_stale=board_stale,
                 )
                 if raw_cancel_signal:
                     allowed_cancel, blocked_reason = self.risk.can_send_cancel_signal(raw_cancel_signal, ts)

@@ -146,6 +146,11 @@ class StrategyConfig:
     # Inventory skew amplifier: |inventory_ratio| >= high_threshold → multiply skew_ticks by high_multiplier
     inventory_high_threshold: float = 0.66
     inventory_high_multiplier: float = 1.5
+    # Quote-drift cancel: reprice when ideal quote drifts ≥N ticks from working price (0 = disabled)
+    max_quote_drift_ticks: float = 1.0
+    # Queue-depth retreat: retreat extra ticks when top-of-book < threshold (0 = disabled)
+    queue_min_top_qty: int = 0
+    queue_retreat_ticks: float = 1.0
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "StrategyConfig":
@@ -186,6 +191,9 @@ class StrategyConfig:
             microprice_streak_min=int(payload.get("microprice_streak_min", 3)),
             inventory_high_threshold=float(payload.get("inventory_high_threshold", 0.66)),
             inventory_high_multiplier=float(payload.get("inventory_high_multiplier", 1.5)),
+            max_quote_drift_ticks=float(payload.get("max_quote_drift_ticks", 1.0)),
+            queue_min_top_qty=int(payload.get("queue_min_top_qty", 0)),
+            queue_retreat_ticks=float(payload.get("queue_retreat_ticks", 1.0)),
         )
 
 
@@ -216,6 +224,8 @@ class RiskConfig:
     cancel_latency_limit_ms: int = 3000
     poll_latency_limit_ms: int = 3000
     latency_breach_limit: int = 3
+    # Stale-board guard: block entry + cancel working order if inter-board gap > this ms (0 = disabled)
+    stale_board_ms: int = 0
     # Cost model for dry-run accounting/backtest estimates
     fee_per_share: float = 0.0
     slippage_ticks_default: float = 0.0
@@ -244,6 +254,7 @@ class RiskConfig:
             cancel_latency_limit_ms=int(payload.get("cancel_latency_limit_ms", 3000)),
             poll_latency_limit_ms=int(payload.get("poll_latency_limit_ms", 3000)),
             latency_breach_limit=int(payload.get("latency_breach_limit", 3)),
+            stale_board_ms=int(payload.get("stale_board_ms", 0)),
             fee_per_share=float(payload.get("fee_per_share", 0.0)),
             slippage_ticks_default=float(payload.get("slippage_ticks_default", 0.0)),
         )
