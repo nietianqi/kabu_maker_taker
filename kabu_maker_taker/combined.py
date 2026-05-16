@@ -64,7 +64,7 @@ class CombinedMakerTakerStrategy:
         self.metrics = MetricsCollector(tick_size=config.tick_size)
         self.last_result: StrategyResult | None = None
         self.journal: TradeJournal | None = None   # set by app.py when enable_journal=True
-        self._last_entry_signal: object = None     # SignalPacket at time of entry fill
+        self._last_entry_signal: SignalPacket | None = None  # captured at entry fill
         self.entry_order_active = False
         self._working_entry_side: int = 0
         self._working_entry_price: float = 0.0
@@ -424,7 +424,7 @@ class CombinedMakerTakerStrategy:
                     exit_price=price,
                     exit_reason=self.last_result.blocked_reason if self.last_result else "",
                     entry_mode=entry_mode_for_log,
-                    signal=self._last_entry_signal,  # type: ignore[arg-type]
+                    signal=self._last_entry_signal,
                     realized_pnl=net_pnl,
                 )
             return "exit"

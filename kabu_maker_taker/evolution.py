@@ -122,10 +122,8 @@ def walk_forward(
         train_files = files[start: start + train_days]
         test_files = files[start + train_days: start + train_days + test_days]
 
-        # Build combined training JSONL in memory (concatenate files)
-        # Use the first training file for simplicity; grid_search handles multi-day
-        # by concatenating via a temp approach — here we run on each file separately
-        # and aggregate results to pick best params.
+        # Run grid_search independently on each training file; take the best
+        # scoring params across all training files as the selected combination.
         best_params: dict[str, Any] = {}
         best_score = float("-inf")
         for train_file in train_files:

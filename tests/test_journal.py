@@ -206,6 +206,45 @@ class TradeJournalTests(unittest.TestCase):
         self.assertEqual(float(row["obi_z"]), 0.0)
         self.assertEqual(float(row["composite"]), 0.0)
 
+    def test_short_side_markout_pnl_sign(self) -> None:
+        """side=-1: pnl_ticks = -1*(mid-exit_price)/tick — positive when mid < exit_price."""
+        j = self._make_journal()
+        exit_ns = 1_000_000_000
+        j.on_trade_closed(
+            entry_ts_ns=500_000_000, exit_ts_ns=exit_ns,
+            side=-1, qty=100, entry_price=105.0, exit_price=100.0,
+            exit_reason="lollipop_tp", entry_mode="maker",
+            signal=None, realized_pnl=0.0,
+        )
+        # mid = (97 + 98) / 2 = 97.5 → pnl_ticks = -1 * (97.5 - 100.0) / 1.0 = +2.5
+        j.on_board(_snap(exit_ns + 500_000_000, bid=97.0, ask=98.0))
+        j.close()
+
+        with (Path(self.log_dir) / "markouts.csv").open(encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        row_500ms = next(r for r in rows if r["markout_horizon"] == "500ms")
+        self.assertAlmostEqual(float(row_500ms["markout_pnl_ticks"]), 2.5, places=2)
+
+    def test_methods_are_noop_after_close(self) -> None:
+        """on_trade_closed, on_board, and flush are all no-ops after close()."""
+        j = self._make_journal()
+        j.close()
+
+        # None of these should raise or write a trade row
+        j.on_trade_closed(
+            entry_ts_ns=1_000_000_000, exit_ts_ns=2_000_000_000,
+            side=1, qty=100, entry_price=100.0, exit_price=101.0,
+            exit_reason="timeout", entry_mode="taker",
+            signal=None, realized_pnl=100.0,
+        )
+        j.on_board(_snap(2_000_000_000))
+        j.flush()
+
+        trades_path = Path(self.log_dir) / "trades.csv"
+        with trades_path.open(encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual(len(rows), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

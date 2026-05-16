@@ -96,7 +96,11 @@ class TradeJournal:
             self._trades_writer.writeheader()
             self._trades_fh.flush()
 
-        self._markouts_fh = markouts_path.open("a", newline="", encoding="utf-8")
+        try:
+            self._markouts_fh = markouts_path.open("a", newline="", encoding="utf-8")
+        except Exception:
+            self._trades_fh.close()
+            raise
         self._markouts_writer = csv.DictWriter(self._markouts_fh, fieldnames=_MARKOUT_FIELDS)
         if markouts_new:
             self._markouts_writer.writeheader()

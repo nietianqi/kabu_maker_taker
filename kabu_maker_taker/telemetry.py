@@ -63,8 +63,6 @@ class DecisionTraceWriter:
             "position_side": position.side,
         }
         self._fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-        # Flush infrequently — every 10 lines — to avoid disk I/O on hot path
-        # (the file is opened in append mode so data is durable after each OS write)
         self._fh.flush()
 
     def close(self) -> None:

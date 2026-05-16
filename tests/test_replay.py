@@ -149,6 +149,31 @@ class ReplayRunnerTests(unittest.TestCase):
         result = runner.run(self._events_path(events))
         self.assertEqual(result.fill_rate, 0.0)
 
+    def test_max_drawdown_is_non_negative(self) -> None:
+        """max_drawdown is always >= 0.0 regardless of trade sequence."""
+        base = 1_700_000_000_000_000_000
+        # Mix of board and trade events; no real signal-driven trades expected,
+        # but the invariant must hold in all cases.
+        events = (
+            [_board(base + i * 100_000_000) for i in range(5)]
+            + [_trade(base + 600_000_000)]
+            + [_board(base + 700_000_000 + i * 100_000_000) for i in range(5)]
+        )
+        runner = ReplayRunner(_config())
+        result = runner.run(self._events_path(events))
+        self.assertGreaterEqual(result.max_drawdown, 0.0)
+
+    def test_result_fields_are_consistent(self) -> None:
+        """win_rate and avg_pnl_per_trade are 0.0 when trade_count is 0."""
+        base = 1_700_000_000_000_000_000
+        events = [_board(base + i * 100_000_000) for i in range(4)]
+        runner = ReplayRunner(_config())
+        result = runner.run(self._events_path(events))
+        if result.trade_count == 0:
+            self.assertEqual(result.win_rate, 0.0)
+            self.assertEqual(result.avg_pnl_per_trade, 0.0)
+            self.assertEqual(result.sharpe, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
