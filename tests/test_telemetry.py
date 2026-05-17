@@ -68,6 +68,20 @@ def _result(
         entry_cancel_blocked_reason="cancel_rate_limit" if with_intents else "",
         exit_cancel_signal="replace_active_exit_before_force_exit" if with_intents else "",
         market_state=MarketState.NORMAL,
+        market_state_reason="normal_flow",
+        market_state_spread_ticks=1.0,
+        market_state_event_rate_hz=2.0,
+        market_state_stale_ms=3.0,
+        market_state_jump_ticks=0.5,
+        market_state_trade_lag_ms=4.0,
+        maker_quote_mode="PASSIVE_FAIR_VALUE",
+        maker_fair_price=100.6,
+        maker_reservation_price=100.4,
+        maker_edge_ticks=0.4,
+        maker_half_spread_ticks=1.0,
+        maker_queue_threshold=300,
+        maker_top_queue_qty=500,
+        maker_working_age_ms=12.5,
     )
 
 
@@ -127,6 +141,8 @@ class DecisionTraceWriterTests(unittest.TestCase):
         self.assertEqual(row["position_qty"], 100)
         self.assertEqual(row["position_side"], 1)
         self.assertAlmostEqual(row["signal_composite"], 0.55, places=2)
+        self.assertEqual(row["market_state_reason"], "normal_flow")
+        self.assertEqual(row["maker_quote_mode"], "PASSIVE_FAIR_VALUE")
 
     def test_ts_jst_present_for_nonzero_timestamp(self) -> None:
         """ts_jst is a non-empty string when now_ns > 0."""
@@ -164,6 +180,9 @@ class DecisionTraceWriterTests(unittest.TestCase):
         self.assertEqual(row["exit_cancel_signal"], "replace_active_exit_before_force_exit")
         self.assertAlmostEqual(row["position_avg_price"], 101.5)
         self.assertEqual(row["position_entry_mode"], "maker")
+        self.assertEqual(row["maker_queue_threshold"], 300)
+        self.assertEqual(row["maker_top_queue_qty"], 500)
+        self.assertAlmostEqual(row["maker_working_age_ms"], 12.5)
 
 
 if __name__ == "__main__":

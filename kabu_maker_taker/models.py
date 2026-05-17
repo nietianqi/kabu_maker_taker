@@ -15,6 +15,7 @@ only.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -48,6 +49,12 @@ class BoardSnapshot:
     last: float = 0.0
     duplicate: bool = False
     out_of_order: bool = False
+    bid_sign: str = ""
+    ask_sign: str = ""
+    bid_ts_ns: int = 0
+    ask_ts_ns: int = 0
+    current_ts_ns: int = 0
+    last_size: int = 0
 
     def __post_init__(self) -> None:
         if not self.bids and self.bid > 0:
@@ -77,7 +84,12 @@ class BoardSnapshot:
     ) -> "BoardSnapshot":
         symbol = str(payload.get("symbol", payload.get("Symbol", "")))
         exchange = int(payload.get("exchange", payload.get("Exchange", 27)))
-        ts_ns = int(payload.get("ts_ns", payload.get("timestamp_ns", payload.get("ExchangeTimeNs", 0))))
+        ts_ns = _to_ns_value(
+            payload.get(
+                "ts_ns",
+                payload.get("timestamp_ns", payload.get("ExchangeTimeNs", payload.get("ExchangeTime", 0))),
+            )
+        )
 
         if "bid" in payload or "ask" in payload:
             bid = float(payload.get("bid", 0.0))
@@ -116,6 +128,14 @@ class BoardSnapshot:
             last=float(payload.get("last", payload.get("CurrentPrice", 0.0))),
             duplicate=bool(payload.get("duplicate", False)),
             out_of_order=bool(payload.get("out_of_order", False)),
+            bid_sign=str(payload.get("bid_sign", payload.get("BidSign", ""))),
+            ask_sign=str(payload.get("ask_sign", payload.get("AskSign", ""))),
+            bid_ts_ns=_to_ns_value(payload.get("bid_ts_ns", payload.get("BidTimeNs", payload.get("BidTime", 0)))),
+            ask_ts_ns=_to_ns_value(payload.get("ask_ts_ns", payload.get("AskTimeNs", payload.get("AskTime", 0)))),
+            current_ts_ns=_to_ns_value(
+                payload.get("current_ts_ns", payload.get("CurrentPriceTimeNs", payload.get("CurrentPriceTime", 0)))
+            ),
+            last_size=int(payload.get("last_size", payload.get("LastSize", payload.get("CurrentPriceSize", 0)))),
         )
 
 
@@ -133,10 +153,10 @@ class TradePrint:
         return cls(
             symbol=str(payload.get("symbol", payload.get("Symbol", ""))),
             exchange=int(payload.get("exchange", payload.get("Exchange", 27))),
-            ts_ns=int(payload.get("ts_ns", payload.get("timestamp_ns", 0))),
+            ts_ns=_to_ns_value(payload.get("ts_ns", payload.get("timestamp_ns", 0))),
             price=float(payload.get("price", payload.get("Price", 0.0))),
             size=int(payload.get("size", payload.get("Qty", 0))),
-            side=1 if int(payload.get("side", payload.get("Side", 0))) > 0 else -1,
+            side=_trade_side(payload.get("side", payload.get("Side", 0))),
         )
 
 
@@ -293,6 +313,19 @@ class MarketState(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class MakerQuoteDiagnostics:
+    quote_mode: str = ""
+    fair_price: float = 0.0
+    reservation_price: float = 0.0
+    quote_price: float = 0.0
+    edge_ticks: float = 0.0
+    half_spread_ticks: float = 0.0
+    queue_threshold: int = 0
+    top_queue_qty: int = 0
+    working_age_ms: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyResult:
     intent: OrderIntent | None
     decision: EntryDecision
@@ -308,6 +341,20 @@ class StrategyResult:
     # releasing a deferred force-exit order.
     exit_cancel_signal: str = ""
     market_state: MarketState = MarketState.NORMAL
+    market_state_reason: str = ""
+    market_state_spread_ticks: float = 0.0
+    market_state_event_rate_hz: float = 0.0
+    market_state_stale_ms: float = 0.0
+    market_state_jump_ticks: float = 0.0
+    market_state_trade_lag_ms: float = 0.0
+    maker_quote_mode: str = ""
+    maker_fair_price: float = 0.0
+    maker_reservation_price: float = 0.0
+    maker_edge_ticks: float = 0.0
+    maker_half_spread_ticks: float = 0.0
+    maker_queue_threshold: int = 0
+    maker_top_queue_qty: int = 0
+    maker_working_age_ms: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -321,7 +368,61 @@ class StrategyResult:
             "entry_cancel_blocked_reason": self.entry_cancel_blocked_reason,
             "exit_cancel_signal": self.exit_cancel_signal,
             "market_state": self.market_state.value,
+            "market_state_reason": self.market_state_reason,
+            "market_state_spread_ticks": self.market_state_spread_ticks,
+            "market_state_event_rate_hz": self.market_state_event_rate_hz,
+            "market_state_stale_ms": self.market_state_stale_ms,
+            "market_state_jump_ticks": self.market_state_jump_ticks,
+            "market_state_trade_lag_ms": self.market_state_trade_lag_ms,
+            "maker_quote_mode": self.maker_quote_mode,
+            "maker_fair_price": self.maker_fair_price,
+            "maker_reservation_price": self.maker_reservation_price,
+            "maker_edge_ticks": self.maker_edge_ticks,
+            "maker_half_spread_ticks": self.maker_half_spread_ticks,
+            "maker_queue_threshold": self.maker_queue_threshold,
+            "maker_top_queue_qty": self.maker_top_queue_qty,
+            "maker_working_age_ms": self.maker_working_age_ms,
         }
+
+
+def _to_ns_value(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1_000_000_000)
+
+
+def _trade_side(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+    text = str(value).strip().lower()
+    if text in {"buy", "bid", "long", "b"}:
+        return 1
+    if text in {"sell", "ask", "short", "s"}:
+        return -1
+    try:
+        numeric = int(float(text))
+    except ValueError:
+        return 0
+    if numeric > 0:
+        return 1
+    if numeric < 0:
+        return -1
+    return 0
 
 
 class LollipopPhase(str, Enum):

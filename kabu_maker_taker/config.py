@@ -151,6 +151,10 @@ class StrategyConfig:
     # Queue-depth retreat: retreat extra ticks when top-of-book < threshold (0 = disabled)
     queue_min_top_qty: int = 0
     queue_retreat_ticks: float = 1.0
+    # Maker edge gate: block passive entry when quote edge is below this many ticks (0 = disabled)
+    maker_min_edge_ticks: float = 0.0
+    # Working maker order maximum lifetime before cancel signal (0 = disabled)
+    max_pending_ms: int = 2500
     # Taker: execution quality gate — min composite score (0-10) required to enter (0 = disabled)
     exec_quality_min_score: int = 0
     # Taker: aggressive mode — reduce required_confirm to 1 when entry_score >= this (0 = disabled)
@@ -207,6 +211,8 @@ class StrategyConfig:
             max_quote_drift_ticks=float(payload.get("max_quote_drift_ticks", 1.0)),
             queue_min_top_qty=int(payload.get("queue_min_top_qty", 0)),
             queue_retreat_ticks=float(payload.get("queue_retreat_ticks", 1.0)),
+            maker_min_edge_ticks=float(payload.get("maker_min_edge_ticks", 0.0)),
+            max_pending_ms=int(payload.get("max_pending_ms", 2500)),
             exec_quality_min_score=int(payload.get("exec_quality_min_score", 0)),
             aggressive_taker_entry_score=int(payload.get("aggressive_taker_entry_score", 0)),
             use_adaptive_confirm=bool(payload.get("use_adaptive_confirm", False)),
@@ -288,6 +294,8 @@ class MarketStateConfig:
     abnormal_event_rate_hz: float = 160.0
     event_rate_window_seconds: int = 3
     abnormal_price_jump_ticks: float = 4.0
+    event_burst_min_events: int = 6
+    queue_spread_max_ticks: float = 1.0
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "MarketStateConfig":
@@ -298,6 +306,8 @@ class MarketStateConfig:
             abnormal_event_rate_hz=float(payload.get("abnormal_event_rate_hz", 160.0)),
             event_rate_window_seconds=int(payload.get("event_rate_window_seconds", 3)),
             abnormal_price_jump_ticks=float(payload.get("abnormal_price_jump_ticks", 4.0)),
+            event_burst_min_events=int(payload.get("event_burst_min_events", 6)),
+            queue_spread_max_ticks=float(payload.get("queue_spread_max_ticks", 1.0)),
         )
 
 

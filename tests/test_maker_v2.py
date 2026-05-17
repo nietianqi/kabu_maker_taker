@@ -3,7 +3,15 @@ from __future__ import annotations
 import unittest
 
 from kabu_maker_taker.config import AppConfig, MarketStateConfig, RiskConfig, StrategyConfig
-from kabu_maker_taker.models import BoardSnapshot, EntryDecision, Level, MarketState, PositionState, SignalPacket
+from kabu_maker_taker.models import (
+    BoardSnapshot,
+    EntryDecision,
+    Level,
+    MarketState,
+    PositionState,
+    SignalPacket,
+    StrategyResult,
+)
 from kabu_maker_taker.strategy import MakerStrategy, MarketStateDetector
 
 
@@ -40,6 +48,34 @@ def _snapshot(**overrides) -> BoardSnapshot:
     )
     defaults.update(overrides)
     return BoardSnapshot(**defaults)
+
+
+class BoardSnapshotParsingTests(unittest.TestCase):
+    def test_from_dict_parses_kabu_quote_diagnostics(self) -> None:
+        snap = BoardSnapshot.from_dict(
+            {
+                "Symbol": "9984",
+                "Exchange": 27,
+                "ExchangeTimeNs": 1_000_000_000,
+                "BidPrice": 100.0,
+                "AskPrice": 101.0,
+                "BidQty": 500,
+                "AskQty": 300,
+                "BidSign": "0101",
+                "AskSign": "0102",
+                "BidTimeNs": 900_000_000,
+                "AskTimeNs": 950_000_000,
+                "CurrentPriceTimeNs": 980_000_000,
+                "CurrentPriceSize": 100,
+            }
+        )
+
+        self.assertEqual(snap.bid_sign, "0101")
+        self.assertEqual(snap.ask_sign, "0102")
+        self.assertEqual(snap.bid_ts_ns, 900_000_000)
+        self.assertEqual(snap.ask_ts_ns, 950_000_000)
+        self.assertEqual(snap.current_ts_ns, 980_000_000)
+        self.assertEqual(snap.last_size, 100)
 
 
 class FairPriceTests(unittest.TestCase):
@@ -271,23 +307,93 @@ class CancelReasonTests(unittest.TestCase):
         reason = m.calc_cancel_reason(sig, working_side=1, working_price=100.0, market_state=MarketState.ABNORMAL)
         self.assertEqual(reason, "abnormal_market")
 
+    def test_pending_timeout_bypasses_min_order_age(self) -> None:
+        m = self._maker(max_pending_ms=2500, min_order_age_ms=5000)
+        sig = _signal(composite=0.45, tape_ofi_raw=0.15, obi_raw=0.20, microprice=100.3, mid=100.0)
+        reason = m.calc_cancel_reason(
+            sig,
+            working_side=1,
+            working_price=100.0,
+            order_age_ns=2_500_000_000,
+        )
+        self.assertEqual(reason, "pending_timeout")
+
+
+class MakerQuoteDiagnosticsTests(unittest.TestCase):
+    def _preview(self, *, bid_size: int, market_state: MarketState):
+        cfg = StrategyConfig(
+            queue_min_top_qty=300,
+            queue_retreat_ticks=1.0,
+            maker_join_best=True,
+            min_half_spread_ticks=1.0,
+            mid_half_spread_ticks=1.0,
+        )
+        maker = MakerStrategy(cfg, tick_size=1.0)
+        decision = EntryDecision(True, "", entry_mode="maker", side=1, entry_score=8, required_confirm=1)
+        return maker.preview_quote(
+            symbol="9984",
+            exchange=27,
+            tick_size=1.0,
+            lot_size=100,
+            qty=100,
+            snapshot=_snapshot(bid=100.0, ask=101.0, bid_size=bid_size),
+            decision=decision,
+            signal=_signal(mid=100.5),
+            position=PositionState(),
+            max_inventory_qty=300,
+            market_state=market_state,
+        )
+
+    def test_queue_mode_retreats_when_top_queue_thin(self) -> None:
+        intent, diagnostics = self._preview(bid_size=100, market_state=MarketState.QUEUE)
+        self.assertLess(intent.price, 100.0)
+        self.assertEqual(diagnostics.quote_mode, "QUEUE_DEFENSE")
+        self.assertEqual(diagnostics.queue_threshold, 300)
+        self.assertEqual(diagnostics.top_queue_qty, 100)
+
+    def test_queue_mode_joins_best_when_top_queue_enough(self) -> None:
+        intent, diagnostics = self._preview(bid_size=500, market_state=MarketState.QUEUE)
+        self.assertEqual(intent.price, 100.0)
+        self.assertEqual(diagnostics.quote_mode, "QUEUE_DEFENSE")
+        self.assertGreater(diagnostics.edge_ticks, 0.0)
+
+    def test_strategy_result_to_dict_includes_maker_fields(self) -> None:
+        _, diagnostics = self._preview(bid_size=500, market_state=MarketState.NORMAL)
+        result = StrategyResult(
+            None,
+            EntryDecision(False, "confirming"),
+            None,
+            maker_quote_mode=diagnostics.quote_mode,
+            maker_fair_price=diagnostics.fair_price,
+            maker_reservation_price=diagnostics.reservation_price,
+            maker_edge_ticks=diagnostics.edge_ticks,
+            maker_half_spread_ticks=diagnostics.half_spread_ticks,
+            maker_queue_threshold=diagnostics.queue_threshold,
+            maker_top_queue_qty=diagnostics.top_queue_qty,
+        )
+        payload = result.to_dict()
+        self.assertEqual(payload["maker_quote_mode"], "PASSIVE_FAIR_VALUE")
+        self.assertIn("maker_edge_ticks", payload)
+
 
 class MarketStateDetectorTests(unittest.TestCase):
-    def _make(self, **kw) -> MarketStateDetector:
+    def _make(self, stale_quote_ms: int = 2000, **kw) -> MarketStateDetector:
         cfg = MarketStateConfig(enabled=True, **kw)
-        return MarketStateDetector(cfg, tick_size=1.0)
+        return MarketStateDetector(cfg, tick_size=1.0, stale_quote_ms=stale_quote_ms)
 
     def test_normal_spread_returns_normal(self) -> None:
         det = self._make(abnormal_spread_ticks=6.0, abnormal_price_jump_ticks=4.0)
         snap = _snapshot(bid=100.0, ask=102.0)
         state = det.update(snap, now_ns=1_000_000_000)
         self.assertEqual(state, MarketState.NORMAL)  # enum comparison
+        self.assertEqual(det.last_diagnostics.reason, "normal_flow")
 
     def test_wide_spread_returns_abnormal(self) -> None:
         det = self._make(abnormal_spread_ticks=6.0)
         snap = _snapshot(bid=100.0, ask=107.0)  # spread=7 ticks
         state = det.update(snap, now_ns=1_000_000_000)
         self.assertEqual(state, MarketState.ABNORMAL)
+        self.assertEqual(det.last_diagnostics.reason, "spread_blowout")
 
     def test_large_price_jump_returns_abnormal(self) -> None:
         det = self._make(abnormal_price_jump_ticks=4.0)
@@ -296,12 +402,61 @@ class MarketStateDetectorTests(unittest.TestCase):
         snap2 = _snapshot(bid=105.0, ask=106.0)  # jump = 5.5 ticks
         state = det.update(snap2, now_ns=2_000_000_000)
         self.assertEqual(state, MarketState.ABNORMAL)
+        self.assertEqual(det.last_diagnostics.reason, "price_jump")
 
     def test_one_tick_spread_returns_queue(self) -> None:
         det = self._make()
         snap = _snapshot(bid=100.0, ask=101.0)  # spread = 1 tick
         state = det.update(snap, now_ns=1_000_000_000)
         self.assertEqual(state, MarketState.QUEUE)
+        self.assertEqual(det.last_diagnostics.reason, "one_tick_queue")
+
+    def test_invalid_board_reason(self) -> None:
+        det = self._make()
+        snap = _snapshot(bid=0.0, ask=101.0)
+        state = det.update(snap, now_ns=1_000_000_000)
+        self.assertEqual(state, MarketState.ABNORMAL)
+        self.assertEqual(det.last_diagnostics.reason, "invalid_quote")
+
+    def test_stale_quote_reason(self) -> None:
+        det = self._make(stale_quote_ms=100)
+        snap = _snapshot(ts_ns=1_000_000_000, bid=100.0, ask=102.0)
+        state = det.update(snap, now_ns=1_200_000_001)
+        self.assertEqual(state, MarketState.ABNORMAL)
+        self.assertEqual(det.last_diagnostics.reason, "stale_quote")
+        self.assertGreater(det.last_diagnostics.stale_ms, 200.0)
+
+    def test_special_quote_reason(self) -> None:
+        det = self._make()
+        snap = _snapshot(bid=100.0, ask=102.0, ask_sign="0102")
+        state = det.update(snap, now_ns=1_000_000_000)
+        self.assertEqual(state, MarketState.ABNORMAL)
+        self.assertEqual(det.last_diagnostics.reason, "special_quote_sign")
+
+    def test_event_burst_reason(self) -> None:
+        det = self._make(
+            abnormal_event_rate_hz=3.0,
+            event_rate_window_seconds=1,
+            event_burst_min_events=3,
+            abnormal_price_jump_ticks=99.0,
+        )
+        for idx in range(3):
+            ts = 1_000_000_000 + idx * 100_000_000
+            state = det.update(_snapshot(ts_ns=ts, bid=100.0, ask=102.0), now_ns=ts)
+        self.assertEqual(state, MarketState.ABNORMAL)
+        self.assertEqual(det.last_diagnostics.reason, "event_burst")
+
+    def test_trade_lag_ms_uses_quote_minus_last_trade_time(self) -> None:
+        det = self._make()
+        snap = _snapshot(
+            bid=100.0,
+            ask=102.0,
+            bid_ts_ns=1_500_000_000,
+            ask_ts_ns=1_400_000_000,
+            current_ts_ns=1_000_000_000,
+        )
+        det.update(snap, now_ns=1_600_000_000)
+        self.assertAlmostEqual(det.last_diagnostics.trade_lag_ms, 500.0)
 
     def test_disabled_always_returns_normal(self) -> None:
         cfg = MarketStateConfig(enabled=False)
@@ -309,6 +464,7 @@ class MarketStateDetectorTests(unittest.TestCase):
         snap = _snapshot(bid=100.0, ask=110.0)  # would be ABNORMAL if enabled
         state = det.update(snap, now_ns=1_000_000_000)
         self.assertEqual(state, MarketState.NORMAL)  # enum comparison
+        self.assertEqual(det.last_diagnostics.reason, "disabled")
 
     def test_abnormal_blocks_maker_entry(self) -> None:
         cfg = StrategyConfig(maker_score_threshold=6)
@@ -437,6 +593,77 @@ class MarketStateOutputPathTests(unittest.TestCase):
         self.assertIsNotNone(result.intent)
         self.assertEqual(result.market_state, MarketState.NORMAL)
         self.assertEqual(result.to_dict()["market_state"], MarketState.NORMAL.value)
+        self.assertEqual(result.market_state_reason, "disabled")
+        self.assertEqual(result.maker_quote_mode, "PASSIVE_FAIR_VALUE")
+
+    def test_maker_min_edge_blocks_low_edge_entry(self) -> None:
+        from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+
+        config = AppConfig(
+            symbol="9984",
+            tick_size=1.0,
+            lot_size=100,
+            strategy=StrategyConfig(
+                maker_confirm_ticks=1,
+                taker_confirm_ticks=1,
+                maker_min_edge_ticks=2.0,
+            ),
+            risk=RiskConfig(max_inventory_qty=300, max_spread_ticks=5.0),
+            market_state=MarketStateConfig(enabled=False),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(mid=100.5, composite=0.20)
+        strategy._choose_decision = lambda snapshot, signal, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            True,
+            "",
+            entry_mode="maker",
+            side=1,
+            entry_score=8,
+            required_confirm=1,
+        )
+
+        result = strategy.on_board(_snapshot(bid=100.0, ask=101.0), now_ns=1_000_000_000)
+
+        self.assertIsNone(result.intent)
+        self.assertEqual(result.blocked_reason, "maker_edge_too_low")
+        self.assertLess(result.maker_edge_ticks, 2.0)
+        self.assertEqual(result.maker_quote_mode, "PASSIVE_FAIR_VALUE")
+
+    def test_working_maker_pending_timeout_emits_cancel_signal(self) -> None:
+        from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+
+        config = AppConfig(
+            symbol="9984",
+            tick_size=1.0,
+            lot_size=100,
+            strategy=StrategyConfig(
+                maker_confirm_ticks=1,
+                taker_confirm_ticks=1,
+                min_order_age_ms=5000,
+                max_pending_ms=2500,
+            ),
+            risk=RiskConfig(max_inventory_qty=300, max_spread_ticks=5.0),
+            market_state=MarketStateConfig(enabled=False),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(mid=100.5, composite=0.45)
+        strategy._choose_decision = lambda snapshot, signal, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            True,
+            "",
+            entry_mode="maker",
+            side=1,
+            entry_score=8,
+            required_confirm=1,
+        )
+        base = 1_000_000_000
+        result1 = strategy.on_board(_snapshot(ts_ns=base), now_ns=base)
+        self.assertIsNotNone(result1.intent)
+
+        result2 = strategy.on_board(_snapshot(ts_ns=base + 2_500_000_000), now_ns=base + 2_500_000_000)
+
+        self.assertEqual(result2.blocked_reason, "working_entry")
+        self.assertEqual(result2.entry_cancel_signal, "pending_timeout")
+        self.assertAlmostEqual(result2.maker_working_age_ms, 2500.0)
 
 
 if __name__ == "__main__":

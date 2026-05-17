@@ -59,6 +59,8 @@
     "max_quote_drift_ticks": 1.0,
     "queue_min_top_qty": 0,
     "queue_retreat_ticks": 1.0,
+    "maker_min_edge_ticks": 0.0,
+    "max_pending_ms": 2500,
     "exec_quality_min_score": 0,
     "aggressive_taker_entry_score": 0,
     "use_adaptive_confirm": false,
@@ -124,6 +126,8 @@
     "abnormal_spread_ticks": 6.0,
     "abnormal_event_rate_hz": 160.0,
     "event_rate_window_seconds": 3,
-    "abnormal_price_jump_ticks": 4.0
+    "abnormal_price_jump_ticks": 4.0,
+    "event_burst_min_events": 6,
+    "queue_spread_max_ticks": 1.0
   }
 }

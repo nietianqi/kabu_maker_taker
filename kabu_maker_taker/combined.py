@@ -27,6 +27,7 @@ from .models import (
     BrokerOrderEvent,
     EntryDecision,
     LollipopPhase,
+    MakerQuoteDiagnostics,
     MarketState,
     OrderIntent,
     OrderState,
@@ -42,6 +43,7 @@ from .signals import MicrostructureSignalEngine
 from .reconciliation import reconcile_strategy_from_broker
 from .strategy import (
     ConfirmationTracker,
+    ENTRY_MODE_MAKER,
     ENTRY_MODE_TAKER,
     MakerStrategy,
     MarketStateDetector,
@@ -61,7 +63,11 @@ class CombinedMakerTakerStrategy:
         self.risk = RiskManager(config=config.risk, tick_size=config.tick_size, lot_size=config.lot_size)
         self.confirmation = ConfirmationTracker()
         self.lollipop = LollipopTPManager(config.lollipop, config.tick_size, config.lot_size)
-        self.market_state_detector = MarketStateDetector(config.market_state, config.tick_size)
+        self.market_state_detector = MarketStateDetector(
+            config.market_state,
+            config.tick_size,
+            stale_quote_ms=config.risk.stale_quote_ms,
+        )
         self.orders = OrderLedger()
         self.metrics = MetricsCollector(tick_size=config.tick_size)
         self.last_result: StrategyResult | None = None
@@ -78,21 +84,60 @@ class CombinedMakerTakerStrategy:
             return
         self.signals.on_trade(trade)
 
+    def _market_result_fields(self) -> dict[str, object]:
+        diagnostics = self.market_state_detector.last_diagnostics
+        return {
+            "market_state": diagnostics.state,
+            "market_state_reason": diagnostics.reason,
+            "market_state_spread_ticks": diagnostics.spread_ticks,
+            "market_state_event_rate_hz": diagnostics.event_rate_hz,
+            "market_state_stale_ms": diagnostics.stale_ms,
+            "market_state_jump_ticks": diagnostics.jump_ticks,
+            "market_state_trade_lag_ms": diagnostics.trade_lag_ms,
+        }
+
+    def _maker_result_fields(self, diagnostics: MakerQuoteDiagnostics | None) -> dict[str, object]:
+        if diagnostics is None:
+            return {}
+        return {
+            "maker_quote_mode": diagnostics.quote_mode,
+            "maker_fair_price": diagnostics.fair_price,
+            "maker_reservation_price": diagnostics.reservation_price,
+            "maker_edge_ticks": diagnostics.edge_ticks,
+            "maker_half_spread_ticks": diagnostics.half_spread_ticks,
+            "maker_queue_threshold": diagnostics.queue_threshold,
+            "maker_top_queue_qty": diagnostics.top_queue_qty,
+            "maker_working_age_ms": diagnostics.working_age_ms,
+        }
+
     def on_board(self, snapshot: BoardSnapshot, *, now_ns: int | None = None) -> StrategyResult:
         ts = now_ns if now_ns is not None else snapshot.ts_ns
 
         if snapshot.symbol != self.config.symbol:
-            result = StrategyResult(None, EntryDecision(False, "symbol_mismatch"), None, blocked_reason="symbol_mismatch")
+            result = StrategyResult(
+                None,
+                EntryDecision(False, "symbol_mismatch"),
+                None,
+                blocked_reason="symbol_mismatch",
+                market_state_reason="symbol_mismatch",
+            )
             self.last_result = result
             return result
         if snapshot.duplicate or snapshot.out_of_order:
-            result = StrategyResult(None, EntryDecision(False, "duplicate_or_out_of_order"), None)
+            result = StrategyResult(
+                None,
+                EntryDecision(False, "duplicate_or_out_of_order"),
+                None,
+                blocked_reason="duplicate_or_out_of_order",
+                market_state_reason="duplicate_or_out_of_order",
+            )
             self.last_result = result
             return result
 
         board_stale = self.risk.is_stale_board(snapshot.ts_ns)
         self.risk.update_board_ts(snapshot.ts_ns)
         market_state = self.market_state_detector.update(snapshot, ts)
+        market_fields = self._market_result_fields()
         signal = self.signals.on_board(snapshot)
         self.metrics.on_board(snapshot)
         if self.journal is not None:
@@ -130,10 +175,31 @@ class CombinedMakerTakerStrategy:
         if self.entry_order_active:
             entry_cancel_signal = ""
             entry_cancel_blocked_reason = ""
+            maker_diag: MakerQuoteDiagnostics | None = None
             if self._working_entry_side != 0:
                 entry_orders = self.orders.active_by_role(ORDER_ROLE_ENTRY)
                 order_age_ns = ts - entry_orders[-1].submitted_ts_ns if entry_orders else 0
-                desired_price = self.maker.compute_quote_price(snapshot, signal, self._working_entry_side)
+                working_age_ms = max(order_age_ns / 1_000_000, 0.0)
+                desired_intent, maker_diag = self.maker.preview_quote(
+                    symbol=self.config.symbol,
+                    exchange=self.config.exchange,
+                    tick_size=self.config.tick_size,
+                    lot_size=self.config.lot_size,
+                    qty=self.config.strategy.trade_qty,
+                    snapshot=snapshot,
+                    decision=EntryDecision(
+                        True,
+                        "",
+                        entry_mode=ENTRY_MODE_MAKER,
+                        side=self._working_entry_side,
+                    ),
+                    signal=signal,
+                    position=self.position,
+                    max_inventory_qty=self.risk.config.max_inventory_qty,
+                    market_state=market_state,
+                    working_age_ms=working_age_ms,
+                )
+                desired_price = desired_intent.price
                 raw_cancel_signal = self.maker.calc_cancel_reason(
                     signal,
                     self._working_entry_side,
@@ -163,7 +229,8 @@ class CombinedMakerTakerStrategy:
                 entry_cancel_signal=entry_cancel_signal,
                 entry_cancel_blocked_reason=entry_cancel_blocked_reason,
                 exit_cancel_signal=exit_cancel_signal,
-                market_state=market_state,
+                **market_fields,
+                **self._maker_result_fields(maker_diag),
             )
             self.last_result = result
             return result
@@ -176,7 +243,7 @@ class CombinedMakerTakerStrategy:
                 blocked_reason="lollipop_active",
                 exit_intent=exit_intent,
                 exit_cancel_signal=exit_cancel_signal,
-                market_state=market_state,
+                **market_fields,
             )
             self.last_result = result
             return result
@@ -192,7 +259,7 @@ class CombinedMakerTakerStrategy:
                 confirm_progress=progress,
                 exit_intent=exit_intent,
                 exit_cancel_signal=exit_cancel_signal,
-                market_state=market_state,
+                **market_fields,
             )
             self.last_result = result
             return result
@@ -224,7 +291,7 @@ class CombinedMakerTakerStrategy:
                 confirm_progress=progress,
                 exit_intent=exit_intent,
                 exit_cancel_signal=exit_cancel_signal,
-                market_state=market_state,
+                **market_fields,
             )
             self.last_result = result
             return result
@@ -248,11 +315,12 @@ class CombinedMakerTakerStrategy:
                 confirm_progress=progress,
                 exit_intent=exit_intent,
                 exit_cancel_signal=exit_cancel_signal,
-                market_state=market_state,
+                **market_fields,
             )
             self.last_result = result
             return result
 
+        maker_diag: MakerQuoteDiagnostics | None = None
         if decision.entry_mode == ENTRY_MODE_TAKER:
             intent = self.taker.build_intent(
                 symbol=self.config.symbol,
@@ -263,7 +331,7 @@ class CombinedMakerTakerStrategy:
                 decision=decision,
             )
         else:
-            intent = self.maker.build_intent(
+            intent, maker_diag = self.maker.preview_quote(
                 symbol=self.config.symbol,
                 exchange=self.config.exchange,
                 tick_size=self.config.tick_size,
@@ -274,7 +342,24 @@ class CombinedMakerTakerStrategy:
                 signal=signal,
                 position=self.position,
                 max_inventory_qty=self.risk.config.max_inventory_qty,
+                market_state=market_state,
             )
+            min_edge = self.config.strategy.maker_min_edge_ticks
+            if min_edge > 0 and maker_diag.edge_ticks < min_edge:
+                self.confirmation.reset()
+                result = StrategyResult(
+                    None,
+                    decision,
+                    signal,
+                    blocked_reason="maker_edge_too_low",
+                    confirm_progress=progress,
+                    exit_intent=exit_intent,
+                    exit_cancel_signal=exit_cancel_signal,
+                    **market_fields,
+                    **self._maker_result_fields(maker_diag),
+                )
+                self.last_result = result
+                return result
 
         intent = self._track_intent(intent, role=ORDER_ROLE_ENTRY, now_ns=ts)
         self.risk.record_entry_order(ts)
@@ -286,7 +371,8 @@ class CombinedMakerTakerStrategy:
             confirm_progress=progress,
             exit_intent=exit_intent,
             exit_cancel_signal=exit_cancel_signal,
-            market_state=market_state,
+            **market_fields,
+            **self._maker_result_fields(maker_diag),
         )
         self.entry_order_active = True
         self.last_result = result

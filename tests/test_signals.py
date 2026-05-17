@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import unittest
 
+from kabu_maker_taker.config import SignalConfig
+from kabu_maker_taker.models import BoardSnapshot, Level, TradePrint
 from kabu_maker_taker.signals import (
     BreakoutTracker,
     CancelImbalanceTracker,
+    MicrostructureSignalEngine,
     MicropriceStreakTracker,
     TapePressure,
     VolExpansionDetector,
@@ -32,9 +35,40 @@ class TapePressure1sTests(unittest.TestCase):
 
     def test_burst_unchanged(self) -> None:
         tape = TapePressure(window_seconds=15)
-        from kabu_maker_taker.models import TradePrint
         tape.on_trade(TradePrint("X", 0, 100.0, 300, 1))
         self.assertGreater(tape.burst, 0.0)
+
+    def test_unknown_side_is_ignored(self) -> None:
+        tape = TapePressure(window_seconds=15)
+        tape.on_trade(TradePrint("X", 1, 100.0, 300, 0))
+        self.assertEqual(tape.current, 0.0)
+        self.assertEqual(len(tape.events), 0)
+
+    def test_tradeprint_missing_side_is_unknown(self) -> None:
+        trade = TradePrint.from_dict({"symbol": "X", "ts_ns": 1, "price": 100.0, "size": 100})
+        self.assertEqual(trade.side, 0)
+
+
+class UnknownTradeSideEngineTests(unittest.TestCase):
+    def test_unknown_side_does_not_pollute_tape_or_wall_consumption(self) -> None:
+        engine = MicrostructureSignalEngine(tick_size=1.0, config=SignalConfig())
+        trade = TradePrint.from_dict({"symbol": "X", "ts_ns": 1, "price": 100.0, "size": 100, "side": 0})
+
+        engine.on_trade(trade)
+
+        self.assertEqual(engine.tape.current, 0.0)
+        snapshot = BoardSnapshot(
+            symbol="X",
+            ts_ns=2,
+            bid=100.0,
+            ask=101.0,
+            bid_size=500,
+            ask_size=500,
+            bids=(Level(100.0, 500),),
+            asks=(Level(101.0, 500),),
+        )
+        signal = engine.on_board(snapshot)
+        self.assertEqual(signal.tape_ofi_raw, 0.0)
 
 
 class WallDetectorTests(unittest.TestCase):

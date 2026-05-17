@@ -124,6 +124,8 @@ class TapePressure:
         self.burst_sell_qty = 0
 
     def on_trade(self, trade: TradePrint) -> float:
+        if trade.side == 0:
+            return self.current
         buy = trade.size if trade.side > 0 else 0
         sell = trade.size if trade.side < 0 else 0
         self.events.append((trade.ts_ns, buy, sell))
@@ -386,11 +388,13 @@ class MicrostructureSignalEngine:
         self._tape_ofi_weight: float = 1.0 - w
 
     def on_trade(self, trade: TradePrint) -> float:
+        if trade.side == 0:
+            return self.tape.current
         result = self.tape.on_trade(trade)
         # Accumulate fills by side for wall consumption tracking
         if trade.side > 0:
             self._acc_fill_at_ask += trade.size
-        else:
+        elif trade.side < 0:
             self._acc_fill_at_bid += trade.size
         return result
 

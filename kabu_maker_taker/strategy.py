@@ -19,12 +19,35 @@ from collections import deque
 from dataclasses import dataclass
 
 from .config import MarketStateConfig, StrategyConfig
-from .models import BoardSnapshot, EntryDecision, MarketState, OrderIntent, PositionState, SignalPacket
+from .models import (
+    BoardSnapshot,
+    EntryDecision,
+    MakerQuoteDiagnostics,
+    MarketState,
+    OrderIntent,
+    PositionState,
+    SignalPacket,
+)
 
 ENTRY_MODE_MAKER = "maker"
 ENTRY_MODE_TAKER = "taker"
 ORDER_ROLE_ENTRY = "entry"
 ORDER_ROLE_EXIT = "exit"
+QUOTE_MODE_PASSIVE_FAIR_VALUE = "PASSIVE_FAIR_VALUE"
+QUOTE_MODE_QUEUE_DEFENSE = "QUEUE_DEFENSE"
+QUOTE_MODE_CLOSE_ONLY = "CLOSE_ONLY"
+_SPECIAL_QUOTE_SIGNS = frozenset({"0102", "0103", "0107"})
+
+
+@dataclass(frozen=True, slots=True)
+class MarketStateDiagnostics:
+    state: MarketState
+    reason: str = ""
+    spread_ticks: float = 0.0
+    event_rate_hz: float = 0.0
+    stale_ms: float = 0.0
+    jump_ticks: float = 0.0
+    trade_lag_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,47 +118,121 @@ def primary_checks_pass(diagnostics: EntryLayerDiagnostics) -> bool:
 class MarketStateDetector:
     """Classifies each board tick as NORMAL, QUEUE, or ABNORMAL."""
 
-    def __init__(self, config: MarketStateConfig, tick_size: float):
+    def __init__(self, config: MarketStateConfig, tick_size: float, *, stale_quote_ms: int = 2000):
         self.config = config
         self.tick_size = max(tick_size, 1e-9)
+        self.stale_quote_ms = max(int(stale_quote_ms), 0)
         self._prev_mid: float = 0.0
         # Hard-bound the deque: at most 2× the max expected events in the window.
         _max = max(int(config.abnormal_event_rate_hz * config.event_rate_window_seconds * 2), 64)
         self._event_times: deque[int] = deque(maxlen=_max)
         self._state: MarketState = MarketState.NORMAL
+        self._last_diagnostics = MarketStateDiagnostics(MarketState.NORMAL, reason="init")
 
     def update(self, snapshot: BoardSnapshot, now_ns: int) -> MarketState:
+        diagnostics = self.evaluate(snapshot, now_ns)
+        self._state = diagnostics.state
+        self._last_diagnostics = diagnostics
+        return self._state
+
+    def evaluate(self, snapshot: BoardSnapshot, now_ns: int) -> MarketStateDiagnostics:
         if not self.config.enabled:
-            return MarketState.NORMAL
+            diagnostics = self._diagnostics(
+                MarketState.NORMAL,
+                "disabled",
+                snapshot=snapshot,
+                now_ns=now_ns,
+                event_rate_hz=0.0,
+                jump_ticks=0.0,
+            )
+            if snapshot.mid > 0:
+                self._prev_mid = snapshot.mid
+            return diagnostics
 
         window_ns = self.config.event_rate_window_seconds * 1_000_000_000
-        self._event_times.append(now_ns)
-        while self._event_times and now_ns - self._event_times[0] > window_ns:
+        event_ts = snapshot.ts_ns if snapshot.ts_ns > 0 else now_ns
+        self._event_times.append(event_ts)
+        while self._event_times and event_ts - self._event_times[0] > window_ns:
             self._event_times.popleft()
-        event_rate_hz = len(self._event_times) / max(self.config.event_rate_window_seconds, 1)
+        legacy_event_rate_hz = len(self._event_times) / max(self.config.event_rate_window_seconds, 1)
+        if len(self._event_times) >= 2:
+            duration_ns = max(self._event_times[-1] - self._event_times[0], 1)
+            event_rate_hz = max((len(self._event_times) - 1) * 1_000_000_000 / duration_ns, legacy_event_rate_hz)
+        else:
+            event_rate_hz = legacy_event_rate_hz
 
-        tick = self.tick_size
-        spread_ticks = snapshot.spread / tick if snapshot.spread > 0 else 0.0
         price_jump_ticks = 0.0
         if self._prev_mid > 0 and snapshot.mid > 0:
-            price_jump_ticks = abs(snapshot.mid - self._prev_mid) / tick
+            price_jump_ticks = abs(snapshot.mid - self._prev_mid) / self.tick_size
         if snapshot.mid > 0:
             self._prev_mid = snapshot.mid
 
-        if (not snapshot.valid
-                or spread_ticks >= self.config.abnormal_spread_ticks
-                or event_rate_hz >= self.config.abnormal_event_rate_hz
-                or price_jump_ticks >= self.config.abnormal_price_jump_ticks):
-            self._state = MarketState.ABNORMAL
-        elif snapshot.spread <= tick:
-            self._state = MarketState.QUEUE
-        else:
-            self._state = MarketState.NORMAL
-        return self._state
+        spread_ticks = snapshot.spread / self.tick_size if snapshot.spread > 0 else 0.0
+        event_burst = (
+            legacy_event_rate_hz >= self.config.abnormal_event_rate_hz
+            or (
+                len(self._event_times) >= max(self.config.event_burst_min_events, 1)
+                and event_rate_hz >= self.config.abnormal_event_rate_hz
+            )
+        )
+        diagnostics_kwargs = {
+            "snapshot": snapshot,
+            "now_ns": now_ns,
+            "event_rate_hz": event_rate_hz,
+            "jump_ticks": price_jump_ticks,
+        }
+        if not snapshot.valid:
+            return self._diagnostics(MarketState.ABNORMAL, "invalid_quote", **diagnostics_kwargs)
+        if _is_special_quote_sign(snapshot.bid_sign) or _is_special_quote_sign(snapshot.ask_sign):
+            return self._diagnostics(MarketState.ABNORMAL, "special_quote_sign", **diagnostics_kwargs)
+        if self.stale_quote_ms > 0 and now_ns > 0 and snapshot.ts_ns > 0:
+            if now_ns - snapshot.ts_ns > self.stale_quote_ms * 1_000_000:
+                return self._diagnostics(MarketState.ABNORMAL, "stale_quote", **diagnostics_kwargs)
+        if spread_ticks >= self.config.abnormal_spread_ticks:
+            return self._diagnostics(MarketState.ABNORMAL, "spread_blowout", **diagnostics_kwargs)
+        if event_burst:
+            return self._diagnostics(MarketState.ABNORMAL, "event_burst", **diagnostics_kwargs)
+        if price_jump_ticks >= self.config.abnormal_price_jump_ticks:
+            return self._diagnostics(MarketState.ABNORMAL, "price_jump", **diagnostics_kwargs)
+        if spread_ticks > 0 and spread_ticks <= self.config.queue_spread_max_ticks:
+            return self._diagnostics(MarketState.QUEUE, "one_tick_queue", **diagnostics_kwargs)
+        return self._diagnostics(MarketState.NORMAL, "normal_flow", **diagnostics_kwargs)
+
+    def _diagnostics(
+        self,
+        state: MarketState,
+        reason: str,
+        *,
+        snapshot: BoardSnapshot,
+        now_ns: int,
+        event_rate_hz: float,
+        jump_ticks: float,
+    ) -> MarketStateDiagnostics:
+        stale_ms = max((now_ns - snapshot.ts_ns) / 1_000_000, 0.0) if now_ns > 0 and snapshot.ts_ns > 0 else 0.0
+        quote_ts = max(snapshot.bid_ts_ns, snapshot.ask_ts_ns)
+        trade_lag_ms = (
+            max((quote_ts - snapshot.current_ts_ns) / 1_000_000, 0.0)
+            if quote_ts > 0 and snapshot.current_ts_ns > 0
+            else 0.0
+        )
+        spread_ticks = snapshot.spread / self.tick_size if snapshot.spread > 0 else 0.0
+        return MarketStateDiagnostics(
+            state=state,
+            reason=reason,
+            spread_ticks=spread_ticks,
+            event_rate_hz=event_rate_hz,
+            stale_ms=stale_ms,
+            jump_ticks=jump_ticks,
+            trade_lag_ms=trade_lag_ms,
+        )
 
     @property
     def state(self) -> MarketState:
         return self._state
+
+    @property
+    def last_diagnostics(self) -> MarketStateDiagnostics:
+        return self._last_diagnostics
 
 
 class MakerStrategy:
@@ -170,6 +267,86 @@ class MakerStrategy:
             required_confirm=max(self.config.maker_confirm_ticks, 1),
         )
 
+    def quote_mode_for_market(self, market_state: MarketState) -> str:
+        if market_state == MarketState.ABNORMAL:
+            return QUOTE_MODE_CLOSE_ONLY
+        if market_state == MarketState.QUEUE:
+            return QUOTE_MODE_QUEUE_DEFENSE
+        return QUOTE_MODE_PASSIVE_FAIR_VALUE
+
+    def preview_quote(
+        self,
+        *,
+        symbol: str,
+        exchange: int,
+        tick_size: float,
+        lot_size: int,
+        qty: int,
+        snapshot: BoardSnapshot,
+        decision: EntryDecision,
+        signal: SignalPacket | None = None,
+        position: PositionState | None = None,
+        max_inventory_qty: int = 0,
+        market_state: MarketState = MarketState.NORMAL,
+        working_age_ms: float = 0.0,
+    ) -> tuple[OrderIntent, MakerQuoteDiagnostics]:
+        tick = max(tick_size, 1e-9)
+        quote_mode = self.quote_mode_for_market(market_state)
+        half_spread_ticks = self._calc_half_spread(signal) if signal is not None else self.config.min_half_spread_ticks
+        queue_threshold = self._queue_threshold(market_state)
+        top_queue_qty = snapshot.bid_size if decision.side > 0 else snapshot.ask_size
+
+        if signal is not None and position is not None and max_inventory_qty > 0:
+            fair = self._calc_fair_price(signal, snapshot.mid)
+            reservation = self._calc_reservation_price(fair, position, max_inventory_qty)
+            raw_price = self._select_quote_price(
+                snapshot,
+                signal,
+                decision.side,
+                reservation,
+                tick,
+                quote_mode=quote_mode,
+                queue_threshold=queue_threshold,
+            )
+            reference_price = reservation
+        elif decision.side > 0:
+            fair = snapshot.mid
+            reservation = snapshot.ask
+            raw_price = snapshot.bid if self.config.maker_join_best else snapshot.bid - self.config.maker_retreat_ticks * tick
+            reference_price = snapshot.ask
+        else:
+            fair = snapshot.mid
+            reservation = snapshot.bid
+            raw_price = snapshot.ask if self.config.maker_join_best else snapshot.ask + self.config.maker_retreat_ticks * tick
+            reference_price = snapshot.bid
+
+        price = align_price(raw_price, side=decision.side, tick_size=tick_size)
+        edge_ticks = self._edge_ticks(side=decision.side, quote_price=price, reference_price=reference_price, tick=tick)
+        intent = OrderIntent(
+            symbol=symbol,
+            exchange=exchange,
+            side=decision.side,
+            qty=align_qty(qty, lot_size),
+            price=price,
+            is_market=False,
+            strategy=ENTRY_MODE_MAKER,
+            reason="maker_passive_edge",
+            score=decision.entry_score,
+            reference_price=reference_price,
+        )
+        diagnostics = MakerQuoteDiagnostics(
+            quote_mode=quote_mode,
+            fair_price=fair,
+            reservation_price=reservation,
+            quote_price=price,
+            edge_ticks=edge_ticks,
+            half_spread_ticks=half_spread_ticks,
+            queue_threshold=queue_threshold,
+            top_queue_qty=top_queue_qty,
+            working_age_ms=working_age_ms,
+        )
+        return intent, diagnostics
+
     def build_intent(
         self,
         *,
@@ -184,33 +361,19 @@ class MakerStrategy:
         position: PositionState | None = None,
         max_inventory_qty: int = 0,
     ) -> OrderIntent:
-        tick = max(tick_size, 1e-9)
-        if signal is not None and position is not None and max_inventory_qty > 0:
-            fair = self._calc_fair_price(signal, snapshot.mid)
-            reservation = self._calc_reservation_price(fair, position, max_inventory_qty)
-            raw_price = self._select_quote_price(snapshot, signal, decision.side, reservation, tick)
-            # Reference = fair-value anchor (the mid-point the strategy priced off)
-            reference_price = reservation
-        elif decision.side > 0:
-            raw_price = snapshot.bid if self.config.maker_join_best else snapshot.bid - self.config.maker_retreat_ticks * tick
-            # Reference = the contra-side best (cost if adversely selected)
-            reference_price = snapshot.ask
-        else:
-            raw_price = snapshot.ask if self.config.maker_join_best else snapshot.ask + self.config.maker_retreat_ticks * tick
-            reference_price = snapshot.bid
-        price = align_price(raw_price, side=decision.side, tick_size=tick_size)
-        return OrderIntent(
+        intent, _ = self.preview_quote(
             symbol=symbol,
             exchange=exchange,
-            side=decision.side,
-            qty=align_qty(qty, lot_size),
-            price=price,
-            is_market=False,
-            strategy=ENTRY_MODE_MAKER,
-            reason="maker_passive_edge",
-            score=decision.entry_score,
-            reference_price=reference_price,
+            tick_size=tick_size,
+            lot_size=lot_size,
+            qty=qty,
+            snapshot=snapshot,
+            decision=decision,
+            signal=signal,
+            position=position,
+            max_inventory_qty=max_inventory_qty,
         )
+        return intent
 
     def compute_quote_price(
         self,
@@ -220,7 +383,15 @@ class MakerStrategy:
     ) -> float:
         """Recompute the ideal quote price (no inventory skew) for drift detection."""
         fair = self._calc_fair_price(signal, snapshot.mid)
-        return self._select_quote_price(snapshot, signal, side, fair, self.tick_size)
+        return self._select_quote_price(
+            snapshot,
+            signal,
+            side,
+            fair,
+            self.tick_size,
+            quote_mode=QUOTE_MODE_PASSIVE_FAIR_VALUE,
+            queue_threshold=self._queue_threshold(MarketState.NORMAL),
+        )
 
     def calc_cancel_reason(
         self,
@@ -254,6 +425,8 @@ class MakerStrategy:
         if current_spread > 0 and self.config.spread_expanded_ticks > 0:
             if current_spread / self.tick_size >= self.config.spread_expanded_ticks:
                 return "spread_expanded"
+        if self.config.max_pending_ms > 0 and order_age_ns >= self.config.max_pending_ms * 1_000_000:
+            return "pending_timeout"
         # Min order age guard — suppress signal-based cancels during order's min lifetime
         if self.config.min_order_age_ms > 0 and 0 < order_age_ns < self.config.min_order_age_ms * 1_000_000:
             return ""
@@ -307,6 +480,21 @@ class MakerStrategy:
             return self.config.min_half_spread_ticks
         return self.config.mid_half_spread_ticks
 
+    def _queue_threshold(self, market_state: MarketState) -> int:
+        threshold = max(int(self.config.queue_min_top_qty), 0)
+        if market_state == MarketState.QUEUE and threshold <= 0:
+            return 1
+        return threshold
+
+    def _edge_ticks(self, *, side: int, quote_price: float, reference_price: float, tick: float) -> float:
+        if quote_price <= 0 or reference_price <= 0:
+            return 0.0
+        if side > 0:
+            return (reference_price - quote_price) / tick
+        if side < 0:
+            return (quote_price - reference_price) / tick
+        return 0.0
+
     def _select_quote_price(
         self,
         snapshot: BoardSnapshot,
@@ -314,13 +502,17 @@ class MakerStrategy:
         side: int,
         reservation: float,
         tick: float,
+        *,
+        quote_mode: str = QUOTE_MODE_PASSIVE_FAIR_VALUE,
+        queue_threshold: int = 0,
     ) -> float:
         half_spread_ticks = self._calc_half_spread(signal)
         extra_retreat_ticks = max(0.0, half_spread_ticks - self.config.min_half_spread_ticks)
         # Queue-depth retreat: back away from a thin top-of-book to avoid adverse selection
-        if self.config.queue_min_top_qty > 0:
+        threshold = queue_threshold if queue_threshold > 0 else self.config.queue_min_top_qty
+        if threshold > 0 and quote_mode != QUOTE_MODE_CLOSE_ONLY:
             top_qty = snapshot.bid_size if side > 0 else snapshot.ask_size
-            if 0 < top_qty < self.config.queue_min_top_qty:
+            if 0 < top_qty < threshold:
                 extra_retreat_ticks += self.config.queue_retreat_ticks
         if side > 0:
             base = snapshot.bid if self.config.maker_join_best else snapshot.bid - self.config.maker_retreat_ticks * tick
@@ -579,3 +771,7 @@ def _same_side_depth(snapshot: BoardSnapshot, direction: int) -> int:
 def _opposite_depth(snapshot: BoardSnapshot, direction: int) -> int:
     levels = snapshot.asks if direction > 0 else snapshot.bids
     return sum(max(level.size, 0) for level in levels[:2])
+
+
+def _is_special_quote_sign(sign: str) -> bool:
+    return str(sign or "").strip() in _SPECIAL_QUOTE_SIGNS
