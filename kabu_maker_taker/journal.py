@@ -96,15 +96,18 @@ class TradeJournal:
             self._trades_writer.writeheader()
             self._trades_fh.flush()
 
+        self._markouts_fh = None
         try:
             self._markouts_fh = markouts_path.open("a", newline="", encoding="utf-8")
+            self._markouts_writer = csv.DictWriter(self._markouts_fh, fieldnames=_MARKOUT_FIELDS)
+            if markouts_new:
+                self._markouts_writer.writeheader()
+                self._markouts_fh.flush()
         except Exception:
             self._trades_fh.close()
+            if self._markouts_fh is not None:
+                self._markouts_fh.close()
             raise
-        self._markouts_writer = csv.DictWriter(self._markouts_fh, fieldnames=_MARKOUT_FIELDS)
-        if markouts_new:
-            self._markouts_writer.writeheader()
-            self._markouts_fh.flush()
 
         self._pending: list[_PendingMarkout] = []
         self._last_mid: float = 0.0

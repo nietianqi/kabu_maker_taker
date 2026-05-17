@@ -29,9 +29,12 @@ class DecisionTraceWriter:
         self._fh = None
         if not enabled:
             return
-        log_path = Path(log_dir)
-        log_path.mkdir(parents=True, exist_ok=True)
-        self._fh = (log_path / "decisions.jsonl").open("a", encoding="utf-8")
+        try:
+            log_path = Path(log_dir)
+            log_path.mkdir(parents=True, exist_ok=True)
+            self._fh = (log_path / "decisions.jsonl").open("a", encoding="utf-8")
+        except OSError:
+            self.enabled = False  # degrade gracefully — tracing is optional
 
     def record(
         self,

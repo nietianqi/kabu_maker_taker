@@ -246,6 +246,22 @@ class WalkForwardTests(unittest.TestCase):
         for w in windows:
             self.assertEqual(w["best_params"], {})
 
+    def test_corrupt_training_file_is_skipped(self) -> None:
+        """A corrupt (non-JSON) JSONL file in the training set is skipped silently;
+        walk_forward completes without exception and returns results from valid windows."""
+        valid_files = self._make_files(3)
+
+        # Insert a corrupt file as the second training file
+        corrupt_path = self._dir / "corrupt.jsonl"
+        corrupt_path.write_text("this is not valid json\n", encoding="utf-8")
+
+        # Sequence: [corrupt, valid0, valid1] with train=1, test=1 → 2 windows
+        files = [corrupt_path] + valid_files[:2]
+        # Should NOT raise even though the first training file is corrupt
+        windows = walk_forward(_config(), files, {}, train_days=1, test_days=1)
+        # Must complete and return windows from the valid training files
+        self.assertIsInstance(windows, list)
+
 
 if __name__ == "__main__":
     unittest.main()

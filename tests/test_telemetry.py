@@ -201,5 +201,30 @@ class DecisionTraceWriterTests(unittest.TestCase):
         self.assertAlmostEqual(row["maker_working_age_ms"], 12.5)
 
 
+class TelemetryInitFallbackTests(unittest.TestCase):
+    """Verify that DecisionTraceWriter degrades gracefully when the log
+    directory is inaccessible rather than crashing the whole application."""
+
+    def test_graceful_degradation_on_unwritable_dir(self) -> None:
+        """When the log file cannot be opened (OSError), enabled becomes False
+        and record() / close() are both silent no-ops — no exception raised."""
+        from pathlib import Path
+        import unittest.mock as mock
+
+        # Patch Path.open to raise OSError (simulates inaccessible log dir)
+        # while allowing mkdir to succeed so only the file open fails.
+        with mock.patch.object(Path, "mkdir", return_value=None):
+            with mock.patch.object(Path, "open", side_effect=OSError("permission denied")):
+                writer = DecisionTraceWriter(log_dir="fake_dir", symbol="9984", enabled=True)
+
+        # Should have degraded to disabled
+        self.assertFalse(writer.enabled)
+
+        # record() must be a no-op — no exception
+        writer.record(_result(), PositionState(), now_ns=0)
+        # close() must be a no-op — no exception
+        writer.close()
+
+
 if __name__ == "__main__":
     unittest.main()

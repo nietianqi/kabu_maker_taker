@@ -127,11 +127,14 @@ def walk_forward(
         best_params: dict[str, Any] = {}
         best_score = float("-inf")
         for train_file in train_files:
-            for combo_result in grid_search(base_config, train_file, param_grid, sort_by=sort_by):
-                score = getattr(combo_result.result, sort_by, 0.0)
-                if score > best_score:
-                    best_score = score
-                    best_params = combo_result.params
+            try:
+                for combo_result in grid_search(base_config, train_file, param_grid, sort_by=sort_by):
+                    score = getattr(combo_result.result, sort_by, 0.0)
+                    if score > best_score:
+                        best_score = score
+                        best_params = combo_result.params
+            except Exception:
+                continue  # skip corrupt or empty training file
 
         # Apply best params and test out-of-sample
         test_config = base_config

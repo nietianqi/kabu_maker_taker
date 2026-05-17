@@ -4,6 +4,11 @@
   "tick_size": 1.0,
   "lot_size": 100,
   "dry_run": true,
+  "log_dir": "logs",
+  "enable_journal": false,
+  "enable_decision_trace": false,
+  "kill_switch_path": "halt.txt",
+  "kill_switch_hard_path": "halt_hard.txt",
   "kabu": {
     "base_url": "http://localhost:18080",
     "api_password": "",
@@ -39,12 +44,15 @@
     "mom_long_threshold": 0.0,
     "strong_signal_multiplier": 1.5,
     "maker_join_best": true,
+    "maker_retreat_ticks": 1.0,
     "wall_consumed_ratio_min": 0.60,
     "signal_expire_ms": 500,
     "max_slip_ticks": 1.0,
     "fair_value_beta": 0.75,
     "max_fair_shift_ticks": 3.0,
     "inventory_skew_ticks": 1.0,
+    "inventory_high_threshold": 0.66,
+    "inventory_high_multiplier": 1.5,
     "strong_signal_threshold": 0.75,
     "alpha_exit_threshold": 0.15,
     "alpha_entry_threshold": 0.40,
@@ -118,7 +126,16 @@
     "breakout_lookback_bars": 20,
     "breakout_buffer_ticks": 0.0,
     "vol_expansion_ratio": 2.0,
-    "vol_ema_alpha": 0.05
+    "vol_ema_alpha": 0.05,
+    "lob_tape_ofi_weight": 0.5,
+    "microprice_ema_alpha": 0.2,
+    "weights": {
+      "obi": 0.30,
+      "lob_ofi": 0.25,
+      "tape_ofi": 0.25,
+      "micro_momentum": 0.12,
+      "microprice_tilt": 0.08
+    }
   },
   "lollipop": {
     "maker_tp_ticks": 2.0,
