@@ -89,7 +89,7 @@ def _timeout_strategy() -> CombinedMakerTakerStrategy:
         lot_size=1,
         strategy=StrategyConfig(trade_qty=100, maker_confirm_ticks=1, taker_confirm_ticks=1),
         risk=RiskConfig(max_inventory_qty=300, max_spread_ticks=5.0),
-        lollipop=LollipopConfig(tp_delay_ms=0, maker_max_hold_seconds=0, taker_max_hold_seconds=0),
+        lollipop=LollipopConfig(tp_delay_ms=0, maker_max_hold_seconds=1, taker_max_hold_seconds=1),
     )
     strategy = CombinedMakerTakerStrategy(config)
     strategy.signals.on_board = lambda snapshot: _signal(ts_ns=snapshot.ts_ns)
@@ -392,7 +392,8 @@ class BrokerOrderEventTests(unittest.TestCase):
 
         tp = strategy.on_board(_snapshot(ts_ns=1_000_000_200), now_ns=1_000_000_200)
         assert tp.exit_intent is not None
-        timeout = strategy.on_board(_snapshot(ts_ns=1_000_000_300, bid=99.0, ask=100.0), now_ns=1_000_000_300)
+        # Advance past maker_max_hold_seconds=1 (entry fill at ts_ns=1_000_000_100 + 1s + margin)
+        timeout = strategy.on_board(_snapshot(ts_ns=2_100_000_000, bid=99.0, ask=100.0), now_ns=2_100_000_000)
 
         self.assertIsNone(timeout.exit_intent)
         self.assertEqual(timeout.exit_cancel_signal, "replace_active_exit_before_force_exit")
@@ -414,7 +415,8 @@ class BrokerOrderEventTests(unittest.TestCase):
             if isinstance(event, BrokerOrderEvent):
                 strategy.on_broker_order_event(event)
 
-        timeout_snapshot = _snapshot(ts_ns=1_000_000_300, bid=99.0, ask=100.0)
+        # Advance past maker_max_hold_seconds=1 (entry fill at ts_ns=1_000_000_100 + 1s + margin)
+        timeout_snapshot = _snapshot(ts_ns=2_100_000_000, bid=99.0, ask=100.0)
         timeout = strategy.on_board(timeout_snapshot, now_ns=timeout_snapshot.ts_ns)
         self.assertEqual(timeout.exit_cancel_signal, "replace_active_exit_before_force_exit")
 
@@ -482,6 +484,84 @@ class BrokerOrderEventTests(unittest.TestCase):
         self.assertNotIn('active_by_role("entry")', text)
         self.assertNotIn("role == \"entry\"", text)
         self.assertNotIn("role='entry'", text)
+
+
+class FillDedupEmptyTradeIdTests(unittest.TestCase):
+    """Verify fill deduplication works correctly when trade_id is empty."""
+
+    def _make_ledger_with_order(self) -> tuple[OrderLedger, str]:
+        """Return a ledger with one NEW_PENDING entry order; return (ledger, order_id)."""
+        ledger = OrderLedger()
+        intent = OrderIntent(
+            symbol="9984",
+            exchange=27,
+            side=1,
+            qty=100,
+            price=101.0,
+            is_market=False,
+            strategy="maker",
+            reason="maker_entry",
+            score=8,
+            reference_price=101.0,
+        )
+        order = ledger.add_intent(intent, role="entry", now_ns=0)
+        return ledger, order.client_order_id
+
+    def test_empty_trade_id_fill_not_double_counted(self) -> None:
+        """Applying the same fill event (trade_id='') twice must only count once.
+
+        The composite key ts_ns:qty:price ensures the second identical event is
+        recognised as a duplicate even when trade_id is absent.
+        """
+        ledger, oid = self._make_ledger_with_order()
+        fill = BrokerFillEvent(
+            order_id=oid,
+            qty=100,
+            price=101.0,
+            ts_ns=1_000_000_000,
+            trade_id="",   # no trade_id from broker
+        )
+        ledger.apply_fill_event(fill)
+        ledger.apply_fill_event(fill)  # identical replay
+
+        order = ledger.get(oid)
+        assert order is not None
+        self.assertEqual(order.cum_qty, 100,
+                         "Second identical fill must be rejected as duplicate; cum_qty must == 100")
+
+    def test_different_ts_fills_both_applied(self) -> None:
+        """Two fills with trade_id='' but different ts_ns produce different composite
+        keys and must both be applied → cum_qty == 200 (2 × fill_qty)."""
+        ledger, oid = self._make_ledger_with_order()
+        # Create ledger with larger qty so both fills fit
+        ledger2 = OrderLedger()
+        intent = OrderIntent(
+            symbol="9984",
+            exchange=27,
+            side=1,
+            qty=200,
+            price=101.0,
+            is_market=False,
+            strategy="maker",
+            reason="maker_entry",
+            score=8,
+            reference_price=101.0,
+        )
+        order2 = ledger2.add_intent(intent, role="entry", now_ns=0)
+        oid2 = order2.client_order_id
+
+        fill1 = BrokerFillEvent(order_id=oid2, qty=100, price=101.0,
+                                ts_ns=1_000_000_000, trade_id="")
+        fill2 = BrokerFillEvent(order_id=oid2, qty=100, price=101.0,
+                                ts_ns=2_000_000_000, trade_id="")  # different ts_ns
+
+        ledger2.apply_fill_event(fill1)
+        ledger2.apply_fill_event(fill2)
+
+        order_state = ledger2.get(oid2)
+        assert order_state is not None
+        self.assertEqual(order_state.cum_qty, 200,
+                         "Two fills with different ts_ns must both be counted")
 
 
 if __name__ == "__main__":

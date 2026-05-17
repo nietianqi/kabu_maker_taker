@@ -205,7 +205,7 @@ class ReplayRunnerTests(unittest.TestCase):
             lot_size=1,
             strategy=StrategyConfig(trade_qty=100, maker_confirm_ticks=1, taker_confirm_ticks=1),
             risk=RiskConfig(max_inventory_qty=300, max_spread_ticks=5.0),
-            lollipop=LollipopConfig(tp_delay_ms=0, maker_max_hold_seconds=0, taker_max_hold_seconds=0),
+            lollipop=LollipopConfig(tp_delay_ms=0, maker_max_hold_seconds=1, taker_max_hold_seconds=1),
         )
         strategy = CombinedMakerTakerStrategy(config)
         strategy.signals.on_board = lambda snapshot: _signal(snapshot.ts_ns)
@@ -231,7 +231,8 @@ class ReplayRunnerTests(unittest.TestCase):
             if isinstance(event, BrokerOrderEvent):
                 strategy.on_broker_order_event(event)
 
-        timeout_snapshot = _board(1_000_000_300, bid=99.0, ask=100.0)
+        # Advance past maker_max_hold_seconds=1 (entry fill at ts_ns=1_000_000_100 + 1s + margin)
+        timeout_snapshot = _board(2_100_000_000, bid=99.0, ask=100.0)
         timeout_board = BoardSnapshot.from_dict(timeout_snapshot)
         timeout = strategy.on_board(timeout_board, now_ns=timeout_board.ts_ns)
         self.assertEqual(timeout.exit_cancel_signal, "replace_active_exit_before_force_exit")

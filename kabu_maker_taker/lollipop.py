@@ -218,6 +218,8 @@ class LollipopTPManager:
         if qty <= 0:
             return None
         tp_price = self.state.tp_price
+        if tp_price <= 0:
+            return None  # safety: never submit a zero-price limit order
         exit_side = -position.side
         return OrderIntent(
             symbol=symbol,
@@ -275,7 +277,8 @@ class LollipopTPManager:
         else:
             raw = avg_price - tp_ticks * self.tick_size
             exit_side = 1
-        return _align_price(raw, side=exit_side, tick_size=self.tick_size)
+        aligned = _align_price(raw, side=exit_side, tick_size=self.tick_size)
+        return max(aligned, self.tick_size)
 
     def _hold_exceeded(self, now_ns: int) -> bool:
         max_hold_s = (
@@ -283,6 +286,8 @@ class LollipopTPManager:
             if self.state.entry_mode == "maker"
             else self.config.taker_max_hold_seconds
         )
+        if max_hold_s <= 0:
+            return False
         elapsed_ns = now_ns - self.state.entry_ts_ns
         return elapsed_ns >= max_hold_s * 1_000_000_000
 

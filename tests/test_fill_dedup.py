@@ -57,18 +57,19 @@ class FillDeduplicationTests(unittest.TestCase):
         self.assertEqual(q2, 40)
         self.assertEqual(ledger.get(oid).cum_qty, 70)  # type: ignore[union-attr]
 
-    def test_empty_trade_id_does_not_dedup(self) -> None:
-        """trade_id='' (default) must not be deduplicated — backward compatibility."""
+    def test_empty_trade_id_uses_composite_key_dedup(self) -> None:
+        """trade_id='' falls back to ts_ns:qty:price composite key.
+        Replaying the exact same event twice must count only once."""
         ledger, oid = self._ledger_with_working_order()
         f = BrokerFillEvent(order_id=oid, qty=20, price=100.0, ts_ns=1)  # trade_id=""
 
         _, q1, _ = ledger.apply_fill_event(f)
-        _, q2, _ = ledger.apply_fill_event(f)
+        _, q2, _ = ledger.apply_fill_event(f)  # identical replay — same composite key
 
-        # Both fills count; empty trade_id bypasses dedup
+        # Second fill is a duplicate; only the first fill counts
         self.assertEqual(q1, 20)
-        self.assertEqual(q2, 20)
-        self.assertEqual(ledger.get(oid).cum_qty, 40)  # type: ignore[union-attr]
+        self.assertEqual(q2, 0)
+        self.assertEqual(ledger.get(oid).cum_qty, 20)  # type: ignore[union-attr]
 
     def test_fill_ids_cleaned_up_when_order_pruned_from_history(self) -> None:
         """_order_fill_ids must not grow unboundedly; entries removed when order pruned."""

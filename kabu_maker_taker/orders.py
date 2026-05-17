@@ -170,16 +170,17 @@ class OrderLedger:
         if event.price <= 0:
             return order, 0, 0.0
         # Deduplicate fills by trade_id to handle broker replays.
-        if event.trade_id:
-            seen = self._order_fill_ids.get(order.client_order_id)
-            if seen is not None and event.trade_id in seen:
-                return order, 0, event.price  # duplicate — already applied
+        # Fall back to a composite key when trade_id is absent so that empty-id
+        # fills (broker replay, simulator) are also deduplicated correctly.
+        dedup_key = event.trade_id or f"{event.ts_ns}:{event.qty}:{event.price}"
+        seen = self._order_fill_ids.get(order.client_order_id)
+        if seen is not None and dedup_key in seen:
+            return order, 0, event.price  # duplicate — already applied
         fill_qty = min(max(event.qty, 0), order.leaves_qty)
         if fill_qty <= 0 or order.is_final:
             return order, 0, event.price
         self._apply_incremental_fill(order, fill_qty, event.price)
-        if event.trade_id:
-            self._order_fill_ids.setdefault(order.client_order_id, set()).add(event.trade_id)
+        self._order_fill_ids.setdefault(order.client_order_id, set()).add(dedup_key)
         order.updated_ts_ns = event.ts_ns or order.updated_ts_ns
         self._sync_active(order)
         return order, fill_qty, event.price

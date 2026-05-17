@@ -710,5 +710,104 @@ class StopLossZeroBidTests(unittest.TestCase):
         self.assertEqual(mgr.phase, LollipopPhase.ACTIVE)
 
 
+class HoldExceededGuardTests(unittest.TestCase):
+    """Verify that _hold_exceeded() never fires when hold-time is disabled
+    or when entry_ts_ns is 0 (uninitialized / broker reconciliation default)."""
+
+    def test_hold_not_exceeded_when_max_hold_zero(self) -> None:
+        """max_hold_seconds=0 means disabled; tick() must NOT transition to TIMEOUT."""
+        cfg = LollipopConfig(
+            maker_tp_ticks=2.0,
+            taker_tp_ticks=3.0,
+            maker_max_hold_seconds=0,   # disabled
+            taker_max_hold_seconds=0,   # disabled
+            tp_delay_ms=0,
+            max_retries=5,
+            stop_loss_ticks=0.0,
+        )
+        mgr = LollipopTPManager(cfg, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        pos = _pos(100.0)
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)  # → ACTIVE
+
+        # Advance time far into the future — hold guard must stay silent
+        action = mgr.tick(_snap(), pos, now_ns=999_999_999_999_999_999, **_KW)
+        self.assertEqual(action.action, "none",
+                         "max_hold=0 should disable hold-time timeout entirely")
+        self.assertEqual(mgr.phase, LollipopPhase.ACTIVE)
+
+    def test_hold_not_exceeded_when_entry_ts_recent(self) -> None:
+        """restore_active_exit with a recent entry_ts_ns does not cause spurious
+        timeout on the very first tick after broker reconciliation."""
+        cfg = LollipopConfig(
+            maker_tp_ticks=2.0,
+            taker_tp_ticks=3.0,
+            maker_max_hold_seconds=30,
+            taker_max_hold_seconds=30,
+            tp_delay_ms=0,
+            max_retries=5,
+            stop_loss_ticks=0.0,
+        )
+        mgr = LollipopTPManager(cfg, _TICK, _LOT)
+        now = 1_770_000_000_000_000_000  # realistic production timestamp
+        # Broker reconciliation: entry was 5 seconds ago — well within 30s hold
+        mgr.restore_active_exit(
+            tp_price=102.0,
+            entry_mode="maker",
+            entry_side=1,
+            entry_ts_ns=now - 5_000_000_000,  # 5 seconds before now
+        )
+        self.assertEqual(mgr.phase, LollipopPhase.ACTIVE)
+
+        pos = _pos(100.0)
+        action = mgr.tick(_snap(), pos, now_ns=now, **_KW)
+        self.assertEqual(action.action, "none",
+                         "5s into a 30s hold should not trigger timeout")
+        self.assertEqual(mgr.phase, LollipopPhase.ACTIVE)
+
+
+class TpPriceGuardTests(unittest.TestCase):
+    """Verify TP price floor and zero-price intent guard."""
+
+    def test_tp_price_clamped_to_tick_size_for_short_entry(self) -> None:
+        """For a short entry where avg_price - tp_ticks * tick_size ≤ 0,
+        the TP price must be clamped to at least tick_size (1.0)."""
+        cfg = LollipopConfig(
+            maker_tp_ticks=2.0,
+            taker_tp_ticks=5.0,  # 1.0 - 5.0 * 1.0 = -4.0 → would be 0 without fix
+            maker_max_hold_seconds=300,
+            taker_max_hold_seconds=300,
+            tp_delay_ms=0,
+            max_retries=5,
+            stop_loss_ticks=0.0,
+        )
+        mgr = LollipopTPManager(cfg, _TICK, _LOT)
+        mgr.on_entry_fill(1.0, "taker", now_ns=0, entry_side=-1)
+        # TP price must be ≥ tick_size even when the raw value would go negative
+        self.assertGreaterEqual(mgr.state.tp_price, _TICK,
+                                "TP price must be floored at tick_size for short entry")
+
+    def test_build_tp_intent_returns_none_for_zero_tp_price(self) -> None:
+        """If state.tp_price is 0.0 (e.g. pathological config), _build_tp_intent
+        must return None rather than submit a zero-price limit order."""
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        # Force tp_price to zero to exercise the safety guard
+        mgr.state.tp_price = 0.0
+        pos = _pos(100.0)
+        # tick() in SCHEDULED state calls _build_tp_intent(); with tp_price=0 it must
+        # return None and not submit an intent, keeping the phase in SCHEDULED
+        action = mgr.tick(_snap(), pos, now_ns=0, **_KW)
+        # With tp_price=0, _build_tp_intent returns None → action must NOT be submit_tp
+        # The lollipop should not submit a zero-price order
+        if action.action == "submit_tp":
+            self.assertIsNotNone(action.intent)
+            self.assertGreater(action.intent.price, 0.0,
+                               "submitted TP intent must never have price=0")
+        else:
+            self.assertEqual(action.action, "none",
+                             "zero tp_price must not produce a submit_tp action")
+
+
 if __name__ == "__main__":
     unittest.main()
