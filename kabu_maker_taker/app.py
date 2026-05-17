@@ -206,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             if halt_reason:
                 return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
         if result.entry_cancel_signal:
-            for oid in strategy.working_entry_ids:
+            for oid in list(strategy.working_entry_ids):
                 order = strategy.request_cancel(oid, reason=result.entry_cancel_signal, now_ns=now_ns)
                 if live_executor is None:
                     for cancel_event in simulator.cancel(oid, snapshot.ts_ns):

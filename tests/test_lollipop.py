@@ -454,6 +454,115 @@ class ForceExitOneShotTests(unittest.TestCase):
         self.assertEqual(strategy.lollipop.phase, LollipopPhase.SCHEDULED)
 
 
+class ScaleInFillTests(unittest.TestCase):
+    """Verify on_scale_in_fill() updates tp_price without resetting the state machine."""
+
+    def _make_active_mgr(self) -> tuple[LollipopTPManager, PositionState]:
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        pos = _pos(100.0)
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)  # SCHEDULED → ACTIVE
+        self.assertEqual(mgr.phase, LollipopPhase.ACTIVE)
+        return mgr, pos
+
+    def test_scale_in_while_scheduled_updates_tp_price(self) -> None:
+        """Scale-in during SCHEDULED updates tp_price; phase stays SCHEDULED.
+
+        With tick_size=1.0 and maker_tp_ticks=2.0, exit_side=-1 so _align_price floors:
+          avg=100.0 → tp = floor(102.0) = 102.0
+          avg=101.0 → tp = floor(103.0) = 103.0  (clearly different)
+        """
+        mgr = LollipopTPManager(_CFG, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        self.assertEqual(mgr.phase, LollipopPhase.SCHEDULED)
+        old_tp = mgr.state.tp_price  # 102.0
+
+        mgr.on_scale_in_fill(101.0, "maker", entry_side=1)
+        self.assertEqual(mgr.phase, LollipopPhase.SCHEDULED)
+        self.assertAlmostEqual(mgr.state.tp_price, 103.0, places=4)
+        self.assertNotEqual(mgr.state.tp_price, old_tp)
+
+    def test_scale_in_while_active_does_not_reset_state(self) -> None:
+        """Scale-in during ACTIVE updates tp_price; phase stays ACTIVE; retry_count unchanged."""
+        mgr, _ = self._make_active_mgr()
+        old_retry = mgr.state.retry_count
+        old_submit_after = mgr.state.submit_after_ns
+
+        mgr.on_scale_in_fill(101.0, "maker", entry_side=1)
+
+        self.assertEqual(mgr.phase, LollipopPhase.ACTIVE, "Phase must stay ACTIVE after scale-in")
+        self.assertEqual(mgr.state.retry_count, old_retry, "retry_count must not reset")
+        self.assertEqual(mgr.state.submit_after_ns, old_submit_after, "submit_after_ns must not reset")
+        self.assertAlmostEqual(mgr.state.tp_price, 103.0, places=4)
+
+    def test_scale_in_while_timeout_preserves_timeout(self) -> None:
+        """Scale-in during TIMEOUT only updates tp_price; phase stays TIMEOUT."""
+        mgr, _ = self._make_active_mgr()
+        mgr.force_exit_next_tick()
+        self.assertEqual(mgr.phase, LollipopPhase.TIMEOUT)
+
+        mgr.on_scale_in_fill(100.2, "maker", entry_side=1)
+
+        self.assertEqual(mgr.phase, LollipopPhase.TIMEOUT,
+                         "TIMEOUT phase must not change on scale-in")
+
+    def test_scale_in_via_combined_does_not_double_submit_tp(self) -> None:
+        """combined._apply_position_fill() with scale-in does not reset ACTIVE lollipop."""
+        from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+        from kabu_maker_taker.config import AppConfig, LollipopConfig
+        from kabu_maker_taker.models import BrokerFillEvent
+
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            tick_size=1.0,
+            lot_size=100,
+            lollipop=LollipopConfig(
+                maker_tp_ticks=2.0,
+                taker_tp_ticks=3.0,
+                tp_delay_ms=0,
+                maker_max_hold_seconds=300,
+                taker_max_hold_seconds=300,
+                max_retries=3,
+            ),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+
+        # Simulate first entry fill (IDLE → SCHEDULED).
+        # Use the tracked order's client_order_id (OrderIntent.client_order_id defaults to "").
+        from kabu_maker_taker.models import OrderIntent
+        from kabu_maker_taker.strategy import ORDER_ROLE_ENTRY
+        entry_intent = OrderIntent(
+            symbol="9984", exchange=27, side=1, qty=100, price=101.0,
+            is_market=False, strategy="taker", reason="taker_entry", score=10,
+            reference_price=101.0,
+        )
+        tracked1 = strategy.orders.add_intent(entry_intent, role=ORDER_ROLE_ENTRY, now_ns=0)
+        strategy.on_broker_fill(BrokerFillEvent(
+            order_id=tracked1.client_order_id,
+            qty=100, price=101.0, ts_ns=0,
+        ))
+        # Advance lollipop to ACTIVE via tick
+        strategy.lollipop.tick(_snap(bid=100.0, ask=101.0), strategy.position, 0, **_KW)
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.ACTIVE)
+
+        # Simulate scale-in fill (same side)
+        entry_intent2 = OrderIntent(
+            symbol="9984", exchange=27, side=1, qty=100, price=101.5,
+            is_market=False, strategy="taker", reason="taker_entry", score=10,
+            reference_price=101.5,
+        )
+        tracked2 = strategy.orders.add_intent(entry_intent2, role=ORDER_ROLE_ENTRY, now_ns=0)
+        strategy.on_broker_fill(BrokerFillEvent(
+            order_id=tracked2.client_order_id,
+            qty=100, price=101.5, ts_ns=1_000_000,
+        ))
+
+        # After scale-in, lollipop must still be ACTIVE (not SCHEDULED)
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.ACTIVE,
+                         "Scale-in must not reset lollipop from ACTIVE to SCHEDULED")
+
+
 class RejectedForceExitTests(unittest.TestCase):
     """Verify that a REJECTED force-exit order correctly resets the lollipop
     so the next tick can re-emit a fresh force_exit."""

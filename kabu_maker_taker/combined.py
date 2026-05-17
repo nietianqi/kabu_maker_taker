@@ -433,10 +433,9 @@ class CombinedMakerTakerStrategy:
             self.position.avg_price = (self.position.avg_price * self.position.qty + price * qty) / new_qty
             self.position.qty = new_qty
             self._partial_loss_counted_for_position = False
-            self.lollipop.on_entry_fill(
+            self.lollipop.on_scale_in_fill(
                 self.position.avg_price,
                 self.position.entry_mode or entry_mode,
-                now_ns,
                 entry_side=self.position.side,
             )
             return "entry"

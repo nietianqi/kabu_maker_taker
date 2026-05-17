@@ -402,6 +402,9 @@ class MicrostructureSignalEngine:
         microprice, micro_momentum_raw, microprice_tilt_raw = self._micro_signals(snapshot)
         mid_std_ticks = self.mid_std.update(snapshot.mid)
         integrated_ofi = self._lob_ofi_weight * lob_ofi_raw + self._tape_ofi_weight * tape_ofi_raw
+        # microprice_gap_ticks: raw displacement of microprice from mid, in ticks.
+        # Distinct from microprice_tilt_raw which normalises by mid_std_ticks.
+        microprice_gap_ticks_val = (microprice - snapshot.mid) / self.tick_size if self.tick_size > 0 else 0.0
 
         obi_z = self.z_obi.update(obi_raw)
         lob_z = self.z_lob.update(lob_ofi_raw)
@@ -457,7 +460,7 @@ class MicrostructureSignalEngine:
             microprice_tilt_z=tilt_z,
             composite=composite,
             mid_std_ticks=mid_std_ticks,
-            microprice_gap_ticks=microprice_tilt_raw,
+            microprice_gap_ticks=microprice_gap_ticks_val,
             integrated_ofi=integrated_ofi,
             trade_burst_score=self.tape.burst,
             tape_ofi_1s=tape_ofi_1s,

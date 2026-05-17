@@ -68,6 +68,21 @@ class LollipopTPManager:
             force_exit_requested=False,
         )
 
+    def on_scale_in_fill(self, new_avg_price: float, entry_mode: str, entry_side: int) -> None:
+        """Update TP price after a scale-in fill without resetting the state machine.
+
+        Calling ``on_entry_fill()`` while ACTIVE would reset the phase to SCHEDULED,
+        orphaning the already-submitted TP limit order and causing a second TP to be
+        submitted on the next tick (double-exit risk).  This method only recalculates
+        ``tp_price`` in-place, preserving the current phase, retry_count, and
+        submit_after_ns.
+        """
+        if self.state.phase == LollipopPhase.IDLE:
+            # Defensive fallback: no active workflow — treat as a fresh entry.
+            self.on_entry_fill(new_avg_price, entry_mode, now_ns=0, entry_side=entry_side)
+            return
+        self.state.tp_price = self._calc_tp_price(new_avg_price, entry_mode, entry_side)
+
     def on_exit_fill(self) -> None:
         self.state = LollipopState()
 
