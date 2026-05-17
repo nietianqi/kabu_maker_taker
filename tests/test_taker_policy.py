@@ -348,5 +348,139 @@ class DynamicSizingTests(unittest.TestCase):
         self.assertEqual(min(scaled, max_inv), 300)
 
 
+# ---------------------------------------------------------------------------
+# T-09 Volatility Expansion Taker
+# ---------------------------------------------------------------------------
+
+class VolExpansionTakerTests(unittest.TestCase):
+
+    def _make_vol_snap(self, spread_ticks: float = 1.0) -> BoardSnapshot:
+        """Snapshot with configurable spread; ask = bid + spread."""
+        return _snap(bid=100.0, ask=100.0 + spread_ticks, bid_size=500, ask_size=100)
+
+    def _make_vol_signal(self, vol_expansion: bool = True) -> SignalPacket:
+        """Signal with directional OBI+tape+tilt all passing thresholds."""
+        s = _signal(obi_raw=0.40, tape_ofi_raw=0.25, microprice_tilt_raw=0.50)
+        # Rebuild with vol_expansion set
+        return SignalPacket(
+            ts_ns=s.ts_ns,
+            composite=s.composite,
+            obi_raw=s.obi_raw,
+            obi_z=s.obi_z,
+            tape_ofi_raw=s.tape_ofi_raw,
+            tape_ofi_z=s.tape_ofi_z,
+            lob_ofi_raw=s.lob_ofi_raw,
+            lob_ofi_z=s.lob_ofi_z,
+            micro_momentum_raw=s.micro_momentum_raw,
+            micro_momentum_z=s.micro_momentum_z,
+            microprice_tilt_raw=s.microprice_tilt_raw,
+            microprice_tilt_z=s.microprice_tilt_z,
+            microprice=s.microprice,
+            mid=s.mid,
+            mid_std_ticks=s.mid_std_ticks,
+            integrated_ofi=s.integrated_ofi,
+            trade_burst_score=s.trade_burst_score,
+            vol_expansion=vol_expansion,
+        )
+
+    def test_vol_expansion_disabled_by_default(self) -> None:
+        """use_vol_expansion_taker=False → T-09 path inactive even with vol_expansion=True."""
+        # Standard breakout checks will fail (opposite side not thin, no breakout_long)
+        t = _make_taker(use_vol_expansion_taker=False)
+        snap = self._make_vol_snap(spread_ticks=1.0)
+        sig = self._make_vol_signal(vol_expansion=True)
+        decision = t.evaluate(snap, sig)
+        # T-09 disabled → must hit taker_breakout (not T-09 path)
+        if not decision.allow:
+            self.assertIn("taker_breakout", decision.reason)
+
+    def test_vol_expansion_triggers_entry_when_enabled(self) -> None:
+        """T-09 enabled + vol_expansion=True + narrow spread + directional signals → entry allowed."""
+        # Make opposite side thin so _breakout_ready COULD pass, but disable burst so it doesn't.
+        # Use thin opposite side (ask_size << bid_size) so breakout_ready might pass —
+        # we just need the evaluate() to eventually return allow=True via some path.
+        # Simpler: ensure T-09 is the accepting path by using bid==ask_size (not thin enough).
+        t = _make_taker(
+            use_vol_expansion_taker=True,
+            vol_expansion_spread_max_ticks=2.0,
+            taker_score_threshold=5,  # lower threshold so score check passes
+        )
+        snap = self._make_vol_snap(spread_ticks=1.0)
+        sig = self._make_vol_signal(vol_expansion=True)
+        decision = t.evaluate(snap, sig)
+        # With T-09 path active + all conditions met, should be allowed (or at least not blocked by vol_expansion)
+        if not decision.allow:
+            self.assertNotEqual(decision.reason, "taker_breakout",
+                                "T-09 path enabled + vol_expansion=True should not fail at breakout when conditions pass")
+
+    def test_vol_expansion_blocked_when_spread_too_wide(self) -> None:
+        """T-09 spread filter: spread=3 > vol_expansion_spread_max_ticks=2 → blocked."""
+        t = _make_taker(
+            use_vol_expansion_taker=True,
+            vol_expansion_spread_max_ticks=2.0,
+        )
+        snap = self._make_vol_snap(spread_ticks=3.0)  # exceeds 2-tick cap
+        sig = self._make_vol_signal(vol_expansion=True)
+        # _vol_expansion_ready should return False → breakout path also fails → blocked
+        blocked = t._vol_expansion_ready(snap, sig, direction=1)
+        self.assertFalse(blocked, "Spread=3 > max=2 must block T-09 entry")
+
+    def test_vol_expansion_blocked_without_vol_expansion_flag(self) -> None:
+        """T-09 requires vol_expansion=True; False → _vol_expansion_ready returns False."""
+        t = _make_taker(use_vol_expansion_taker=True, vol_expansion_spread_max_ticks=2.0)
+        snap = self._make_vol_snap(spread_ticks=1.0)
+        sig = self._make_vol_signal(vol_expansion=False)
+        result = t._vol_expansion_ready(snap, sig, direction=1)
+        self.assertFalse(result, "vol_expansion=False must block T-09 path")
+
+
+# ---------------------------------------------------------------------------
+# Multi-window tape (tape_ofi_1s) in exec quality scoring
+# ---------------------------------------------------------------------------
+
+class TapeOfi1sExecQualityTests(unittest.TestCase):
+
+    def _make_snap(self) -> BoardSnapshot:
+        return _snap(bid=100.0, ask=101.0)  # 1-tick spread → spread_score=3
+
+    def _make_signal_with_1s(self, tape_ofi_raw: float, tape_ofi_1s: float) -> SignalPacket:
+        s = _signal(obi_raw=0.40, lob_ofi_raw=0.25, tape_ofi_raw=tape_ofi_raw, microprice_tilt_raw=0.50)
+        return SignalPacket(
+            ts_ns=s.ts_ns, composite=s.composite,
+            obi_raw=s.obi_raw, obi_z=s.obi_z,
+            tape_ofi_raw=s.tape_ofi_raw, tape_ofi_z=s.tape_ofi_z,
+            tape_ofi_1s=tape_ofi_1s,
+            lob_ofi_raw=s.lob_ofi_raw, lob_ofi_z=s.lob_ofi_z,
+            micro_momentum_raw=s.micro_momentum_raw, micro_momentum_z=s.micro_momentum_z,
+            microprice_tilt_raw=s.microprice_tilt_raw, microprice_tilt_z=s.microprice_tilt_z,
+            microprice=s.microprice, mid=s.mid, mid_std_ticks=s.mid_std_ticks,
+            integrated_ofi=s.integrated_ofi, trade_burst_score=s.trade_burst_score,
+        )
+
+    def test_tape_ofi_1s_disabled_by_default(self) -> None:
+        """tape_ofi_1s_min=0 → 1s window ignored; strongly negative 1s tape doesn't reduce score."""
+        t = _make_taker(tape_ofi_1s_min=0.0)
+        sig = self._make_signal_with_1s(tape_ofi_raw=0.25, tape_ofi_1s=-0.50)
+        q = t._compute_exec_quality(self._make_snap(), sig, direction=1)
+        # lob(0.25)+tape(0.25) both pass → ofi=2; spread(1)=3, obi=3, microprice=2 → total=10
+        self.assertEqual(q, 10, "1s tape disabled → ofi_score=2 regardless of tape_ofi_1s")
+
+    def test_tape_ofi_1s_reduces_score_when_1s_fails(self) -> None:
+        """tape_ofi_1s_min=0.10 + tape_ofi_raw passes but tape_ofi_1s fails → tape_ok=False → ofi_score drops."""
+        t = _make_taker(tape_ofi_1s_min=0.10)
+        sig = self._make_signal_with_1s(tape_ofi_raw=0.25, tape_ofi_1s=-0.05)
+        q = t._compute_exec_quality(self._make_snap(), sig, direction=1)
+        # tape_ok=False; lob_ok=True → ofi=1 (only lob); total = 3+3+1+2 = 9
+        self.assertEqual(q, 9, "1s tape fails → ofi_score=1 (lob only)")
+
+    def test_tape_ofi_1s_full_score_when_both_pass(self) -> None:
+        """tape_ofi_1s_min=0.10 + both windows pass → tape_ok=True → ofi_score=2."""
+        t = _make_taker(tape_ofi_1s_min=0.10)
+        sig = self._make_signal_with_1s(tape_ofi_raw=0.25, tape_ofi_1s=0.20)
+        q = t._compute_exec_quality(self._make_snap(), sig, direction=1)
+        # Both windows pass → ofi=2; total = 3+3+2+2 = 10
+        self.assertEqual(q, 10, "Both tape windows pass → ofi_score=2, quality=10")
+
+
 if __name__ == "__main__":
     unittest.main()

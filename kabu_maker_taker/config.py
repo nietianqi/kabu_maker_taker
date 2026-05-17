@@ -168,6 +168,12 @@ class StrategyConfig:
     scale_qty_by_score: bool = False
     scale_qty_score_threshold: int = 11
     scale_qty_multiplier: float = 1.5
+    # Taker: T-09 volatility-expansion alternative entry path (False = disabled)
+    use_vol_expansion_taker: bool = False
+    # T-09: max spread ticks allowed when vol_expansion fires (0 = inherit RiskConfig.max_spread_ticks)
+    vol_expansion_spread_max_ticks: float = 2.0
+    # Taker: exec quality — require 1s tape OFI to also confirm direction (0 = disabled)
+    tape_ofi_1s_min: float = 0.0
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "StrategyConfig":
@@ -221,6 +227,9 @@ class StrategyConfig:
             scale_qty_by_score=bool(payload.get("scale_qty_by_score", False)),
             scale_qty_score_threshold=int(payload.get("scale_qty_score_threshold", 11)),
             scale_qty_multiplier=float(payload.get("scale_qty_multiplier", 1.5)),
+            use_vol_expansion_taker=bool(payload.get("use_vol_expansion_taker", False)),
+            vol_expansion_spread_max_ticks=float(payload.get("vol_expansion_spread_max_ticks", 2.0)),
+            tape_ofi_1s_min=float(payload.get("tape_ofi_1s_min", 0.0)),
         )
 
 

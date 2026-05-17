@@ -588,7 +588,8 @@ class TakerStrategy:
 
         if not self._breakout_ready(snapshot, signal, diagnostics.direction):
             if not self._breakout_price_ready(signal, diagnostics.direction):
-                return EntryDecision(False, "taker_breakout")
+                if not self._vol_expansion_ready(snapshot, signal, diagnostics.direction):
+                    return EntryDecision(False, "taker_breakout")
 
         # Determine required confirmation ticks
         confirm = max(self.config.taker_confirm_ticks, 1)
@@ -626,6 +627,9 @@ class TakerStrategy:
                            else 0)
         lob_ok = sign * signal.lob_ofi_raw >= self.config.of_imbalance_long
         tape_ok = sign * signal.tape_ofi_raw >= self.config.tape_imbalance_long
+        if self.config.tape_ofi_1s_min > 0:
+            # Both windows must agree; 15s alone is insufficient when 1s check is active
+            tape_ok = tape_ok and (sign * signal.tape_ofi_1s >= self.config.tape_ofi_1s_min)
         ofi_score = 2 if (lob_ok and tape_ok) else 1 if (lob_ok or tape_ok) else 0
         tilt = sign * signal.microprice_tilt_raw
         microprice_score = (2 if tilt >= self.config.microprice_tilt_long * 1.5
@@ -726,6 +730,27 @@ class TakerStrategy:
             and integrated
             and burst_or_strong_tape
         )
+
+    def _vol_expansion_ready(self, snapshot: BoardSnapshot, signal: SignalPacket, direction: int) -> bool:
+        """T-09: volatility-expansion alternative entry path.
+
+        Fires when the market transitions from low to high volatility with directional
+        confirmation from OBI, tape, and microprice tilt. A strict spread filter is
+        applied because spread can widen simultaneously with vol expansion — entering
+        into a wide spread erodes edge.
+        """
+        if not self.config.use_vol_expansion_taker or not signal.vol_expansion:
+            return False
+        # Spread filter: reject when spread exceeds the T-09-specific cap
+        if self.config.vol_expansion_spread_max_ticks > 0 and snapshot.spread > 0:
+            spread_ticks = snapshot.spread / self.tick_size
+            if spread_ticks > self.config.vol_expansion_spread_max_ticks:
+                return False
+        sign = 1 if direction > 0 else -1
+        obi_ok = sign * signal.obi_raw > self.config.book_imbalance_long
+        tape_ok = sign * signal.tape_ofi_raw > self.config.tape_imbalance_long
+        tilt_ok = sign * signal.microprice_tilt_raw >= self.config.microprice_tilt_long
+        return obi_ok and tape_ok and tilt_ok
 
 
 class ConfirmationTracker:
