@@ -16,6 +16,8 @@ via ``on_broker_fill()`` / ``on_broker_order_event()``.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .broker import BrokerReconciliationSnapshot
 from .config import AppConfig
 from .journal import TradeJournal
@@ -51,6 +53,20 @@ from .strategy import (
     ORDER_ROLE_EXIT,
     TakerStrategy,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class EntrySelection:
+    decision: EntryDecision
+    setup_type: str = ""
+    selection_reason: str = ""
+    maker_decision: EntryDecision | None = None
+    taker_decision: EntryDecision | None = None
+    maker_trigger: str = ""
+    taker_trigger: str = ""
+    maker_edge_ticks: float = 0.0
+    taker_exec_quality: int = 0
+    maker_diagnostics: MakerQuoteDiagnostics | None = None
 
 
 class CombinedMakerTakerStrategy:
@@ -108,6 +124,26 @@ class CombinedMakerTakerStrategy:
             "maker_queue_threshold": diagnostics.queue_threshold,
             "maker_top_queue_qty": diagnostics.top_queue_qty,
             "maker_working_age_ms": diagnostics.working_age_ms,
+        }
+
+    def _selection_result_fields(self, selection: EntrySelection | None) -> dict[str, object]:
+        if selection is None:
+            return {}
+        maker_decision = selection.maker_decision
+        taker_decision = selection.taker_decision
+        return {
+            "setup_type": selection.setup_type,
+            "selection_reason": selection.selection_reason,
+            "maker_candidate_allow": maker_decision.allow if maker_decision else False,
+            "maker_candidate_reason": maker_decision.reason if maker_decision else "",
+            "maker_candidate_score": maker_decision.entry_score if maker_decision else 0,
+            "maker_candidate_trigger": selection.maker_trigger,
+            "maker_candidate_edge_ticks": selection.maker_edge_ticks,
+            "taker_candidate_allow": taker_decision.allow if taker_decision else False,
+            "taker_candidate_reason": taker_decision.reason if taker_decision else "",
+            "taker_candidate_score": taker_decision.entry_score if taker_decision else 0,
+            "taker_candidate_trigger": selection.taker_trigger,
+            "taker_candidate_exec_quality": selection.taker_exec_quality,
         }
 
     def on_board(self, snapshot: BoardSnapshot, *, now_ns: int | None = None) -> StrategyResult:
@@ -248,7 +284,9 @@ class CombinedMakerTakerStrategy:
             self.last_result = result
             return result
 
-        decision = self._choose_decision(snapshot, signal, ts, market_state)
+        selection = self._select_entry(snapshot, signal, ts, market_state)
+        decision = selection.decision
+        selection_fields = self._selection_result_fields(selection)
         confirmed, progress = self.confirmation.observe(decision)
         if not confirmed:
             result = StrategyResult(
@@ -260,6 +298,8 @@ class CombinedMakerTakerStrategy:
                 exit_intent=exit_intent,
                 exit_cancel_signal=exit_cancel_signal,
                 **market_fields,
+                **selection_fields,
+                **self._maker_result_fields(selection.maker_diagnostics),
             )
             self.last_result = result
             return result
@@ -292,6 +332,8 @@ class CombinedMakerTakerStrategy:
                 exit_intent=exit_intent,
                 exit_cancel_signal=exit_cancel_signal,
                 **market_fields,
+                **selection_fields,
+                **self._maker_result_fields(selection.maker_diagnostics),
             )
             self.last_result = result
             return result
@@ -303,6 +345,7 @@ class CombinedMakerTakerStrategy:
             now_ns=ts,
             expected_price=expected_price,
             order_qty=base_qty,
+            market_state=market_state,
         )
         if not allowed:
             self.confirmation.reset()
@@ -316,6 +359,8 @@ class CombinedMakerTakerStrategy:
                 exit_intent=exit_intent,
                 exit_cancel_signal=exit_cancel_signal,
                 **market_fields,
+                **selection_fields,
+                **self._maker_result_fields(selection.maker_diagnostics),
             )
             self.last_result = result
             return result
@@ -329,6 +374,8 @@ class CombinedMakerTakerStrategy:
                 qty=base_qty,
                 snapshot=snapshot,
                 decision=decision,
+                setup_type=selection.setup_type,
+                selection_reason=selection.selection_reason,
             )
         else:
             intent, maker_diag = self.maker.preview_quote(
@@ -343,6 +390,8 @@ class CombinedMakerTakerStrategy:
                 position=self.position,
                 max_inventory_qty=self.risk.config.max_inventory_qty,
                 market_state=market_state,
+                setup_type=selection.setup_type,
+                selection_reason=selection.selection_reason,
             )
             min_edge = self.config.strategy.maker_min_edge_ticks
             if min_edge > 0 and maker_diag.edge_ticks < min_edge:
@@ -356,6 +405,7 @@ class CombinedMakerTakerStrategy:
                     exit_intent=exit_intent,
                     exit_cancel_signal=exit_cancel_signal,
                     **market_fields,
+                    **selection_fields,
                     **self._maker_result_fields(maker_diag),
                 )
                 self.last_result = result
@@ -372,6 +422,7 @@ class CombinedMakerTakerStrategy:
             exit_intent=exit_intent,
             exit_cancel_signal=exit_cancel_signal,
             **market_fields,
+            **selection_fields,
             **self._maker_result_fields(maker_diag),
         )
         self.entry_order_active = True
@@ -663,10 +714,266 @@ class CombinedMakerTakerStrategy:
         now_ns: int = 0,
         market_state: MarketState = MarketState.NORMAL,
     ) -> EntryDecision:
+        return self._select_entry(snapshot, signal, now_ns, market_state).decision
+
+    def _select_entry(
+        self,
+        snapshot: BoardSnapshot,
+        signal: SignalPacket,
+        now_ns: int = 0,
+        market_state: MarketState = MarketState.NORMAL,
+    ) -> EntrySelection:
+        override = self.__dict__.get("_choose_decision")
+        if override is not None:
+            decision = override(snapshot, signal, now_ns=now_ns, market_state=market_state)
+            return EntrySelection(
+                decision=decision,
+                setup_type=self._setup_type_for_decision(decision, ""),
+                selection_reason="legacy_override",
+            )
+
         taker_decision = self.taker.evaluate(snapshot, signal, now_ns=now_ns)
-        if taker_decision.allow:
-            return taker_decision
         maker_decision = self.maker.evaluate(snapshot, signal, market_state=market_state)
-        if maker_decision.allow:
-            return maker_decision
-        return maker_decision if maker_decision.reason != "maker_no_direction" else taker_decision
+        maker_diag = self._preview_maker_candidate(snapshot, signal, maker_decision, market_state)
+        maker_edge = maker_diag.edge_ticks if maker_diag is not None else 0.0
+        maker_trigger = self._maker_setup_type(maker_diag) if maker_diag is not None else ""
+        taker_trigger = (
+            self.taker.classify_entry_trigger(snapshot, signal, taker_decision.side)
+            if taker_decision.side != 0
+            else ""
+        )
+        taker_exec_quality = (
+            self.taker.exec_quality_score(snapshot, signal, taker_decision.side)
+            if taker_decision.side != 0
+            else 0
+        )
+        policy = self.config.strategy.entry_selection_policy.strip().lower()
+        if policy not in {"adaptive", "taker_priority", "maker_priority"}:
+            policy = "adaptive"
+
+        if policy == "taker_priority":
+            if taker_decision.allow:
+                return self._entry_selection(
+                    taker_decision,
+                    "taker_priority",
+                    taker_decision=taker_decision,
+                    maker_decision=maker_decision,
+                    maker_diag=maker_diag,
+                    maker_trigger=maker_trigger,
+                    taker_trigger=taker_trigger,
+                    taker_exec_quality=taker_exec_quality,
+                )
+            if maker_decision.allow:
+                return self._entry_selection(
+                    maker_decision,
+                    "only_maker_allowed",
+                    taker_decision=taker_decision,
+                    maker_decision=maker_decision,
+                    maker_diag=maker_diag,
+                    maker_trigger=maker_trigger,
+                    taker_trigger=taker_trigger,
+                    taker_exec_quality=taker_exec_quality,
+                )
+
+        elif policy == "maker_priority":
+            if maker_decision.allow:
+                return self._entry_selection(
+                    maker_decision,
+                    "maker_priority",
+                    taker_decision=taker_decision,
+                    maker_decision=maker_decision,
+                    maker_diag=maker_diag,
+                    maker_trigger=maker_trigger,
+                    taker_trigger=taker_trigger,
+                    taker_exec_quality=taker_exec_quality,
+                )
+            if taker_decision.allow:
+                return self._entry_selection(
+                    taker_decision,
+                    "only_taker_allowed",
+                    taker_decision=taker_decision,
+                    maker_decision=maker_decision,
+                    maker_diag=maker_diag,
+                    maker_trigger=maker_trigger,
+                    taker_trigger=taker_trigger,
+                    taker_exec_quality=taker_exec_quality,
+                )
+
+        else:
+            maker_floor = max(
+                self.config.strategy.maker_min_edge_ticks,
+                self.config.strategy.adaptive_maker_min_edge_ticks,
+            )
+            maker_viable = maker_decision.allow and maker_edge >= maker_floor
+            taker_urgency = self._taker_urgency_score(taker_decision, taker_trigger, taker_exec_quality)
+            taker_urgent = (
+                taker_decision.allow
+                and taker_urgency >= max(self.config.strategy.adaptive_taker_urgency_score, 1)
+            )
+            if maker_viable and taker_urgent:
+                return self._entry_selection(
+                    taker_decision,
+                    "taker_urgent",
+                    taker_decision=taker_decision,
+                    maker_decision=maker_decision,
+                    maker_diag=maker_diag,
+                    maker_trigger=maker_trigger,
+                    taker_trigger=taker_trigger,
+                    taker_exec_quality=taker_exec_quality,
+                )
+            if maker_viable:
+                reason = "only_maker_allowed" if not taker_decision.allow else "maker_edge_better"
+                return self._entry_selection(
+                    maker_decision,
+                    reason,
+                    taker_decision=taker_decision,
+                    maker_decision=maker_decision,
+                    maker_diag=maker_diag,
+                    maker_trigger=maker_trigger,
+                    taker_trigger=taker_trigger,
+                    taker_exec_quality=taker_exec_quality,
+                )
+            if taker_decision.allow:
+                reason = "only_taker_allowed" if not maker_decision.allow else "maker_edge_too_low"
+                return self._entry_selection(
+                    taker_decision,
+                    reason,
+                    taker_decision=taker_decision,
+                    maker_decision=maker_decision,
+                    maker_diag=maker_diag,
+                    maker_trigger=maker_trigger,
+                    taker_trigger=taker_trigger,
+                    taker_exec_quality=taker_exec_quality,
+                )
+            if maker_decision.allow:
+                blocked = EntryDecision(
+                    False,
+                    "maker_edge_too_low",
+                    entry_mode=ENTRY_MODE_MAKER,
+                    side=maker_decision.side,
+                    entry_score=maker_decision.entry_score,
+                    required_confirm=maker_decision.required_confirm,
+                )
+                return self._entry_selection(
+                    blocked,
+                    "maker_edge_too_low",
+                    taker_decision=taker_decision,
+                    maker_decision=maker_decision,
+                    maker_diag=maker_diag,
+                    maker_trigger=maker_trigger,
+                    taker_trigger=taker_trigger,
+                    taker_exec_quality=taker_exec_quality,
+                )
+
+        blocked_decision = maker_decision if maker_decision.reason != "maker_no_direction" else taker_decision
+        return self._entry_selection(
+            blocked_decision,
+            "both_blocked",
+            taker_decision=taker_decision,
+            maker_decision=maker_decision,
+            maker_diag=maker_diag,
+            maker_trigger=maker_trigger,
+            taker_trigger=taker_trigger,
+            taker_exec_quality=taker_exec_quality,
+        )
+
+    def _preview_maker_candidate(
+        self,
+        snapshot: BoardSnapshot,
+        signal: SignalPacket,
+        decision: EntryDecision,
+        market_state: MarketState,
+    ) -> MakerQuoteDiagnostics | None:
+        if not decision.allow:
+            return None
+        _, diagnostics = self.maker.preview_quote(
+            symbol=self.config.symbol,
+            exchange=self.config.exchange,
+            tick_size=self.config.tick_size,
+            lot_size=self.config.lot_size,
+            qty=self.config.strategy.trade_qty,
+            snapshot=snapshot,
+            decision=decision,
+            signal=signal,
+            position=self.position,
+            max_inventory_qty=self.risk.config.max_inventory_qty,
+            market_state=market_state,
+        )
+        return diagnostics
+
+    def _entry_selection(
+        self,
+        decision: EntryDecision,
+        selection_reason: str,
+        *,
+        taker_decision: EntryDecision,
+        maker_decision: EntryDecision,
+        maker_diag: MakerQuoteDiagnostics | None,
+        maker_trigger: str,
+        taker_trigger: str,
+        taker_exec_quality: int,
+    ) -> EntrySelection:
+        setup_type = self._setup_type_for_decision(decision, taker_trigger, maker_diag=maker_diag)
+        if not decision.allow:
+            setup_type = self._blocked_setup_type(decision.reason)
+        return EntrySelection(
+            decision=decision,
+            setup_type=setup_type,
+            selection_reason=selection_reason,
+            maker_decision=maker_decision,
+            taker_decision=taker_decision,
+            maker_trigger=maker_trigger,
+            taker_trigger=taker_trigger,
+            maker_edge_ticks=maker_diag.edge_ticks if maker_diag is not None else 0.0,
+            taker_exec_quality=taker_exec_quality,
+            maker_diagnostics=maker_diag,
+        )
+
+    def _setup_type_for_decision(
+        self,
+        decision: EntryDecision,
+        taker_trigger: str,
+        *,
+        maker_diag: MakerQuoteDiagnostics | None = None,
+    ) -> str:
+        if decision.entry_mode == ENTRY_MODE_MAKER:
+            return self._maker_setup_type(maker_diag)
+        if decision.entry_mode == ENTRY_MODE_TAKER:
+            return self._taker_setup_type(taker_trigger, decision)
+        return self._blocked_setup_type(decision.reason)
+
+    def _maker_setup_type(self, diagnostics: MakerQuoteDiagnostics | None) -> str:
+        if diagnostics is not None and diagnostics.quote_mode == "QUEUE_DEFENSE":
+            return "maker_queue_defense"
+        return "maker_passive_fair"
+
+    def _taker_setup_type(self, trigger: str, decision: EntryDecision) -> str:
+        mapping = {
+            "depth_breakout": "taker_depth_breakout",
+            "price_breakout": "taker_price_breakout",
+            "vol_expansion": "taker_vol_expansion",
+        }
+        if trigger in mapping:
+            return mapping[trigger]
+        return "taker_quality_urgent" if decision.allow else self._blocked_setup_type(decision.reason)
+
+    def _blocked_setup_type(self, reason: str) -> str:
+        token = (reason or "unknown").split(":", 1)[0].strip().lower()
+        token = "".join(ch if ch.isalnum() else "_" for ch in token).strip("_") or "unknown"
+        return f"blocked_{token}"
+
+    def _taker_urgency_score(self, decision: EntryDecision, trigger: str, exec_quality: int) -> int:
+        if not decision.allow:
+            return 0
+        score = 0
+        if trigger in {"depth_breakout", "price_breakout", "vol_expansion"}:
+            score += 2
+        if exec_quality >= max(self.config.strategy.exec_quality_min_score, 8):
+            score += 1
+        aggressive_threshold = self.config.strategy.aggressive_taker_entry_score
+        if aggressive_threshold > 0:
+            if decision.entry_score >= aggressive_threshold:
+                score += 1
+        elif decision.entry_score >= self.config.strategy.taker_score_threshold + 2:
+            score += 1
+        return score

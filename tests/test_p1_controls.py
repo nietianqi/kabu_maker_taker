@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
-from kabu_maker_taker.config import AppConfig, LollipopConfig, RiskConfig, StrategyConfig
+from kabu_maker_taker.config import AppConfig, LollipopConfig, MarketStateConfig, RiskConfig, StrategyConfig
 from kabu_maker_taker.models import (
     BoardSnapshot,
     BrokerOrderEvent,
@@ -88,6 +88,64 @@ class P1RiskControlTests(unittest.TestCase):
         self.assertIsNone(second.intent)
         self.assertEqual(second.blocked_reason, "order_rate_limit")
         self.assertEqual(strategy.metrics.order_rate_blocks, 1)
+
+    def test_abnormal_market_blocks_taker_entry_globally(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            tick_size=1.0,
+            lot_size=1,
+            strategy=StrategyConfig(trade_qty=100, maker_confirm_ticks=1, taker_confirm_ticks=1),
+            risk=RiskConfig(max_spread_ticks=5.0),
+            market_state=MarketStateConfig(enabled=True),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(ts_ns=snapshot.ts_ns)
+        strategy._choose_decision = lambda snapshot, sig, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            True,
+            "",
+            entry_mode="taker",
+            side=1,
+            entry_score=12,
+            required_confirm=1,
+        )
+        snapshot = _snapshot()
+        snapshot.bid_sign = "0102"
+
+        result = strategy.on_board(snapshot, now_ns=1_000_000_000)
+
+        self.assertIsNone(result.intent)
+        self.assertEqual(result.blocked_reason, "market_abnormal")
+
+    def test_abnormal_market_entry_cancel_bypasses_cancel_rate_limit(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            tick_size=1.0,
+            lot_size=1,
+            strategy=StrategyConfig(trade_qty=100, maker_confirm_ticks=1, taker_confirm_ticks=1),
+            risk=RiskConfig(max_spread_ticks=5.0, max_cancel_requests_per_minute=1),
+            market_state=MarketStateConfig(enabled=True),
+            lollipop=LollipopConfig(tp_delay_ms=0, stop_loss_ticks=0.0),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(ts_ns=snapshot.ts_ns)
+        strategy._choose_decision = lambda snapshot, sig, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            True,
+            "",
+            entry_mode="maker",
+            side=1,
+            entry_score=8,
+            required_confirm=1,
+        )
+        first = strategy.on_board(_snapshot(1_000_000_000), now_ns=1_000_000_000)
+        assert first.intent is not None
+        strategy.risk.record_cancel_request("alpha_flip", 1_000_000_100)
+        abnormal = _snapshot(1_000_001_000)
+        abnormal.ask_sign = "0103"
+
+        result = strategy.on_board(abnormal, now_ns=1_000_001_000)
+
+        self.assertEqual(result.entry_cancel_signal, "abnormal_market")
+        self.assertEqual(result.entry_cancel_blocked_reason, "")
 
     def test_order_rate_limit_does_not_block_lollipop_emergency_exit(self) -> None:
         strategy = _strategy(risk=RiskConfig(max_spread_ticks=5.0, max_entry_orders_per_minute=1))

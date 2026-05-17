@@ -268,6 +268,12 @@ class KabuRestExecutor:
             )
         return BrokerReconciliationSnapshot(ts_ns=time.time_ns(), positions=positions)
 
+    def register_market_data(self) -> None:
+        self.client.register_symbol(self.config.symbol, self.config.exchange)
+
+    def unregister_market_data(self) -> None:
+        self.client.unregister_symbol(self.config.symbol, self.config.exchange)
+
     def open_order_snapshots(self) -> tuple[KabuOrderSnapshot, ...]:
         raw_orders = self.client.get_orders(product=0, lane=_REQUEST_LANE_POLL)
         return self._open_order_snapshots(raw_orders)
@@ -298,7 +304,7 @@ class KabuRestExecutor:
                 side=lots[0].side,
                 qty=total_qty,
                 avg_price=avg_price,
-                entry_mode="maker",
+                entry_mode="broker_unknown",
             ),
         )
 

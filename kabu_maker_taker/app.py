@@ -9,15 +9,17 @@ from typing import Any
 
 from .broker import JsonBrokerSnapshotAdapter
 from .combined import CombinedMakerTakerStrategy
-from .config import AppConfig, load_config
+from .config import AppConfig
 from .execution import KabuApiError, KabuRestExecutor
 from .journal import TradeJournal
 from .live_runtime import (
     check_kill_switch as _check_kill_switch,
     emergency_flatten as _emergency_flatten,
     handle_live_execution as _handle_live_execution,
+    live_event_freshness_error as _runtime_live_event_freshness_error,
     live_halted as _live_halted,
     poll_live as _poll_live,
+    run_websocket_live as _run_websocket_live,
     sleep_before_live_poll as _sleep_before_live_poll,
     submit_to_live as _submit_to_live,
 )
@@ -63,7 +65,8 @@ def main(argv: list[str] | None = None) -> int:
             evolve_argv += ["--param-grid", args.param_grid]
         return _run_evolve(evolve_argv)
 
-    config = load_config(args.config)
+    raw_config = _load_config_payload(args.config)
+    config = AppConfig.from_dict(raw_config)
     if args.live and args.sample:
         parser.error("--live cannot be used with --sample")
     if args.live and config.dry_run:
@@ -71,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.live and args.broker_snapshot:
         parser.error("--broker-snapshot cannot be combined with --live")
     if args.live:
-        live_config_errors = _validate_live_config(config)
+        live_config_errors = _validate_live_config(config, raw_config=raw_config)
         if live_config_errors:
             parser.error("--live safety config incomplete: " + ", ".join(live_config_errors))
         if args.events:
@@ -126,6 +129,14 @@ def main(argv: list[str] | None = None) -> int:
                 separators=(",", ":"),
             )
         )
+        if not args.events:
+            try:
+                return _run_websocket_live(strategy, live_executor, config, tracer)
+            finally:
+                if strategy.journal is not None:
+                    strategy.journal.flush()
+                    strategy.journal.close()
+                tracer.close()
 
     if args.broker_snapshot:
         broker_snapshot = JsonBrokerSnapshotAdapter(args.broker_snapshot).snapshot()
@@ -381,7 +392,14 @@ def _halt_live(
     return _live_halted(strategy, reason, cleanup=cleanup)
 
 
-def _validate_live_config(config: AppConfig) -> list[str]:
+def _load_config_payload(path: str | Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _validate_live_config(config: AppConfig, *, raw_config: dict[str, Any] | None = None) -> list[str]:
     risk = config.risk
     missing: list[str] = []
     if not risk.enforce_session:
@@ -414,6 +432,16 @@ def _validate_live_config(config: AppConfig) -> list[str]:
         missing.append("enable_decision_trace=true")
     if not config.market_state.enabled:
         missing.append("market_state.enabled=true")
+    if raw_config is not None:
+        strategy_payload = raw_config.get("strategy")
+        if not isinstance(strategy_payload, dict) or "entry_selection_policy" not in strategy_payload:
+            missing.append("strategy.entry_selection_policy explicit")
+        elif config.strategy.entry_selection_policy.strip().lower() not in {
+            "adaptive",
+            "taker_priority",
+            "maker_priority",
+        }:
+            missing.append("strategy.entry_selection_policy valid")
     return missing
 
 
@@ -430,22 +458,7 @@ def _validate_live_events_file(path: Path, config: AppConfig, *, now_ns: int) ->
 
 
 def _live_event_freshness_error(event: dict[str, Any], config: AppConfig, *, now_ns: int) -> str:
-    raw_ts = event.get("ts_ns", event.get("timestamp_ns", event.get("ExchangeTimeNs", 0)))
-    try:
-        ts_ns = int(raw_ts)
-    except (TypeError, ValueError):
-        ts_ns = 0
-    if ts_ns <= 0:
-        return "missing or invalid ts_ns"
-    tolerance_ns = config.risk.stale_quote_ms * 1_000_000
-    if tolerance_ns <= 0:
-        return "risk.stale_quote_ms must be positive"
-    diff_ns = ts_ns - now_ns
-    if abs(diff_ns) > tolerance_ns:
-        direction = "future" if diff_ns > 0 else "stale"
-        diff_ms = abs(diff_ns) / 1_000_000
-        return f"{direction} event ts_ns outside risk.stale_quote_ms ({diff_ms:.0f}ms)"
-    return ""
+    return _runtime_live_event_freshness_error(event, config, now_ns=now_ns)
 
 
 def _read_jsonl_with_line(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:

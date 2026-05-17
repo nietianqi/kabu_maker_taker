@@ -8,13 +8,14 @@ import time
 import unittest
 from pathlib import Path
 
-from kabu_maker_taker.app import _handle_live_execution
+from kabu_maker_taker.app import _handle_live_execution, _validate_live_config
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
 from kabu_maker_taker.config import AppConfig, KabuConfig, OrderProfile, RiskConfig, StrategyConfig
 from kabu_maker_taker.kabu_rest import (
     KabuApiError,
     KabuRestClient,
     KabuRestExecutor,
+    LiveExecutionResult,
     order_snapshot,
 )
 from kabu_maker_taker.models import BrokerFillEvent, BrokerOrderEvent, OrderIntent, OrderState, OrderStatus
@@ -61,6 +62,8 @@ class KabuConfigTests(unittest.TestCase):
                     "base_url": "http://localhost:18081/kabusapi",
                     "api_password": "secret",
                     "poll_interval_ms": 0,
+                    "websocket_url": "ws://localhost:18081/kabusapi/websocket",
+                    "websocket_reconnect_attempts": 5,
                     "order_profile": {
                         "mode": "cash",
                         "front_order_type_market": 120,
@@ -73,6 +76,8 @@ class KabuConfigTests(unittest.TestCase):
         self.assertFalse(config.dry_run)
         self.assertEqual(config.kabu.base_url, "http://localhost:18081/kabusapi")
         self.assertEqual(config.kabu.api_password, "secret")
+        self.assertEqual(config.kabu.websocket_url, "ws://localhost:18081/kabusapi/websocket")
+        self.assertEqual(config.kabu.websocket_reconnect_attempts, 5)
         self.assertEqual(config.kabu.order_profile.mode, "cash")
         self.assertEqual(config.kabu.order_profile.front_order_type_market, 120)
         self.assertEqual(config.kabu.order_profile.front_order_type_ioc_limit, 127)
@@ -88,6 +93,22 @@ class KabuRestClientRequestTests(unittest.TestCase):
         client = KabuRestClient("http://localhost:18080/kabusapi")
 
         self.assertEqual(client.base_url, "http://localhost:18080")
+
+    def test_register_and_unregister_symbol_payloads(self) -> None:
+        calls: list[tuple[str, str, dict]] = []
+
+        def fake_request(method: str, path: str, **kwargs):
+            calls.append((method, path, kwargs["json_body"]))
+            return {"RegistList": []}
+
+        client = KabuRestClient("http://localhost:18080")
+        client._request_json = fake_request  # type: ignore[method-assign]
+
+        client.register_symbol("9984", 27)
+        client.unregister_symbol("9984", 27)
+
+        self.assertEqual(calls[0], ("PUT", "/kabusapi/register", {"Symbols": [{"Symbol": "9984", "Exchange": 27}]}))
+        self.assertEqual(calls[1], ("PUT", "/kabusapi/unregister", {"Symbols": [{"Symbol": "9984", "Exchange": 27}]}))
 
     def test_margin_entry_market_order_body(self) -> None:
         captured: dict[str, object] = {}
@@ -264,6 +285,30 @@ class KabuRestExecutorTests(unittest.TestCase):
         self.assertEqual(events[0].broker_order_id, "B-ENTRY")
         self.assertEqual(result.request_kind, "submit")
         self.assertGreaterEqual(result.latency_ms, 0.0)
+
+    def test_live_position_snapshot_uses_broker_unknown_entry_mode(self) -> None:
+        class PositionClient(self.FakeClient):
+            def get_positions(self, symbol=None, product=2, lane="poll"):
+                _ = (symbol, product, lane)
+                return [
+                    {
+                        "HoldID": "HOLD-1",
+                        "Symbol": "9984",
+                        "Exchange": 27,
+                        "Side": "2",
+                        "LeavesQty": 100,
+                        "HoldQty": 0,
+                        "Price": 1000.0,
+                    }
+                ]
+
+        config = AppConfig(symbol="9984", exchange=27, kabu=KabuConfig(api_password="pw", poll_interval_ms=0))
+        executor = KabuRestExecutor(config, client=PositionClient())  # type: ignore[arg-type]
+
+        positions = executor.position_snapshot()
+
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0].entry_mode, "broker_unknown")
 
     def test_submit_taker_entry_maps_to_ioc_limit(self) -> None:
         class CapturingClient(self.FakeClient):
@@ -681,6 +726,7 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
             "enable_journal": True,
             "enable_decision_trace": True,
             "market_state": {"enabled": True},
+            "strategy": {"entry_selection_policy": "adaptive"},
             "risk": {
                 "enforce_session": True,
                 "daily_loss_limit": 10_000,
@@ -801,6 +847,39 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
         self.assertIn("risk.enforce_session=true", completed.stderr)
         self.assertIn("enable_journal=true", completed.stderr)
         self.assertIn("market_state.enabled=true", completed.stderr)
+
+    def test_live_requires_explicit_entry_selection_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp).joinpath("config.json")
+            config = self._live_safe_config()
+            config.pop("strategy")
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-m", "kabu_maker_taker.app", "--config", str(config_path), "--live"],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("strategy.entry_selection_policy explicit", completed.stderr)
+
+    def test_live_rejects_invalid_entry_selection_policy(self) -> None:
+        config_payload = self._live_safe_config(strategy={"entry_selection_policy": "unknown"})
+        config = AppConfig.from_dict(config_payload)
+
+        errors = _validate_live_config(config, raw_config=config_payload)
+
+        self.assertIn("strategy.entry_selection_policy valid", errors)
+
+    def test_live_accepts_supported_entry_selection_policies(self) -> None:
+        for policy in ("adaptive", "taker_priority", "maker_priority"):
+            config_payload = self._live_safe_config(strategy={"entry_selection_policy": policy})
+            config = AppConfig.from_dict(config_payload)
+            errors = _validate_live_config(config, raw_config=config_payload)
+            self.assertNotIn("strategy.entry_selection_policy explicit", errors)
+            self.assertNotIn("strategy.entry_selection_policy valid", errors)
 
     def test_live_events_reject_stale_timestamp_before_network_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

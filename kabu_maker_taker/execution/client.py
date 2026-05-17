@@ -114,6 +114,22 @@ class KabuRestClient:
         data = self._request_json("GET", "/kabusapi/positions", params=params, lane=lane)
         return data if isinstance(data, list) else [data]
 
+    def register_symbol(self, symbol: str, exchange: int) -> dict[str, Any]:
+        return self._request_json(
+            "PUT",
+            "/kabusapi/register",
+            json_body={"Symbols": [{"Symbol": str(symbol), "Exchange": int(exchange)}]},
+            lane=_REQUEST_LANE_POLL,
+        )
+
+    def unregister_symbol(self, symbol: str, exchange: int) -> dict[str, Any]:
+        return self._request_json(
+            "PUT",
+            "/kabusapi/unregister",
+            json_body={"Symbols": [{"Symbol": str(symbol), "Exchange": int(exchange)}]},
+            lane=_REQUEST_LANE_POLL,
+        )
+
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         return self._request_json(
             "PUT",

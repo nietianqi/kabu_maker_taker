@@ -90,6 +90,13 @@ class BoardSnapshot:
                 payload.get("timestamp_ns", payload.get("ExchangeTimeNs", payload.get("ExchangeTime", 0))),
             )
         )
+        bid_ts_ns = _to_ns_value(payload.get("bid_ts_ns", payload.get("BidTimeNs", payload.get("BidTime", 0))))
+        ask_ts_ns = _to_ns_value(payload.get("ask_ts_ns", payload.get("AskTimeNs", payload.get("AskTime", 0))))
+        current_ts_ns = _to_ns_value(
+            payload.get("current_ts_ns", payload.get("CurrentPriceTimeNs", payload.get("CurrentPriceTime", 0)))
+        )
+        if ts_ns <= 0:
+            ts_ns = max(bid_ts_ns, ask_ts_ns, current_ts_ns)
 
         if "bid" in payload or "ask" in payload:
             bid = float(payload.get("bid", 0.0))
@@ -130,11 +137,9 @@ class BoardSnapshot:
             out_of_order=bool(payload.get("out_of_order", False)),
             bid_sign=str(payload.get("bid_sign", payload.get("BidSign", ""))),
             ask_sign=str(payload.get("ask_sign", payload.get("AskSign", ""))),
-            bid_ts_ns=_to_ns_value(payload.get("bid_ts_ns", payload.get("BidTimeNs", payload.get("BidTime", 0)))),
-            ask_ts_ns=_to_ns_value(payload.get("ask_ts_ns", payload.get("AskTimeNs", payload.get("AskTime", 0)))),
-            current_ts_ns=_to_ns_value(
-                payload.get("current_ts_ns", payload.get("CurrentPriceTimeNs", payload.get("CurrentPriceTime", 0)))
-            ),
+            bid_ts_ns=bid_ts_ns,
+            ask_ts_ns=ask_ts_ns,
+            current_ts_ns=current_ts_ns,
             last_size=int(payload.get("last_size", payload.get("LastSize", payload.get("CurrentPriceSize", 0)))),
         )
 
@@ -239,6 +244,8 @@ class OrderIntent:
     reference_price: float
     max_slip_ticks: float = 0.0
     client_order_id: str = ""
+    setup_type: str = ""
+    selection_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -355,6 +362,18 @@ class StrategyResult:
     maker_queue_threshold: int = 0
     maker_top_queue_qty: int = 0
     maker_working_age_ms: float = 0.0
+    setup_type: str = ""
+    selection_reason: str = ""
+    maker_candidate_allow: bool = False
+    maker_candidate_reason: str = ""
+    maker_candidate_score: int = 0
+    maker_candidate_trigger: str = ""
+    maker_candidate_edge_ticks: float = 0.0
+    taker_candidate_allow: bool = False
+    taker_candidate_reason: str = ""
+    taker_candidate_score: int = 0
+    taker_candidate_trigger: str = ""
+    taker_candidate_exec_quality: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -382,6 +401,18 @@ class StrategyResult:
             "maker_queue_threshold": self.maker_queue_threshold,
             "maker_top_queue_qty": self.maker_top_queue_qty,
             "maker_working_age_ms": self.maker_working_age_ms,
+            "setup_type": self.setup_type,
+            "selection_reason": self.selection_reason,
+            "maker_candidate_allow": self.maker_candidate_allow,
+            "maker_candidate_reason": self.maker_candidate_reason,
+            "maker_candidate_score": self.maker_candidate_score,
+            "maker_candidate_trigger": self.maker_candidate_trigger,
+            "maker_candidate_edge_ticks": self.maker_candidate_edge_ticks,
+            "taker_candidate_allow": self.taker_candidate_allow,
+            "taker_candidate_reason": self.taker_candidate_reason,
+            "taker_candidate_score": self.taker_candidate_score,
+            "taker_candidate_trigger": self.taker_candidate_trigger,
+            "taker_candidate_exec_quality": self.taker_candidate_exec_quality,
         }
 
 

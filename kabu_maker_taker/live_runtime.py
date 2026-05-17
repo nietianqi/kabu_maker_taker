@@ -4,12 +4,22 @@ import json
 import time
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import urlparse, urlunparse
 
 from .combined import CombinedMakerTakerStrategy
 from .config import AppConfig
 from .execution import KabuApiError, KabuRestExecutor, LiveExecutionResult
-from .models import BrokerFillEvent, BrokerOrderEvent, OrderIntent, OrderState, OrderStatus
-from .strategy import ORDER_ROLE_EXIT
+from .models import (
+    BoardSnapshot,
+    BrokerFillEvent,
+    BrokerOrderEvent,
+    OrderIntent,
+    OrderState,
+    OrderStatus,
+    _to_ns_value,
+)
+from .strategy import ORDER_ROLE_ENTRY, ORDER_ROLE_EXIT
 
 
 def submit_to_live(
@@ -86,6 +96,331 @@ def check_kill_switch(config: AppConfig) -> str:
         return "hard"
     if Path(config.kill_switch_path).exists():
         return "soft"
+    return ""
+
+
+def live_event_freshness_error(event: dict[str, Any], config: AppConfig, *, now_ns: int) -> str:
+    ts_ns = _event_ts_ns(event)
+    if ts_ns <= 0:
+        return "missing or invalid ts_ns"
+    tolerance_ns = config.risk.stale_quote_ms * 1_000_000
+    if tolerance_ns <= 0:
+        return "risk.stale_quote_ms must be positive"
+    diff_ns = ts_ns - now_ns
+    if abs(diff_ns) > tolerance_ns:
+        direction = "future" if diff_ns > 0 else "stale"
+        diff_ms = abs(diff_ns) / 1_000_000
+        return f"{direction} event ts_ns outside risk.stale_quote_ms ({diff_ms:.0f}ms)"
+    return ""
+
+
+def run_websocket_live(
+    strategy: CombinedMakerTakerStrategy,
+    executor: KabuRestExecutor,
+    config: AppConfig,
+    tracer,
+    *,
+    websocket_factory: Callable[..., object] | None = None,
+) -> int:
+    attempts = max(config.kabu.websocket_reconnect_attempts, 0) + 1
+    last_snapshot = _empty_snapshot(config, time.time_ns())
+    last_error = ""
+    for attempt in range(attempts):
+        ws = None
+        registered = False
+        try:
+            executor.register_market_data()
+            registered = True
+            ws = _open_websocket(config, websocket_factory=websocket_factory)
+            print(
+                json.dumps(
+                    {"status": "live_websocket_connected", "attempt": attempt + 1},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            while True:
+                raw = ws.recv()  # type: ignore[attr-defined]
+                now_ns = time.time_ns()
+                event = _decode_websocket_message(raw)
+                snapshot = BoardSnapshot.from_dict(
+                    event,
+                    kabu_bidask_reversed=config.signals.kabu_bidask_reversed,
+                    auto_fix_negative_spread=config.signals.auto_fix_negative_spread,
+                )
+                last_snapshot = snapshot
+                freshness_error = _live_snapshot_freshness_error(snapshot, config, now_ns=now_ns)
+                if freshness_error:
+                    reason = f"websocket_{_reason_token(freshness_error)}"
+                    cleanup = (
+                        emergency_flatten(strategy, executor, config, snapshot, now_ns=now_ns, reason=reason)
+                        if _has_live_exposure(strategy)
+                        else {"detail": freshness_error}
+                    )
+                    return live_halted(strategy, reason, cleanup=cleanup)
+                halt_reason = process_live_board(strategy, executor, config, tracer, snapshot, now_ns)
+                if halt_reason:
+                    return live_halted(
+                        strategy,
+                        halt_reason,
+                        cleanup=emergency_flatten(
+                            strategy,
+                            executor,
+                            config,
+                            snapshot,
+                            now_ns=now_ns,
+                            reason=halt_reason,
+                        ),
+                    )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            cleanup = (
+                emergency_flatten(
+                    strategy,
+                    executor,
+                    config,
+                    last_snapshot,
+                    now_ns=time.time_ns(),
+                    reason="websocket_bad_message",
+                )
+                if _has_live_exposure(strategy)
+                else {"error": str(exc)}
+            )
+            return live_halted(strategy, "websocket_bad_message", cleanup=cleanup)
+        except Exception as exc:  # websocket-client raises several transport-specific exception classes.
+            last_error = str(exc)
+            if _has_live_exposure(strategy):
+                return live_halted(
+                    strategy,
+                    "websocket_disconnected",
+                    cleanup=emergency_flatten(
+                        strategy,
+                        executor,
+                        config,
+                        last_snapshot,
+                        now_ns=time.time_ns(),
+                        reason="websocket_disconnected",
+                    ),
+                )
+            if attempt >= attempts - 1:
+                return live_halted(
+                    strategy,
+                    "websocket_reconnect_exhausted",
+                    cleanup={"last_error": last_error},
+                )
+            reconnect_error = _reconcile_before_reconnect(strategy, executor)
+            if reconnect_error:
+                cleanup = emergency_flatten(
+                    strategy,
+                    executor,
+                    config,
+                    last_snapshot,
+                    now_ns=time.time_ns(),
+                    reason=reconnect_error,
+                )
+                cleanup["last_error"] = last_error
+                return live_halted(strategy, reconnect_error, cleanup=cleanup)
+            if _has_live_exposure(strategy):
+                return live_halted(
+                    strategy,
+                    "websocket_disconnected_with_exposure",
+                    cleanup=emergency_flatten(
+                        strategy,
+                        executor,
+                        config,
+                        last_snapshot,
+                        now_ns=time.time_ns(),
+                        reason="websocket_disconnected_with_exposure",
+                    ),
+                )
+            print(
+                json.dumps(
+                    {"status": "live_websocket_reconnect", "attempt": attempt + 2, "reason": last_error},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            if registered:
+                try:
+                    executor.unregister_market_data()
+                except KabuApiError:
+                    pass
+    return live_halted(strategy, "websocket_reconnect_exhausted", cleanup={"last_error": last_error})
+
+
+def process_live_board(
+    strategy: CombinedMakerTakerStrategy,
+    executor: KabuRestExecutor,
+    config: AppConfig,
+    tracer,
+    snapshot: BoardSnapshot,
+    now_ns: int,
+) -> str:
+    ks = check_kill_switch(config)
+    if ks == "hard":
+        return "kill_switch_hard"
+    strategy.risk.set_soft_kill(ks == "soft")
+
+    halt_reason = poll_live(strategy, executor, now_ns=now_ns)
+    if halt_reason:
+        return halt_reason
+    result = strategy.on_board(snapshot, now_ns=now_ns)
+    tracer.record(result, strategy.position, now_ns)
+    if result.exit_cancel_signal:
+        halt_reason = _handle_live_exit_cancel_signal(
+            strategy,
+            executor,
+            config,
+            result.exit_cancel_signal,
+            snapshot,
+            now_ns,
+        )
+        if halt_reason:
+            return halt_reason
+    if result.entry_cancel_signal:
+        halt_reason = _handle_live_entry_cancel_signal(strategy, executor, config, result.entry_cancel_signal, now_ns)
+        if halt_reason:
+            return halt_reason
+    if result.intent is not None:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
+        halt_reason = submit_to_live(strategy, executor, result.intent, ORDER_ROLE_ENTRY, now_ns, config)
+        if halt_reason:
+            return halt_reason
+    if result.exit_intent is not None:
+        halt_reason = submit_to_live(strategy, executor, result.exit_intent, ORDER_ROLE_EXIT, now_ns, config)
+        if halt_reason:
+            return halt_reason
+    return ""
+
+
+def _handle_live_entry_cancel_signal(
+    strategy: CombinedMakerTakerStrategy,
+    executor: KabuRestExecutor,
+    config: AppConfig,
+    reason: str,
+    now_ns: int,
+) -> str:
+    for oid in list(strategy.working_entry_ids):
+        order = strategy.request_cancel(oid, reason=reason, now_ns=now_ns)
+        if order is None:
+            continue
+        halt_reason = handle_live_execution(strategy, executor.cancel(order, now_ns=now_ns), now_ns=now_ns)
+        if halt_reason:
+            return halt_reason
+        sleep_before_live_poll(config)
+        halt_reason = poll_live(strategy, executor, now_ns=now_ns)
+        if halt_reason:
+            return halt_reason
+    return ""
+
+
+def _handle_live_exit_cancel_signal(
+    strategy: CombinedMakerTakerStrategy,
+    executor: KabuRestExecutor,
+    config: AppConfig,
+    reason: str,
+    snapshot: BoardSnapshot,
+    now_ns: int,
+) -> str:
+    for oid in list(strategy.working_exit_ids):
+        order = strategy.request_cancel(oid, reason=reason, now_ns=now_ns)
+        if order is None:
+            continue
+        halt_reason = handle_live_execution(strategy, executor.cancel(order, now_ns=now_ns), now_ns=now_ns)
+        if halt_reason:
+            return halt_reason
+    sleep_before_live_poll(config)
+    halt_reason = poll_live(strategy, executor, now_ns=now_ns)
+    if halt_reason:
+        return halt_reason
+    deferred = strategy.release_deferred_force_exit(snapshot, now_ns=now_ns)
+    if deferred is None:
+        return ""
+    return submit_to_live(strategy, executor, deferred, ORDER_ROLE_EXIT, now_ns, config)
+
+
+def _open_websocket(config: AppConfig, *, websocket_factory: Callable[..., object] | None = None) -> object:
+    factory = websocket_factory
+    if factory is None:
+        import websocket
+
+        factory = websocket.create_connection
+    timeout_s = max(config.risk.stale_quote_ms / 1000.0, 0.1)
+    return factory(_websocket_url(config), timeout=timeout_s)
+
+
+def _websocket_url(config: AppConfig) -> str:
+    if config.kabu.websocket_url:
+        return config.kabu.websocket_url
+    parsed = urlparse(config.kabu.base_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return urlunparse((scheme, parsed.netloc, "/kabusapi/websocket", "", "", ""))
+
+
+def _decode_websocket_message(raw: object) -> dict[str, Any]:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        payload = json.loads(raw)
+    else:
+        payload = raw
+    if not isinstance(payload, dict):
+        raise ValueError("websocket message must decode to an object")
+    return payload
+
+
+def _event_ts_ns(event: dict[str, Any]) -> int:
+    values = [
+        event.get("ts_ns"),
+        event.get("timestamp_ns"),
+        event.get("ExchangeTimeNs"),
+        event.get("ExchangeTime"),
+        event.get("BidTimeNs"),
+        event.get("BidTime"),
+        event.get("AskTimeNs"),
+        event.get("AskTime"),
+        event.get("CurrentPriceTimeNs"),
+        event.get("CurrentPriceTime"),
+    ]
+    return max((_to_ns_value(value) for value in values), default=0)
+
+
+def _reason_token(reason: str) -> str:
+    token = reason.split("(", 1)[0].strip().lower()
+    return "".join(ch if ch.isalnum() else "_" for ch in token).strip("_") or "unknown"
+
+
+def _live_snapshot_freshness_error(snapshot: BoardSnapshot, config: AppConfig, *, now_ns: int) -> str:
+    return live_event_freshness_error({"ts_ns": snapshot.ts_ns}, config, now_ns=now_ns)
+
+
+def _empty_snapshot(config: AppConfig, ts_ns: int) -> BoardSnapshot:
+    return BoardSnapshot(
+        symbol=config.symbol,
+        exchange=config.exchange,
+        ts_ns=ts_ns,
+        bid=0.0,
+        ask=0.0,
+        bid_size=0,
+        ask_size=0,
+    )
+
+
+def _has_live_exposure(strategy: CombinedMakerTakerStrategy) -> bool:
+    return strategy.position.qty > 0 or bool(strategy.orders.active())
+
+
+def _reconcile_before_reconnect(strategy: CombinedMakerTakerStrategy, executor: KabuRestExecutor) -> str:
+    try:
+        snapshot = executor.snapshot()
+    except KabuApiError as exc:
+        return f"websocket_reconnect_snapshot_failed:{exc}"
+    strategy.reconcile_from_broker(snapshot, now_ns=snapshot.ts_ns or time.time_ns())
     return ""
 
 

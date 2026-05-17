@@ -289,6 +289,8 @@ class MakerStrategy:
         max_inventory_qty: int = 0,
         market_state: MarketState = MarketState.NORMAL,
         working_age_ms: float = 0.0,
+        setup_type: str = "",
+        selection_reason: str = "",
     ) -> tuple[OrderIntent, MakerQuoteDiagnostics]:
         tick = max(tick_size, 1e-9)
         quote_mode = self.quote_mode_for_market(market_state)
@@ -333,6 +335,8 @@ class MakerStrategy:
             reason="maker_passive_edge",
             score=decision.entry_score,
             reference_price=reference_price,
+            setup_type=setup_type,
+            selection_reason=selection_reason,
         )
         diagnostics = MakerQuoteDiagnostics(
             quote_mode=quote_mode,
@@ -646,6 +650,8 @@ class TakerStrategy:
         qty: int,
         snapshot: BoardSnapshot,
         decision: EntryDecision,
+        setup_type: str = "",
+        selection_reason: str = "",
     ) -> OrderIntent:
         reference = snapshot.ask if decision.side > 0 else snapshot.bid
         return OrderIntent(
@@ -660,7 +666,23 @@ class TakerStrategy:
             score=decision.entry_score,
             reference_price=reference,
             max_slip_ticks=self.config.max_slip_ticks,
+            setup_type=setup_type,
+            selection_reason=selection_reason,
         )
+
+    def exec_quality_score(self, snapshot: BoardSnapshot, signal: SignalPacket, direction: int) -> int:
+        return self._compute_exec_quality(snapshot, signal, direction)
+
+    def classify_entry_trigger(self, snapshot: BoardSnapshot, signal: SignalPacket, direction: int) -> str:
+        if direction == 0:
+            return ""
+        if self._breakout_ready(snapshot, signal, direction):
+            return "depth_breakout"
+        if self._breakout_price_ready(signal, direction):
+            return "price_breakout"
+        if self._vol_expansion_ready(snapshot, signal, direction):
+            return "vol_expansion"
+        return ""
 
     def _best_direction(self, snapshot: BoardSnapshot, signal: SignalPacket) -> EntryLayerDiagnostics | None:
         long_diag = entry_layer_diagnostics(snapshot, signal, self.config, direction=1)

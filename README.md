@@ -41,21 +41,27 @@ Then run:
 python main.py --config config.example.json --events events.jsonl
 ```
 
-## Live kabu REST execution
+## Live kabu WebSocket + REST execution
 
 Live mode is explicit and guarded:
 
 ```powershell
-python main.py --config config.json --events events.jsonl --live
+python main.py --config config.json --live
+python main.py --config config.json --events events.jsonl --live  # fresh JSONL validation mode
 ```
 
 Requirements:
 
 - `config.json` must set `"dry_run": false`.
 - `config.json` must include `kabu.api_password`.
+- Live mode without `--events` registers the configured symbol with kabu Station and consumes the
+  `/kabusapi/websocket` board stream. Set `kabu.websocket_url` only when the endpoint differs from
+  the URL derived from `kabu.base_url`.
 - Live mode requires the safety profile to be fully enabled: session enforcement, daily loss
   limit, entry/cancel rate limits, stale quote and stale board guards, API and latency circuits,
   decision trace, trade journal, and abnormal-market detection.
+- Live mode requires `strategy.entry_selection_policy` to be explicit (`adaptive`,
+  `taker_priority`, or `maker_priority`) so old configs do not silently change entry routing.
 - `risk.order_latency_limit_ms`, `risk.cancel_latency_limit_ms`, `risk.poll_latency_limit_ms`,
   and `risk.latency_breach_limit` protect live mode from slow REST responses. The default is
   `3000ms` for each request class and `3` consecutive breaches.
@@ -67,6 +73,10 @@ Requirements:
 The live adapter starts by fetching a kabu Station token, checking broker positions/orders, and
 reconciling positions into the strategy. It refuses to start if kabu Station already has active
 orders that this process cannot safely own.
+
+The WebSocket live loop treats disconnects and message timeouts as market-data faults. If the
+strategy has any local exposure it halts and runs emergency flatten; if flat, it attempts the
+configured number of reconnects and reconciles with the broker before resubscribing.
 
 Live execution has two independent stop circuits. API failures trip the existing API circuit,
 while slow `submit`, `cancel`, or order-poll REST calls trip the latency circuit after consecutive
@@ -80,4 +90,5 @@ In live mode, aggressive taker intents and lollipop timeout/stop exits are mappe
 meaning of `OrderIntent.is_market=true` while avoiding unbounded live market-order slippage.
 
 This remains a REST execution validation mode for controlled `--events` input; it does not yet
-provide a full WebSocket market-data loop or unattended live-trading runtime.
+provide broker-side order push callbacks; order and fill state is still reconciled through guarded
+REST polling.

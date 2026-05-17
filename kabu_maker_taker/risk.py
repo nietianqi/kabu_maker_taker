@@ -23,7 +23,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from .config import RiskConfig
-from .models import BoardSnapshot, EntryDecision, PositionState
+from .models import BoardSnapshot, EntryDecision, MarketState, PositionState
 
 JST = timezone(timedelta(hours=9))
 ONE_MINUTE_NS = 60_000_000_000
@@ -78,6 +78,7 @@ class RiskManager:
         now_ns: int,
         expected_price: float,
         order_qty: int = 0,
+        market_state: MarketState = MarketState.NORMAL,
     ) -> tuple[bool, str]:
         if not decision.allow:
             return False, decision.reason
@@ -90,6 +91,8 @@ class RiskManager:
             return False, "api_circuit_open"
         if self._latency_circuit_open(now_ns):
             return False, "latency_circuit_open"
+        if market_state == MarketState.ABNORMAL:
+            return False, "market_abnormal"
         if self.config.daily_loss_limit > 0 and self._daily_pnl <= -self.config.daily_loss_limit:
             return False, "daily_loss_limit"
         if self.config.max_entry_orders_per_minute > 0:

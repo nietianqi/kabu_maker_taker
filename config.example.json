@@ -10,6 +10,8 @@
     "order_rate_per_sec": 4.0,
     "poll_rate_per_sec": 4.0,
     "poll_interval_ms": 250,
+    "websocket_url": "",
+    "websocket_reconnect_attempts": 3,
     "order_profile": {
       "mode": "margin",
       "allow_short": false,
@@ -71,7 +73,10 @@
     "scale_qty_multiplier": 1.5,
     "use_vol_expansion_taker": false,
     "vol_expansion_spread_max_ticks": 2.0,
-    "tape_ofi_1s_min": 0.0
+    "tape_ofi_1s_min": 0.0,
+    "entry_selection_policy": "adaptive",
+    "adaptive_maker_min_edge_ticks": 0.25,
+    "adaptive_taker_urgency_score": 2
   },
   "risk": {
     "max_inventory_qty": 300,

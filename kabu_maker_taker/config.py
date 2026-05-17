@@ -174,6 +174,12 @@ class StrategyConfig:
     vol_expansion_spread_max_ticks: float = 2.0
     # Taker: exec quality — require 1s tape OFI to also confirm direction (0 = disabled)
     tape_ofi_1s_min: float = 0.0
+    # Entry selector policy: adaptive, taker_priority, or maker_priority
+    entry_selection_policy: str = "adaptive"
+    # Adaptive selector: minimum maker quote edge when maker competes with taker
+    adaptive_maker_min_edge_ticks: float = 0.25
+    # Adaptive selector: urgency score required for taker to beat a valid maker quote
+    adaptive_taker_urgency_score: int = 2
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "StrategyConfig":
@@ -230,6 +236,9 @@ class StrategyConfig:
             use_vol_expansion_taker=bool(payload.get("use_vol_expansion_taker", False)),
             vol_expansion_spread_max_ticks=float(payload.get("vol_expansion_spread_max_ticks", 2.0)),
             tape_ofi_1s_min=float(payload.get("tape_ofi_1s_min", 0.0)),
+            entry_selection_policy=str(payload.get("entry_selection_policy", "adaptive")),
+            adaptive_maker_min_edge_ticks=float(payload.get("adaptive_maker_min_edge_ticks", 0.25)),
+            adaptive_taker_urgency_score=int(payload.get("adaptive_taker_urgency_score", 2)),
         )
 
 
@@ -389,6 +398,8 @@ class KabuConfig:
     order_rate_per_sec: float = 4.0
     poll_rate_per_sec: float = 4.0
     poll_interval_ms: int = 250
+    websocket_url: str = ""
+    websocket_reconnect_attempts: int = 3
     order_profile: OrderProfile = field(default_factory=OrderProfile)
 
     @classmethod
@@ -400,6 +411,8 @@ class KabuConfig:
             order_rate_per_sec=float(payload.get("order_rate_per_sec", 4.0)),
             poll_rate_per_sec=float(payload.get("poll_rate_per_sec", 4.0)),
             poll_interval_ms=int(payload.get("poll_interval_ms", 250)),
+            websocket_url=str(payload.get("websocket_url", "")),
+            websocket_reconnect_attempts=int(payload.get("websocket_reconnect_attempts", 3)),
             order_profile=OrderProfile.from_dict(payload.get("order_profile")),
         )
 

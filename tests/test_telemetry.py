@@ -82,6 +82,18 @@ def _result(
         maker_queue_threshold=300,
         maker_top_queue_qty=500,
         maker_working_age_ms=12.5,
+        setup_type="maker_passive_fair",
+        selection_reason="maker_edge_better",
+        maker_candidate_allow=True,
+        maker_candidate_reason="",
+        maker_candidate_score=8,
+        maker_candidate_trigger="maker_passive_fair",
+        maker_candidate_edge_ticks=0.4,
+        taker_candidate_allow=True,
+        taker_candidate_reason="",
+        taker_candidate_score=10,
+        taker_candidate_trigger="depth_breakout",
+        taker_candidate_exec_quality=9,
     )
 
 
@@ -143,6 +155,10 @@ class DecisionTraceWriterTests(unittest.TestCase):
         self.assertAlmostEqual(row["signal_composite"], 0.55, places=2)
         self.assertEqual(row["market_state_reason"], "normal_flow")
         self.assertEqual(row["maker_quote_mode"], "PASSIVE_FAIR_VALUE")
+        self.assertEqual(row["setup_type"], "maker_passive_fair")
+        self.assertEqual(row["selection_reason"], "maker_edge_better")
+        self.assertTrue(row["maker_candidate_allow"])
+        self.assertEqual(row["taker_candidate_trigger"], "depth_breakout")
 
     def test_ts_jst_present_for_nonzero_timestamp(self) -> None:
         """ts_jst is a non-empty string when now_ns > 0."""

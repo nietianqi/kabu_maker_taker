@@ -21,6 +21,7 @@ class PendingMarkout:
     side: int
     reference_price: float
     remaining_boards: int
+    setup_type: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,10 @@ class MetricsCollector:
         self.total_hold_ns = 0
         self.markout_sum_ticks = 0.0
         self.markout_count = 0
+        self._entry_setup_count: dict[str, int] = {}
+        self._fill_setup_count: dict[str, int] = {}
+        self._setup_markout_sum_ticks: dict[str, float] = {}
+        self._setup_markout_count: dict[str, int] = {}
         self._pending_markouts: list[PendingMarkout] = []
         self._timed_markout_sum_ticks = {bucket.name: 0.0 for bucket in self.markout_buckets}
         self._timed_markout_count = {bucket.name: 0 for bucket in self.markout_buckets}
@@ -96,8 +101,13 @@ class MetricsCollector:
             for pending in self._pending_markouts:
                 pending.remaining_boards -= 1
                 if pending.remaining_boards <= 0:
-                    self.markout_sum_ticks += pending.side * (mid - pending.reference_price) / tick
+                    markout = pending.side * (mid - pending.reference_price) / tick
+                    self.markout_sum_ticks += markout
                     self.markout_count += 1
+                    setup = self._setup_key(pending.setup_type)
+                    if setup:
+                        self._setup_markout_sum_ticks[setup] = self._setup_markout_sum_ticks.get(setup, 0.0) + markout
+                        self._setup_markout_count[setup] = self._setup_markout_count.get(setup, 0) + 1
                 else:
                     still.append(pending)
             self._pending_markouts = still
@@ -121,12 +131,16 @@ class MetricsCollector:
             self.taker_entry_intent_count += 1
         elif intent.strategy == ENTRY_MODE_MAKER:
             self.maker_entry_intent_count += 1
+        setup = self._setup_key(intent.setup_type)
+        if setup:
+            self._entry_setup_count[setup] = self._entry_setup_count.get(setup, 0) + 1
         reference_price = intent.reference_price or intent.price
         self._pending_markouts.append(
             PendingMarkout(
                 side=intent.side,
                 reference_price=reference_price,
                 remaining_boards=self.markout_horizon_boards,
+                setup_type=setup,
             )
         )
         if now_ns > 0:
@@ -162,6 +176,9 @@ class MetricsCollector:
                 self.taker_fill_count += 1
             elif order.intent.strategy == ENTRY_MODE_MAKER:
                 self.maker_fill_count += 1
+            setup = self._setup_key(order.intent.setup_type)
+            if setup:
+                self._fill_setup_count[setup] = self._fill_setup_count.get(setup, 0) + 1
         elif order.role == ORDER_ROLE_EXIT and outcome == "exit":
             if order.intent.is_market:
                 self.market_exit_count += 1
@@ -246,6 +263,16 @@ class MetricsCollector:
             slug = bucket.name
             payload[f"markout_{slug}_count"] = count
             payload[f"average_markout_{slug}_ticks"] = total / count if count else 0.0
+        setup_keys = set(self._entry_setup_count) | set(self._fill_setup_count) | set(self._setup_markout_count)
+        for setup in sorted(setup_keys):
+            entry_count = self._entry_setup_count.get(setup, 0)
+            fill_count = self._fill_setup_count.get(setup, 0)
+            markout_count = self._setup_markout_count.get(setup, 0)
+            markout_total = self._setup_markout_sum_ticks.get(setup, 0.0)
+            payload[f"entry_setup_{setup}_count"] = entry_count
+            payload[f"fill_setup_{setup}_count"] = fill_count
+            payload[f"markout_setup_{setup}_count"] = markout_count
+            payload[f"average_markout_setup_{setup}_ticks"] = markout_total / markout_count if markout_count else 0.0
         for kind in ("submit", "cancel", "poll"):
             count = self._rest_latency_count[kind]
             total = self._rest_latency_sum_ms[kind]
@@ -254,3 +281,9 @@ class MetricsCollector:
             payload[f"{kind}_latency_ms_avg"] = total / count if count else 0.0
             payload[f"{kind}_latency_ms_last"] = self._rest_latency_last_ms[kind]
         return payload
+
+    def _setup_key(self, setup_type: str) -> str:
+        setup = (setup_type or "").strip().lower()
+        if not setup:
+            return ""
+        return "".join(ch if ch.isalnum() else "_" for ch in setup).strip("_")
