@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import csv
+import tempfile
 import unittest
 from pathlib import Path
 
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
 from kabu_maker_taker.app import _handle_exit_cancel_signal
 from kabu_maker_taker.config import AppConfig, LollipopConfig, RiskConfig, StrategyConfig
+from kabu_maker_taker.journal import TradeJournal
 from kabu_maker_taker.models import (
     BoardSnapshot,
     BrokerFillEvent,
@@ -297,6 +300,33 @@ class BrokerOrderEventTests(unittest.TestCase):
         self.assertEqual(outcome, "exit")
         self.assertEqual(strategy.position.qty, 0)
         self.assertFalse(strategy.lollipop.is_busy)
+
+    def test_journal_exit_reason_uses_exit_order_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            strategy = _strategy()
+            strategy.journal = TradeJournal(log_dir=tmp, symbol="9984", tick_size=1.0)
+            entry = strategy.on_board(_snapshot(), now_ns=1_000_000_000)
+            assert entry.intent is not None
+            strategy.on_broker_fill(
+                BrokerFillEvent(order_id=entry.intent.client_order_id, qty=100, price=101.0, ts_ns=1_000_000_100)
+            )
+
+            exit_result = strategy.on_board(_snapshot(ts_ns=1_060_000_000, bid=101.0, ask=102.0), now_ns=1_060_000_000)
+            assert exit_result.exit_intent is not None
+            strategy.on_broker_fill(
+                BrokerFillEvent(
+                    order_id=exit_result.exit_intent.client_order_id,
+                    qty=100,
+                    price=103.0,
+                    ts_ns=1_060_000_100,
+                )
+            )
+            strategy.journal.close()
+
+            with Path(tmp).joinpath("trades.csv").open(encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+
+        self.assertEqual(rows[0]["exit_reason"], "limit_tp")
 
     def test_exit_tp_rejected_switches_to_force_exit_path(self) -> None:
         strategy = _strategy()

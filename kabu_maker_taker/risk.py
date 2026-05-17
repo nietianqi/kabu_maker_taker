@@ -77,6 +77,7 @@ class RiskManager:
         position: PositionState,
         now_ns: int,
         expected_price: float,
+        order_qty: int = 0,
     ) -> tuple[bool, str]:
         if not decision.allow:
             return False, decision.reason
@@ -114,7 +115,8 @@ class RiskManager:
             return False, "outside_session"
         if self.config.max_notional > 0 and expected_price > 0:
             available_notional = self.config.max_notional - position.qty * position.avg_price
-            if available_notional < self.lot_size * expected_price:
+            qty_for_check = order_qty if order_qty > 0 else self.lot_size
+            if available_notional < qty_for_check * expected_price:
                 return False, "notional_limit"
         if position.qty >= self.config.max_inventory_qty:
             return False, "inventory_limit"
@@ -246,9 +248,13 @@ class RiskManager:
         slip = max(self.config.slippage_ticks_default, 0.0) * self.tick_size * qty * 2
         return fee + slip
 
-    def order_qty(self, *, base_qty: int, position: PositionState) -> int:
+    def order_qty(self, *, base_qty: int, position: PositionState, expected_price: float = 0.0) -> int:
         remaining = max(self.config.max_inventory_qty - position.qty, 0)
         qty = min(max(base_qty, 0), remaining)
+        if self.config.max_notional > 0 and expected_price > 0:
+            current_notional = max(position.qty, 0) * max(position.avg_price, 0.0)
+            available_notional = max(self.config.max_notional - current_notional, 0.0)
+            qty = min(qty, int(available_notional // expected_price))
         return (qty // self.lot_size) * self.lot_size
 
     @property

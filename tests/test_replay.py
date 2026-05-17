@@ -7,8 +7,11 @@ import time
 import unittest
 from pathlib import Path
 
+from kabu_maker_taker.combined import CombinedMakerTakerStrategy
 from kabu_maker_taker.config import AppConfig, LollipopConfig, RiskConfig, StrategyConfig
-from kabu_maker_taker.replay import ReplayResult, ReplayRunner, read_jsonl
+from kabu_maker_taker.models import BoardSnapshot, BrokerFillEvent, BrokerOrderEvent, EntryDecision, MarketState, SignalPacket
+from kabu_maker_taker.replay import ReplayResult, ReplayRunner, _handle_exit_cancel_signal_sim, read_jsonl
+from kabu_maker_taker.simulator import DryRunSimulator
 
 
 def _config() -> AppConfig:
@@ -55,6 +58,27 @@ def _trade(ts_ns: int, price: float = 100.5, size: int = 200, side: int = 1) -> 
         "size": size,
         "side": side,
     }
+
+
+def _signal(ts_ns: int) -> SignalPacket:
+    return SignalPacket(
+        ts_ns=ts_ns,
+        obi_raw=0.35,
+        lob_ofi_raw=0.20,
+        tape_ofi_raw=0.20,
+        micro_momentum_raw=0.10,
+        microprice_tilt_raw=0.30,
+        microprice=100.3,
+        mid=100.0,
+        obi_z=0.0,
+        lob_ofi_z=0.0,
+        tape_ofi_z=0.0,
+        micro_momentum_z=0.0,
+        microprice_tilt_z=0.0,
+        composite=0.50,
+        integrated_ofi=0.20,
+        trade_burst_score=0.10,
+    )
 
 
 class ReadJsonlTests(unittest.TestCase):
@@ -173,6 +197,54 @@ class ReplayRunnerTests(unittest.TestCase):
             self.assertEqual(result.win_rate, 0.0)
             self.assertEqual(result.avg_pnl_per_trade, 0.0)
             self.assertEqual(result.sharpe, 0.0)
+
+    def test_replay_exit_cancel_helper_releases_deferred_force_exit(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            tick_size=1.0,
+            lot_size=1,
+            strategy=StrategyConfig(trade_qty=100, maker_confirm_ticks=1, taker_confirm_ticks=1),
+            risk=RiskConfig(max_inventory_qty=300, max_spread_ticks=5.0),
+            lollipop=LollipopConfig(tp_delay_ms=0, maker_max_hold_seconds=0, taker_max_hold_seconds=0),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(snapshot.ts_ns)
+        strategy._choose_decision = lambda snapshot, sig, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            True,
+            "",
+            entry_mode="maker",
+            side=1,
+            entry_score=8,
+            required_confirm=1,
+        )
+        simulator = DryRunSimulator(tick_size=1.0)
+        entry_snapshot = BoardSnapshot.from_dict(_board(1_000_000_000))
+        entry = strategy.on_board(entry_snapshot, now_ns=entry_snapshot.ts_ns)
+        assert entry.intent is not None
+        strategy.on_broker_fill(
+            BrokerFillEvent(order_id=entry.intent.client_order_id, qty=100, price=101.0, ts_ns=1_000_000_100)
+        )
+        tp_snapshot = BoardSnapshot.from_dict(_board(1_000_000_200))
+        tp = strategy.on_board(tp_snapshot, now_ns=tp_snapshot.ts_ns)
+        assert tp.exit_intent is not None
+        for event in simulator.submit(tp.exit_intent, tp_snapshot, tp_snapshot.ts_ns):
+            if isinstance(event, BrokerOrderEvent):
+                strategy.on_broker_order_event(event)
+
+        timeout_snapshot = _board(1_000_000_300, bid=99.0, ask=100.0)
+        timeout_board = BoardSnapshot.from_dict(timeout_snapshot)
+        timeout = strategy.on_board(timeout_board, now_ns=timeout_board.ts_ns)
+        self.assertEqual(timeout.exit_cancel_signal, "replace_active_exit_before_force_exit")
+
+        _handle_exit_cancel_signal_sim(
+            strategy,
+            simulator,
+            timeout.exit_cancel_signal,
+            timeout_board,
+            timeout_board.ts_ns,
+        )
+        self.assertEqual(strategy.position.qty, 0)
+        self.assertEqual(strategy.working_exit_ids, [])
 
 
 if __name__ == "__main__":

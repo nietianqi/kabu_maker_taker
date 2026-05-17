@@ -101,6 +101,10 @@ class ReplayRunner:
 
             result = strategy.on_board(snapshot, now_ns=snapshot.ts_ns)
 
+            # Cancel active exit orders before releasing deferred force-exit, matching app.py dry-run flow.
+            if result.exit_cancel_signal:
+                _handle_exit_cancel_signal_sim(strategy, simulator, result.exit_cancel_signal, snapshot, snapshot.ts_ns)
+
             # Cancel signal
             if result.entry_cancel_signal:
                 for oid in strategy.working_entry_ids:
@@ -185,3 +189,21 @@ def _submit_to_sim(
             strategy.on_broker_order_event(ev)
         elif isinstance(ev, BrokerFillEvent):
             strategy.on_broker_fill(ev)
+
+
+def _handle_exit_cancel_signal_sim(
+    strategy: CombinedMakerTakerStrategy,
+    simulator: DryRunSimulator,
+    reason: str,
+    snapshot: BoardSnapshot,
+    now_ns: int,
+) -> None:
+    for oid in list(strategy.working_exit_ids):
+        order = strategy.request_cancel(oid, reason=reason, now_ns=now_ns)
+        if order is None:
+            continue
+        for ev in simulator.cancel(oid, now_ns):
+            strategy.on_broker_order_event(ev)
+    deferred = strategy.release_deferred_force_exit(snapshot, now_ns=now_ns)
+    if deferred is not None:
+        _submit_to_sim(strategy, simulator, deferred, snapshot, now_ns)

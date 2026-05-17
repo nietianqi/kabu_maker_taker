@@ -53,11 +53,16 @@ Requirements:
 
 - `config.json` must set `"dry_run": false`.
 - `config.json` must include `kabu.api_password`.
-- `risk.api_error_limit` must be greater than `0`, so live REST failures can trip the API circuit breaker.
+- Live mode requires the safety profile to be fully enabled: session enforcement, daily loss
+  limit, entry/cancel rate limits, stale quote and stale board guards, API and latency circuits,
+  decision trace, trade journal, and abnormal-market detection.
 - `risk.order_latency_limit_ms`, `risk.cancel_latency_limit_ms`, `risk.poll_latency_limit_ms`,
   and `risk.latency_breach_limit` protect live mode from slow REST responses. The default is
   `3000ms` for each request class and `3` consecutive breaches.
 - `--live --sample` is rejected so embedded sample events cannot place real orders.
+- `--live --events` remains a validation mode only. Every event must include a fresh `ts_ns`
+  within `risk.stale_quote_ms` of the local wall clock; stale or future JSONL events are rejected
+  before live startup.
 
 The live adapter starts by fetching a kabu Station token, checking broker positions/orders, and
 reconciling positions into the strategy. It refuses to start if kabu Station already has active

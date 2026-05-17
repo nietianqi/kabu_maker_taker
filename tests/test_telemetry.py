@@ -11,6 +11,7 @@ from kabu_maker_taker.models import (
     EntryDecision,
     Level,
     MarketState,
+    OrderIntent,
     PositionState,
     SignalPacket,
     StrategyResult,
@@ -22,6 +23,7 @@ def _result(
     allowed: bool = False,
     reason: str = "confirming",
     blocked_reason: str = "confirming",
+    with_intents: bool = False,
 ) -> StrategyResult:
     signal = SignalPacket(
         ts_ns=1_000_000_000,
@@ -33,10 +35,38 @@ def _result(
         composite=0.55,
     )
     return StrategyResult(
-        intent=None,
+        intent=OrderIntent(
+            symbol="9984",
+            exchange=27,
+            side=1,
+            qty=100,
+            price=100.0,
+            is_market=False,
+            strategy="maker",
+            reason="maker_passive_edge",
+            score=8,
+            reference_price=101.0,
+            client_order_id="entry-1",
+        ) if with_intents else None,
         decision=EntryDecision(allow=allowed, reason=reason, entry_mode="maker", side=1),
         signal=signal,
         blocked_reason=blocked_reason,
+        exit_intent=OrderIntent(
+            symbol="9984",
+            exchange=27,
+            side=-1,
+            qty=100,
+            price=102.0,
+            is_market=False,
+            strategy="lollipop_tp",
+            reason="limit_tp",
+            score=0,
+            reference_price=100.0,
+            client_order_id="exit-1",
+        ) if with_intents else None,
+        entry_cancel_signal="alpha_flip" if with_intents else "",
+        entry_cancel_blocked_reason="cancel_rate_limit" if with_intents else "",
+        exit_cancel_signal="replace_active_exit_before_force_exit" if with_intents else "",
         market_state=MarketState.NORMAL,
     )
 
@@ -119,6 +149,21 @@ class DecisionTraceWriterTests(unittest.TestCase):
         writer = DecisionTraceWriter(log_dir=self.log_dir, symbol="9984", enabled=True)
         writer.close()
         writer.close()  # should not raise
+
+    def test_record_includes_order_cancel_and_position_details(self) -> None:
+        writer = DecisionTraceWriter(log_dir=self.log_dir, symbol="9984", enabled=True)
+        pos = PositionState(side=1, qty=100, avg_price=101.5, entry_mode="maker", entry_ts_ns=123)
+        writer.record(_result(with_intents=True), pos, now_ns=2_000_000_000)
+        writer.close()
+
+        row = json.loads((Path(self.log_dir) / "decisions.jsonl").read_text(encoding="utf-8").strip())
+        self.assertEqual(row["entry_intent_id"], "entry-1")
+        self.assertEqual(row["exit_intent_id"], "exit-1")
+        self.assertEqual(row["entry_cancel_signal"], "alpha_flip")
+        self.assertEqual(row["entry_cancel_blocked_reason"], "cancel_rate_limit")
+        self.assertEqual(row["exit_cancel_signal"], "replace_active_exit_before_force_exit")
+        self.assertAlmostEqual(row["position_avg_price"], 101.5)
+        self.assertEqual(row["position_entry_mode"], "maker")
 
 
 if __name__ == "__main__":

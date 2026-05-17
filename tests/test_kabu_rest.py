@@ -673,6 +673,35 @@ class KabuRestExecutorTests(unittest.TestCase):
 
 
 class KabuLiveCliSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _live_safe_config(**overrides) -> dict:
+        config = {
+            "dry_run": False,
+            "log_dir": str(Path(tempfile.gettempdir()) / "kabu_maker_taker_test_logs"),
+            "enable_journal": True,
+            "enable_decision_trace": True,
+            "market_state": {"enabled": True},
+            "risk": {
+                "enforce_session": True,
+                "daily_loss_limit": 10_000,
+                "max_entry_orders_per_minute": 5,
+                "max_cancel_requests_per_minute": 10,
+                "stale_quote_ms": 2_000,
+                "stale_board_ms": 5_000,
+                "api_error_limit": 1,
+                "max_inventory_qty": 300,
+                "max_notional": 3_000_000,
+                "max_spread_ticks": 5.0,
+                "latency_breach_limit": 3,
+                "order_latency_limit_ms": 3000,
+                "cancel_latency_limit_ms": 3000,
+                "poll_latency_limit_ms": 3000,
+            },
+            "kabu": {"api_password": "pw"},
+        }
+        config.update(overrides)
+        return config
+
     def test_live_sample_is_rejected_before_any_network_call(self) -> None:
         completed = subprocess.run(
             [
@@ -708,16 +737,8 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
     def test_live_requires_api_password(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp).joinpath("config.json")
-            config_path.write_text(
-                json.dumps(
-                    {
-                        "dry_run": False,
-                        "risk": {"api_error_limit": 1},
-                        "kabu": {"api_password": ""},
-                    }
-                ),
-                encoding="utf-8",
-            )
+            config = self._live_safe_config(kabu={"api_password": ""})
+            config_path.write_text(json.dumps(config), encoding="utf-8")
             completed = subprocess.run(
                 [
                     sys.executable,
@@ -739,16 +760,9 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
     def test_live_requires_enabled_api_circuit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp).joinpath("config.json")
-            config_path.write_text(
-                json.dumps(
-                    {
-                        "dry_run": False,
-                        "risk": {"api_error_limit": 0},
-                        "kabu": {"api_password": "pw"},
-                    }
-                ),
-                encoding="utf-8",
-            )
+            config = self._live_safe_config()
+            config["risk"]["api_error_limit"] = 0
+            config_path.write_text(json.dumps(config), encoding="utf-8")
             completed = subprocess.run(
                 [
                     sys.executable,
@@ -765,7 +779,120 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
             )
 
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("--live requires risk.api_error_limit > 0", completed.stderr)
+        self.assertIn("--live safety config incomplete", completed.stderr)
+        self.assertIn("risk.api_error_limit>0", completed.stderr)
+
+    def test_live_safety_validator_reports_multiple_missing_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp).joinpath("config.json")
+            config_path.write_text(
+                json.dumps({"dry_run": False, "risk": {"api_error_limit": 1}, "kabu": {"api_password": "pw"}}),
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [sys.executable, "-m", "kabu_maker_taker.app", "--config", str(config_path), "--live"],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("risk.enforce_session=true", completed.stderr)
+        self.assertIn("enable_journal=true", completed.stderr)
+        self.assertIn("market_state.enabled=true", completed.stderr)
+
+    def test_live_events_reject_stale_timestamp_before_network_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.json"
+            events_path = tmp_path / "events.jsonl"
+            config_path.write_text(json.dumps(self._live_safe_config()), encoding="utf-8")
+            events_path.write_text(
+                json.dumps({"type": "board", "symbol": "9984", "ts_ns": 1, "bid": 100, "ask": 101}) + "\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "kabu_maker_taker.app",
+                    "--config",
+                    str(config_path),
+                    "--events",
+                    str(events_path),
+                    "--live",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("--live --events requires fresh events", completed.stderr)
+        self.assertIn("stale event ts_ns", completed.stderr)
+
+    def test_live_events_reject_future_timestamp_before_network_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.json"
+            events_path = tmp_path / "events.jsonl"
+            config_path.write_text(json.dumps(self._live_safe_config()), encoding="utf-8")
+            future_ns = time.time_ns() + 60_000_000_000
+            events_path.write_text(
+                json.dumps({"type": "trade", "symbol": "9984", "ts_ns": future_ns, "price": 100, "size": 100, "side": 1}) + "\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "kabu_maker_taker.app",
+                    "--config",
+                    str(config_path),
+                    "--events",
+                    str(events_path),
+                    "--live",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("future event ts_ns", completed.stderr)
+
+    def test_live_events_reject_missing_timestamp_before_network_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.json"
+            events_path = tmp_path / "events.jsonl"
+            config_path.write_text(json.dumps(self._live_safe_config()), encoding="utf-8")
+            events_path.write_text(
+                json.dumps({"type": "board", "symbol": "9984", "bid": 100, "ask": 101}) + "\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "kabu_maker_taker.app",
+                    "--config",
+                    str(config_path),
+                    "--events",
+                    str(events_path),
+                    "--live",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("missing or invalid ts_ns", completed.stderr)
 
 
 if __name__ == "__main__":

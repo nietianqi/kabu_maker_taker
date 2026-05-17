@@ -238,6 +238,58 @@ class P1RiskControlTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "daily_loss_limit")
 
+    def test_order_qty_caps_final_size_by_notional(self) -> None:
+        rm = RiskManager(
+            config=RiskConfig(max_inventory_qty=1000, max_notional=25_000.0),
+            tick_size=1.0,
+            lot_size=100,
+        )
+
+        qty = rm.order_qty(base_qty=500, position=PositionState(), expected_price=101.0)
+        self.assertEqual(qty, 200)
+
+        ok, reason = rm.can_enter(
+            snapshot=_snapshot(),
+            decision=EntryDecision(True, "", entry_mode="maker", side=1),
+            position=PositionState(),
+            now_ns=1_000_000_000,
+            expected_price=101.0,
+            order_qty=300,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "notional_limit")
+
+    def test_dynamic_sizing_is_capped_by_final_notional_limit(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            tick_size=1.0,
+            lot_size=100,
+            strategy=StrategyConfig(
+                trade_qty=100,
+                taker_confirm_ticks=1,
+                scale_qty_by_score=True,
+                scale_qty_score_threshold=10,
+                scale_qty_multiplier=5.0,
+            ),
+            risk=RiskConfig(max_inventory_qty=1000, max_notional=25_000.0, max_spread_ticks=5.0),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(ts_ns=snapshot.ts_ns)
+        strategy._choose_decision = lambda snapshot, sig, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            True,
+            "",
+            entry_mode="taker",
+            side=1,
+            entry_score=12,
+            required_confirm=1,
+        )
+
+        result = strategy.on_board(_snapshot(), now_ns=1_000_000_000)
+
+        self.assertIsNotNone(result.intent)
+        assert result.intent is not None
+        self.assertEqual(result.intent.qty, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

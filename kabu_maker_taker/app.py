@@ -68,10 +68,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--live cannot be used with --sample")
     if args.live and config.dry_run:
         parser.error("--live requires config.dry_run=false")
-    if args.live and config.risk.api_error_limit <= 0:
-        parser.error("--live requires risk.api_error_limit > 0")
     if args.live and args.broker_snapshot:
         parser.error("--broker-snapshot cannot be combined with --live")
+    if args.live:
+        live_config_errors = _validate_live_config(config)
+        if live_config_errors:
+            parser.error("--live safety config incomplete: " + ", ".join(live_config_errors))
+        if args.events:
+            event_error = _validate_live_events_file(Path(args.events), config, now_ns=time.time_ns())
+            if event_error:
+                parser.error("--live --events requires fresh events: " + event_error)
 
     strategy = CombinedMakerTakerStrategy(config)
     simulator = DryRunSimulator(
@@ -144,6 +150,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     for event in events:
+        live_now_ns = 0
+        if live_executor is not None:
+            live_now_ns = time.time_ns()
+            live_event_error = _live_event_freshness_error(event, config, now_ns=live_now_ns)
+            if live_event_error:
+                print(
+                    json.dumps(
+                        {"status": "live_event_rejected", "reason": live_event_error},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+                return 2
         event_type = str(event.get("type", "board"))
         if event_type == "trade":
             tp = TradePrint.from_dict(event)
@@ -156,11 +175,12 @@ def main(argv: list[str] | None = None) -> int:
             kabu_bidask_reversed=config.signals.kabu_bidask_reversed,
             auto_fix_negative_spread=config.signals.auto_fix_negative_spread,
         )
+        now_ns = live_now_ns if live_executor is not None else snapshot.ts_ns
 
         # Kill-switch check: works in both dry-run and live modes
         ks = _check_kill_switch(config)
         if ks == "hard":
-            return _halt_live(strategy, live_executor, config, snapshot, "kill_switch_hard", snapshot.ts_ns, simulator=simulator)
+            return _halt_live(strategy, live_executor, config, snapshot, "kill_switch_hard", now_ns, simulator=simulator)
         if live_executor is not None:
             strategy.risk.set_soft_kill(ks == "soft")
 
@@ -168,11 +188,11 @@ def main(argv: list[str] | None = None) -> int:
             for fill_event in simulator.on_board(snapshot, snapshot.ts_ns):
                 strategy.on_broker_fill(fill_event)
         else:
-            halt_reason = _poll_live(strategy, live_executor, now_ns=snapshot.ts_ns)
+            halt_reason = _poll_live(strategy, live_executor, now_ns=now_ns)
             if halt_reason:
-                return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
-        result = strategy.on_board(snapshot, now_ns=snapshot.ts_ns)
-        tracer.record(result, strategy.position, snapshot.ts_ns)
+                return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
+        result = strategy.on_board(snapshot, now_ns=now_ns)
+        tracer.record(result, strategy.position, now_ns)
         if result.exit_cancel_signal:
             halt_reason = _handle_exit_cancel_signal(
                 strategy,
@@ -180,29 +200,29 @@ def main(argv: list[str] | None = None) -> int:
                 live_executor,
                 result.exit_cancel_signal,
                 snapshot,
-                snapshot.ts_ns,
+                now_ns,
                 config,
             )
             if halt_reason:
-                return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
+                return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
         if result.entry_cancel_signal:
             for oid in strategy.working_entry_ids:
-                order = strategy.request_cancel(oid, reason=result.entry_cancel_signal, now_ns=snapshot.ts_ns)
+                order = strategy.request_cancel(oid, reason=result.entry_cancel_signal, now_ns=now_ns)
                 if live_executor is None:
                     for cancel_event in simulator.cancel(oid, snapshot.ts_ns):
                         strategy.on_broker_order_event(cancel_event)
                 elif order is not None:
                     halt_reason = _handle_live_execution(
                         strategy,
-                        live_executor.cancel(order, now_ns=snapshot.ts_ns),
-                        now_ns=snapshot.ts_ns,
+                        live_executor.cancel(order, now_ns=now_ns),
+                        now_ns=now_ns,
                     )
                     if halt_reason:
-                        return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
+                        return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
                     _sleep_before_live_poll(config)
-                    halt_reason = _poll_live(strategy, live_executor, now_ns=snapshot.ts_ns)
+                    halt_reason = _poll_live(strategy, live_executor, now_ns=now_ns)
                     if halt_reason:
-                        return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
+                        return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
         if result.intent is not None:
             print(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
             if live_executor is None:
@@ -213,11 +233,11 @@ def main(argv: list[str] | None = None) -> int:
                     live_executor,
                     result.intent,
                     ORDER_ROLE_ENTRY,
-                    snapshot.ts_ns,
+                    now_ns,
                     config,
                 )
                 if halt_reason:
-                    return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
+                    return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
         if result.exit_intent is not None:
             if live_executor is None:
                 _submit_to_simulator(strategy, simulator, result.exit_intent, snapshot, snapshot.ts_ns)
@@ -227,11 +247,11 @@ def main(argv: list[str] | None = None) -> int:
                     live_executor,
                     result.exit_intent,
                     ORDER_ROLE_EXIT,
-                    snapshot.ts_ns,
+                    now_ns,
                     config,
                 )
                 if halt_reason:
-                    return _halt_live(strategy, live_executor, config, snapshot, halt_reason, snapshot.ts_ns)
+                    return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
 
     # Flush journal markouts and close diagnostic files
     if strategy.journal is not None:
@@ -361,13 +381,85 @@ def _halt_live(
     return _live_halted(strategy, reason, cleanup=cleanup)
 
 
-def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+def _validate_live_config(config: AppConfig) -> list[str]:
+    risk = config.risk
+    missing: list[str] = []
+    if not risk.enforce_session:
+        missing.append("risk.enforce_session=true")
+    if risk.daily_loss_limit <= 0:
+        missing.append("risk.daily_loss_limit>0")
+    if risk.max_entry_orders_per_minute <= 0:
+        missing.append("risk.max_entry_orders_per_minute>0")
+    if risk.max_cancel_requests_per_minute <= 0:
+        missing.append("risk.max_cancel_requests_per_minute>0")
+    if risk.stale_quote_ms <= 0:
+        missing.append("risk.stale_quote_ms>0")
+    if risk.stale_board_ms <= 0:
+        missing.append("risk.stale_board_ms>0")
+    if risk.api_error_limit <= 0:
+        missing.append("risk.api_error_limit>0")
+    if risk.max_inventory_qty <= 0:
+        missing.append("risk.max_inventory_qty>0")
+    if risk.max_notional <= 0:
+        missing.append("risk.max_notional>0")
+    if risk.max_spread_ticks <= 0:
+        missing.append("risk.max_spread_ticks>0")
+    if risk.latency_breach_limit <= 0:
+        missing.append("risk.latency_breach_limit>0")
+    if min(risk.order_latency_limit_ms, risk.cancel_latency_limit_ms, risk.poll_latency_limit_ms) <= 0:
+        missing.append("risk REST latency limits>0")
+    if not config.enable_journal:
+        missing.append("enable_journal=true")
+    if not config.enable_decision_trace:
+        missing.append("enable_decision_trace=true")
+    if not config.market_state.enabled:
+        missing.append("market_state.enabled=true")
+    return missing
+
+
+def _validate_live_events_file(path: Path, config: AppConfig, *, now_ns: int) -> str:
+    seen = False
+    for line_no, event in _read_jsonl_with_line(path):
+        seen = True
+        error = _live_event_freshness_error(event, config, now_ns=now_ns)
+        if error:
+            return f"{path}:{line_no}: {error}"
+    if not seen:
+        return f"{path}: no events"
+    return ""
+
+
+def _live_event_freshness_error(event: dict[str, Any], config: AppConfig, *, now_ns: int) -> str:
+    raw_ts = event.get("ts_ns", event.get("timestamp_ns", event.get("ExchangeTimeNs", 0)))
+    try:
+        ts_ns = int(raw_ts)
+    except (TypeError, ValueError):
+        ts_ns = 0
+    if ts_ns <= 0:
+        return "missing or invalid ts_ns"
+    tolerance_ns = config.risk.stale_quote_ms * 1_000_000
+    if tolerance_ns <= 0:
+        return "risk.stale_quote_ms must be positive"
+    diff_ns = ts_ns - now_ns
+    if abs(diff_ns) > tolerance_ns:
+        direction = "future" if diff_ns > 0 else "stale"
+        diff_ms = abs(diff_ns) / 1_000_000
+        return f"{direction} event ts_ns outside risk.stale_quote_ms ({diff_ms:.0f}ms)"
+    return ""
+
+
+def _read_jsonl_with_line(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
     with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+        for line_no, line in enumerate(handle, 1):
             line = line.strip()
             if not line:
                 continue
-            yield json.loads(line)
+            yield line_no, json.loads(line)
+
+
+def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    for _, event in _read_jsonl_with_line(path):
+        yield event
 
 
 def _sample_events(config: AppConfig) -> list[dict[str, Any]]:
