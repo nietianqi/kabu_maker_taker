@@ -7,7 +7,7 @@ from ..broker import BrokerPositionSnapshot, BrokerReconciliationSnapshot
 from ..config import AppConfig
 from ..models import BrokerFillEvent, BrokerOrderEvent, OrderIntent, OrderState, OrderStatus
 from .client import KabuRestClient, _REQUEST_LANE_POLL
-from .models import KabuApiError, LiveExecutionResult
+from .models import KabuApiError, KabuOrderSnapshot, LiveExecutionResult
 from .parsers import _aggressive_limit_price, _elapsed_ms, _find_order_snapshot, order_snapshot, position_lot
 
 
@@ -268,6 +268,13 @@ class KabuRestExecutor:
             )
         return BrokerReconciliationSnapshot(ts_ns=time.time_ns(), positions=positions)
 
+    def open_order_snapshots(self) -> tuple[KabuOrderSnapshot, ...]:
+        raw_orders = self.client.get_orders(product=0, lane=_REQUEST_LANE_POLL)
+        return self._open_order_snapshots(raw_orders)
+
+    def position_snapshot(self) -> tuple[BrokerPositionSnapshot, ...]:
+        return self._position_snapshot()
+
     def _position_snapshot(self) -> tuple[BrokerPositionSnapshot, ...]:
         lots = [
             lot
@@ -294,6 +301,23 @@ class KabuRestExecutor:
                 entry_mode="maker",
             ),
         )
+
+    def _open_order_snapshots(self, raw_orders: list[dict[str, Any]]) -> tuple[KabuOrderSnapshot, ...]:
+        snapshots = []
+        for raw in raw_orders:
+            snapshot = order_snapshot(raw)
+            if snapshot is None:
+                continue
+            if snapshot.symbol and snapshot.symbol != self.config.symbol:
+                continue
+            if snapshot.status in {
+                OrderStatus.FILLED,
+                OrderStatus.CANCELED,
+                OrderStatus.REJECTED,
+            }:
+                continue
+            snapshots.append(snapshot)
+        return tuple(snapshots)
 
 
 def _extract_order_id(payload: Any) -> str:

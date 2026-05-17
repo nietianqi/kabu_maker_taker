@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
-from kabu_maker_taker.config import AppConfig, RiskConfig, StrategyConfig
+from kabu_maker_taker.app import _handle_exit_cancel_signal
+from kabu_maker_taker.config import AppConfig, LollipopConfig, RiskConfig, StrategyConfig
 from kabu_maker_taker.models import (
     BoardSnapshot,
     BrokerFillEvent,
@@ -18,6 +19,7 @@ from kabu_maker_taker.models import (
     SignalPacket,
 )
 from kabu_maker_taker.orders import OrderLedger
+from kabu_maker_taker.simulator import DryRunSimulator
 
 
 def _signal(**overrides) -> SignalPacket:
@@ -63,6 +65,28 @@ def _strategy() -> CombinedMakerTakerStrategy:
         lot_size=1,
         strategy=StrategyConfig(trade_qty=100, maker_confirm_ticks=1, taker_confirm_ticks=1),
         risk=RiskConfig(max_inventory_qty=300, max_spread_ticks=5.0),
+    )
+    strategy = CombinedMakerTakerStrategy(config)
+    strategy.signals.on_board = lambda snapshot: _signal(ts_ns=snapshot.ts_ns)
+    strategy._choose_decision = lambda snapshot, signal, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+        True,
+        "",
+        entry_mode="maker",
+        side=1,
+        entry_score=8,
+        required_confirm=1,
+    )
+    return strategy
+
+
+def _timeout_strategy() -> CombinedMakerTakerStrategy:
+    config = AppConfig(
+        symbol="9984",
+        tick_size=1.0,
+        lot_size=1,
+        strategy=StrategyConfig(trade_qty=100, maker_confirm_ticks=1, taker_confirm_ticks=1),
+        risk=RiskConfig(max_inventory_qty=300, max_spread_ticks=5.0),
+        lollipop=LollipopConfig(tp_delay_ms=0, maker_max_hold_seconds=0, taker_max_hold_seconds=0),
     )
     strategy = CombinedMakerTakerStrategy(config)
     strategy.signals.on_board = lambda snapshot: _signal(ts_ns=snapshot.ts_ns)
@@ -327,6 +351,59 @@ class BrokerOrderEventTests(unittest.TestCase):
         self.assertFalse(second_exit.exit_intent.is_market)
         self.assertEqual(second_exit.exit_intent.reason, "limit_tp")
         self.assertNotEqual(first_exit.exit_intent.client_order_id, second_exit.exit_intent.client_order_id)
+
+    def test_force_exit_is_deferred_until_active_exit_order_is_cleared(self) -> None:
+        strategy = _timeout_strategy()
+        entry = strategy.on_board(_snapshot(), now_ns=1_000_000_000)
+        assert entry.intent is not None
+        strategy.on_broker_fill(
+            BrokerFillEvent(order_id=entry.intent.client_order_id, qty=100, price=101.0, ts_ns=1_000_000_100)
+        )
+
+        tp = strategy.on_board(_snapshot(ts_ns=1_000_000_200), now_ns=1_000_000_200)
+        assert tp.exit_intent is not None
+        timeout = strategy.on_board(_snapshot(ts_ns=1_000_000_300, bid=99.0, ask=100.0), now_ns=1_000_000_300)
+
+        self.assertIsNone(timeout.exit_intent)
+        self.assertEqual(timeout.exit_cancel_signal, "replace_active_exit_before_force_exit")
+        self.assertEqual(strategy.working_exit_ids, [tp.exit_intent.client_order_id])
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.TIMEOUT)
+
+    def test_canceling_active_exit_releases_force_exit_without_reverse_fill(self) -> None:
+        strategy = _timeout_strategy()
+        simulator = DryRunSimulator(tick_size=1.0)
+        entry = strategy.on_board(_snapshot(), now_ns=1_000_000_000)
+        assert entry.intent is not None
+        strategy.on_broker_fill(
+            BrokerFillEvent(order_id=entry.intent.client_order_id, qty=100, price=101.0, ts_ns=1_000_000_100)
+        )
+
+        tp = strategy.on_board(_snapshot(ts_ns=1_000_000_200), now_ns=1_000_000_200)
+        assert tp.exit_intent is not None
+        for event in simulator.submit(tp.exit_intent, _snapshot(ts_ns=1_000_000_200), 1_000_000_200):
+            if isinstance(event, BrokerOrderEvent):
+                strategy.on_broker_order_event(event)
+
+        timeout_snapshot = _snapshot(ts_ns=1_000_000_300, bid=99.0, ask=100.0)
+        timeout = strategy.on_board(timeout_snapshot, now_ns=timeout_snapshot.ts_ns)
+        self.assertEqual(timeout.exit_cancel_signal, "replace_active_exit_before_force_exit")
+
+        halt_reason = _handle_exit_cancel_signal(
+            strategy,
+            simulator,
+            None,
+            timeout.exit_cancel_signal,
+            timeout_snapshot,
+            timeout_snapshot.ts_ns,
+            strategy.config,
+        )
+
+        self.assertEqual(halt_reason, "")
+        self.assertEqual(strategy.position.qty, 0)
+        self.assertEqual(strategy.working_exit_ids, [])
+        fills = simulator.on_board(_snapshot(ts_ns=1_000_000_400, bid=104.0, ask=105.0), 1_000_000_400)
+        self.assertEqual(fills, [])
+        self.assertEqual(strategy.position.qty, 0)
 
     def test_manual_apply_fill_is_disabled(self) -> None:
         strategy = _strategy()

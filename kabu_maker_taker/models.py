@@ -304,6 +304,9 @@ class StrategyResult:
     # Named distinctly from OrderState.cancel_reason (which records what the broker did).
     entry_cancel_signal: str = ""
     entry_cancel_blocked_reason: str = ""
+    # Outbound signal to execution layer: cancel working exit orders before
+    # releasing a deferred force-exit order.
+    exit_cancel_signal: str = ""
     market_state: MarketState = MarketState.NORMAL
 
     def to_dict(self) -> dict[str, Any]:
@@ -316,6 +319,7 @@ class StrategyResult:
             "signal": asdict(self.signal) if self.signal else None,
             "entry_cancel_signal": self.entry_cancel_signal,
             "entry_cancel_blocked_reason": self.entry_cancel_blocked_reason,
+            "exit_cancel_signal": self.exit_cancel_signal,
             "market_state": self.market_state.value,
         }
 

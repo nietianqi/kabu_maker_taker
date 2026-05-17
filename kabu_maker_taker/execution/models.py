@@ -57,6 +57,7 @@ class KabuOrderSnapshot:
     fill_ts_ns: int = 0
     reason: str = ""
     fills: tuple[KabuFillDetail, ...] = field(default_factory=tuple)
+    symbol: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,4 +117,3 @@ def _extract_error_message(payload: Any) -> str | None:
                 if value not in (None, ""):
                     return str(value)
     return None
-
