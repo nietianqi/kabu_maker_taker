@@ -151,6 +151,19 @@ class StrategyConfig:
     # Queue-depth retreat: retreat extra ticks when top-of-book < threshold (0 = disabled)
     queue_min_top_qty: int = 0
     queue_retreat_ticks: float = 1.0
+    # Taker: execution quality gate — min composite score (0-10) required to enter (0 = disabled)
+    exec_quality_min_score: int = 0
+    # Taker: aggressive mode — reduce required_confirm to 1 when entry_score >= this (0 = disabled)
+    aggressive_taker_entry_score: int = 0
+    # Taker: adaptive confirmation — require more ticks when all primary checks pass
+    use_adaptive_confirm: bool = False
+    strong_signal_confirm: int = 2
+    # Taker: flow-flip exit — force-exit taker position when tape/lob OFI flips below -threshold (0 = disabled)
+    flow_flip_threshold: float = 0.0
+    # Taker: dynamic sizing — scale qty up by multiplier when entry_score >= threshold
+    scale_qty_by_score: bool = False
+    scale_qty_score_threshold: int = 11
+    scale_qty_multiplier: float = 1.5
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "StrategyConfig":
@@ -194,6 +207,14 @@ class StrategyConfig:
             max_quote_drift_ticks=float(payload.get("max_quote_drift_ticks", 1.0)),
             queue_min_top_qty=int(payload.get("queue_min_top_qty", 0)),
             queue_retreat_ticks=float(payload.get("queue_retreat_ticks", 1.0)),
+            exec_quality_min_score=int(payload.get("exec_quality_min_score", 0)),
+            aggressive_taker_entry_score=int(payload.get("aggressive_taker_entry_score", 0)),
+            use_adaptive_confirm=bool(payload.get("use_adaptive_confirm", False)),
+            strong_signal_confirm=int(payload.get("strong_signal_confirm", 2)),
+            flow_flip_threshold=float(payload.get("flow_flip_threshold", 0.0)),
+            scale_qty_by_score=bool(payload.get("scale_qty_by_score", False)),
+            scale_qty_score_threshold=int(payload.get("scale_qty_score_threshold", 11)),
+            scale_qty_multiplier=float(payload.get("scale_qty_multiplier", 1.5)),
         )
 
 

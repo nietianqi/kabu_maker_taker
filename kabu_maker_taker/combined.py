@@ -56,7 +56,7 @@ class CombinedMakerTakerStrategy:
         self.position = PositionState()
         self.signals = MicrostructureSignalEngine(tick_size=config.tick_size, config=config.signals)
         self.maker = MakerStrategy(config.strategy, tick_size=config.tick_size)
-        self.taker = TakerStrategy(config.strategy)
+        self.taker = TakerStrategy(config.strategy, tick_size=config.tick_size)
         self.risk = RiskManager(config=config.risk, tick_size=config.tick_size, lot_size=config.lot_size)
         self.confirmation = ConfirmationTracker()
         self.lollipop = LollipopTPManager(config.lollipop, config.tick_size, config.lot_size)
@@ -96,6 +96,19 @@ class CombinedMakerTakerStrategy:
         self.metrics.on_board(snapshot)
         if self.journal is not None:
             self.journal.on_board(snapshot)
+
+        # Force-exit taker position when tape/LOB OFI flips to strong negative flow.
+        if (
+            self.position.qty > 0
+            and self.position.entry_mode == ENTRY_MODE_TAKER
+            and self.config.strategy.flow_flip_threshold > 0
+            and self.lollipop.state.phase != LollipopPhase.TIMEOUT
+            and (
+                signal.tape_ofi_raw <= -self.config.strategy.flow_flip_threshold
+                or signal.lob_ofi_raw <= -self.config.strategy.flow_flip_threshold
+            )
+        ):
+            self.lollipop.force_exit_next_tick()
 
         lollipop_action = self.lollipop.tick(
             snapshot,
@@ -186,6 +199,14 @@ class CombinedMakerTakerStrategy:
         base_qty = self.risk.order_qty(base_qty=self.config.strategy.trade_qty, position=self.position)
         if self.config.strategy.vol_aware_sizing and signal.vol_expansion and base_qty > self.config.lot_size:
             base_qty = max(self.config.lot_size, (base_qty // 2 // self.config.lot_size) * self.config.lot_size)
+        # Dynamic sizing: scale up taker qty at high conviction
+        if (
+            decision.entry_mode == ENTRY_MODE_TAKER
+            and self.config.strategy.scale_qty_by_score
+            and decision.entry_score >= self.config.strategy.scale_qty_score_threshold
+        ):
+            scaled = int(base_qty * self.config.strategy.scale_qty_multiplier // self.config.lot_size) * self.config.lot_size
+            base_qty = min(scaled, self.risk.config.max_inventory_qty)
         if base_qty <= 0:
             self.confirmation.reset()
             result = StrategyResult(

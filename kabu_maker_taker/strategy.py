@@ -368,8 +368,9 @@ class MakerStrategy:
 class TakerStrategy:
     mode = ENTRY_MODE_TAKER
 
-    def __init__(self, config: StrategyConfig):
+    def __init__(self, config: StrategyConfig, tick_size: float = 1.0):
         self.config = config
+        self.tick_size = max(tick_size, 1e-9)
 
     def evaluate(self, snapshot: BoardSnapshot, signal: SignalPacket, now_ns: int = 0) -> EntryDecision:
         # Adverse selection: reject stale signals
@@ -389,14 +390,55 @@ class TakerStrategy:
         if not self._breakout_ready(snapshot, signal, diagnostics.direction):
             if not self._breakout_price_ready(signal, diagnostics.direction):
                 return EntryDecision(False, "taker_breakout")
+
+        # Execution quality gate: composite 0-10 score must meet minimum
+        if self.config.exec_quality_min_score > 0:
+            q = self._compute_exec_quality(snapshot, signal, diagnostics.direction)
+            if q < self.config.exec_quality_min_score:
+                return EntryDecision(False, f"exec_quality:{q}/{self.config.exec_quality_min_score}")
+
+        # Determine required confirmation ticks
+        confirm = max(self.config.taker_confirm_ticks, 1)
+        if (self.config.aggressive_taker_entry_score > 0
+                and diagnostics.entry_score >= self.config.aggressive_taker_entry_score):
+            confirm = 1
+        elif (self.config.use_adaptive_confirm
+              and primary_checks_pass(diagnostics)
+              and diagnostics.book and diagnostics.microprice_tilt):
+            # Both direction signals (book + tilt) firing → require more ticks
+            # to avoid chasing transient spikes; strong_signal_confirm >= taker_confirm_ticks.
+            confirm = max(confirm, self.config.strong_signal_confirm)
+
         return EntryDecision(
             True,
             "",
             entry_mode=ENTRY_MODE_TAKER,
             side=diagnostics.direction,
             entry_score=diagnostics.entry_score,
-            required_confirm=max(self.config.taker_confirm_ticks, 1),
+            required_confirm=confirm,
         )
+
+    def _compute_exec_quality(self, snapshot: BoardSnapshot, signal: SignalPacket, direction: int) -> int:
+        """Composite execution quality score 0–10 (spread+imbalance+OFI+microprice)."""
+        sign = 1 if direction > 0 else -1
+        spread_ticks = snapshot.spread / self.tick_size if snapshot.spread > 0 else 0.0
+        spread_score = (3 if spread_ticks <= 1.0
+                        else 2 if spread_ticks <= 2.0
+                        else 1 if spread_ticks <= 3.0
+                        else 0)
+        obi = sign * signal.obi_raw
+        imbalance_score = (3 if obi >= self.config.book_imbalance_long * 1.5
+                           else 2 if obi >= self.config.book_imbalance_long * 1.25
+                           else 1 if obi >= self.config.book_imbalance_long
+                           else 0)
+        lob_ok = sign * signal.lob_ofi_raw >= self.config.of_imbalance_long
+        tape_ok = sign * signal.tape_ofi_raw >= self.config.tape_imbalance_long
+        ofi_score = 2 if (lob_ok and tape_ok) else 1 if (lob_ok or tape_ok) else 0
+        tilt = sign * signal.microprice_tilt_raw
+        microprice_score = (2 if tilt >= self.config.microprice_tilt_long * 1.5
+                            else 1 if tilt >= self.config.microprice_tilt_long
+                            else 0)
+        return spread_score + imbalance_score + ofi_score + microprice_score
 
     def build_intent(
         self,

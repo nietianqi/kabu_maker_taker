@@ -58,7 +58,15 @@
     "microprice_streak_min": 3,
     "max_quote_drift_ticks": 1.0,
     "queue_min_top_qty": 0,
-    "queue_retreat_ticks": 1.0
+    "queue_retreat_ticks": 1.0,
+    "exec_quality_min_score": 0,
+    "aggressive_taker_entry_score": 0,
+    "use_adaptive_confirm": false,
+    "strong_signal_confirm": 2,
+    "flow_flip_threshold": 0.0,
+    "scale_qty_by_score": false,
+    "scale_qty_score_threshold": 11,
+    "scale_qty_multiplier": 1.5
   },
   "risk": {
     "max_inventory_qty": 300,
