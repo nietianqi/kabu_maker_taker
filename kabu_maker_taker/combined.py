@@ -32,6 +32,7 @@ from .models import (
     OrderState,
     OrderStatus,
     PositionState,
+    SignalPacket,
     StrategyResult,
     TradePrint,
 )
@@ -196,7 +197,8 @@ class CombinedMakerTakerStrategy:
             self.last_result = result
             return result
 
-        base_qty = self.risk.order_qty(base_qty=self.config.strategy.trade_qty, position=self.position)
+        expected_price = snapshot.ask if decision.side > 0 else snapshot.bid
+        base_qty = self.config.strategy.trade_qty
         if self.config.strategy.vol_aware_sizing and signal.vol_expansion and base_qty > self.config.lot_size:
             base_qty = max(self.config.lot_size, (base_qty // 2 // self.config.lot_size) * self.config.lot_size)
         # Dynamic sizing: scale up taker qty at high conviction
@@ -206,7 +208,12 @@ class CombinedMakerTakerStrategy:
             and decision.entry_score >= self.config.strategy.scale_qty_score_threshold
         ):
             scaled = int(base_qty * self.config.strategy.scale_qty_multiplier // self.config.lot_size) * self.config.lot_size
-            base_qty = min(scaled, self.risk.config.max_inventory_qty)
+            base_qty = scaled
+        base_qty = self.risk.order_qty(
+            base_qty=base_qty,
+            position=self.position,
+            expected_price=expected_price,
+        )
         if base_qty <= 0:
             self.confirmation.reset()
             result = StrategyResult(
@@ -222,13 +229,13 @@ class CombinedMakerTakerStrategy:
             self.last_result = result
             return result
 
-        expected_price = snapshot.ask if decision.side > 0 else snapshot.bid
         allowed, reason = self.risk.can_enter(
             snapshot=snapshot,
             decision=decision,
             position=self.position,
             now_ns=ts,
             expected_price=expected_price,
+            order_qty=base_qty,
         )
         if not allowed:
             self.confirmation.reset()
@@ -388,11 +395,21 @@ class CombinedMakerTakerStrategy:
             price=price,
             now_ns=now_ns,
             entry_mode=order.intent.strategy,
+            order_reason=order.intent.reason,
         )
         self.metrics.record_fill(order, outcome)
         return outcome
 
-    def _apply_position_fill(self, *, side: int, qty: int, price: float, now_ns: int = 0, entry_mode: str = "") -> str:
+    def _apply_position_fill(
+        self,
+        *,
+        side: int,
+        qty: int,
+        price: float,
+        now_ns: int = 0,
+        entry_mode: str = "",
+        order_reason: str = "",
+    ) -> str:
         if qty <= 0:
             return "none"
 
@@ -459,7 +476,7 @@ class CombinedMakerTakerStrategy:
                     qty=qty,
                     entry_price=prev_avg,
                     exit_price=price,
-                    exit_reason=self.last_result.blocked_reason if self.last_result else "",
+                    exit_reason=order_reason or (self.last_result.blocked_reason if self.last_result else ""),
                     entry_mode=entry_mode_for_log,
                     signal=self._last_entry_signal,
                     realized_pnl=net_pnl,
@@ -546,7 +563,13 @@ class CombinedMakerTakerStrategy:
             else:
                 self.lollipop.reschedule(now_ns)
         elif order.status == OrderStatus.REJECTED:
-            self.lollipop.force_exit_next_tick()
+            if self.lollipop.phase == LollipopPhase.TIMEOUT:
+                # Already in TIMEOUT: reset flag so next tick re-emits force_exit.
+                # force_exit_next_tick() is a no-op here and leaves force_exit_requested=True,
+                # which would permanently block re-emission.
+                self.lollipop.reset_force_exit()
+            else:
+                self.lollipop.force_exit_next_tick()
 
     def _choose_decision(
         self,

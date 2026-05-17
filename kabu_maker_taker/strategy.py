@@ -387,15 +387,16 @@ class TakerStrategy:
             return EntryDecision(False, "taker_primary")
         if diagnostics.entry_score < self.config.taker_score_threshold:
             return EntryDecision(False, f"taker_score:{diagnostics.entry_score}/{self.config.taker_score_threshold}")
-        if not self._breakout_ready(snapshot, signal, diagnostics.direction):
-            if not self._breakout_price_ready(signal, diagnostics.direction):
-                return EntryDecision(False, "taker_breakout")
-
-        # Execution quality gate: composite 0-10 score must meet minimum
+        # Execution quality gate: composite 0-10 score must meet minimum.
+        # Checked before the expensive breakout calls to fail fast on poor conditions.
         if self.config.exec_quality_min_score > 0:
             q = self._compute_exec_quality(snapshot, signal, diagnostics.direction)
             if q < self.config.exec_quality_min_score:
                 return EntryDecision(False, f"exec_quality:{q}/{self.config.exec_quality_min_score}")
+
+        if not self._breakout_ready(snapshot, signal, diagnostics.direction):
+            if not self._breakout_price_ready(signal, diagnostics.direction):
+                return EntryDecision(False, "taker_breakout")
 
         # Determine required confirmation ticks
         confirm = max(self.config.taker_confirm_ticks, 1)

@@ -454,5 +454,152 @@ class ForceExitOneShotTests(unittest.TestCase):
         self.assertEqual(strategy.lollipop.phase, LollipopPhase.SCHEDULED)
 
 
+class RejectedForceExitTests(unittest.TestCase):
+    """Verify that a REJECTED force-exit order correctly resets the lollipop
+    so the next tick can re-emit a fresh force_exit."""
+
+    def _make_combined_in_timeout(self):
+        from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+        from kabu_maker_taker.config import AppConfig, LollipopConfig
+        from kabu_maker_taker.models import OrderIntent
+        from kabu_maker_taker.strategy import ORDER_ROLE_EXIT
+
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            tick_size=1.0,
+            lot_size=100,
+            lollipop=LollipopConfig(
+                maker_tp_ticks=2.0,
+                taker_tp_ticks=3.0,
+                tp_delay_ms=0,
+                maker_max_hold_seconds=300,
+                taker_max_hold_seconds=300,
+                max_retries=3,
+            ),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.lollipop.on_entry_fill(100.0, "maker", now_ns=0, entry_side=1)
+        strategy.position.side = 1
+        strategy.position.qty = 100
+        strategy.position.avg_price = 100.0
+
+        # Push directly to TIMEOUT
+        strategy.lollipop.force_exit_next_tick()
+        # Emit first force_exit (sets force_exit_requested=True)
+        strategy.lollipop.tick(_snap(), strategy.position, 0, **_KW)
+
+        # Register a fake working exit order so _handle_final_order_state triggers
+        intent = OrderIntent(
+            symbol="9984", exchange=27, side=-1, qty=100,
+            price=0.0, is_market=True, strategy="lollipop_tp",
+            reason="timeout_exit", score=0, reference_price=100.0,
+        )
+        tracked = strategy.orders.add_intent(intent, role=ORDER_ROLE_EXIT, now_ns=0)
+        return strategy, tracked.client_order_id
+
+    def test_rejected_force_exit_in_timeout_resets_flag(self) -> None:
+        """REJECTED exit while in TIMEOUT: force_exit_requested cleared → retry possible."""
+        from kabu_maker_taker.models import BrokerOrderEvent, OrderStatus
+
+        strategy, oid = self._make_combined_in_timeout()
+        self.assertTrue(strategy.lollipop.state.force_exit_requested)
+
+        reject_event = BrokerOrderEvent(order_id=oid, status=OrderStatus.REJECTED)
+        strategy.on_broker_order_event(reject_event)
+
+        self.assertFalse(strategy.lollipop.state.force_exit_requested,
+                         "REJECTED in TIMEOUT must reset force_exit_requested for retry")
+
+    def test_rejected_force_exit_in_timeout_allows_reemission(self) -> None:
+        """After REJECTED reset, the next tick() call re-emits a force_exit."""
+        from kabu_maker_taker.models import BrokerOrderEvent, OrderStatus
+
+        strategy, oid = self._make_combined_in_timeout()
+        reject_event = BrokerOrderEvent(order_id=oid, status=OrderStatus.REJECTED)
+        strategy.on_broker_order_event(reject_event)
+
+        action = strategy.lollipop.tick(_snap(), strategy.position, 0, **_KW)
+        self.assertEqual(action.action, "force_exit",
+                         "After REJECTED+reset, next tick should re-emit force_exit")
+
+    def test_rejected_exit_outside_timeout_calls_force_exit_next_tick(self) -> None:
+        """REJECTED exit while in ACTIVE phase → lollipop transitions to TIMEOUT."""
+        from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+        from kabu_maker_taker.config import AppConfig, LollipopConfig
+        from kabu_maker_taker.models import BrokerOrderEvent, OrderIntent, OrderStatus
+        from kabu_maker_taker.strategy import ORDER_ROLE_EXIT
+
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            tick_size=1.0,
+            lot_size=100,
+            lollipop=LollipopConfig(
+                maker_tp_ticks=2.0,
+                taker_tp_ticks=3.0,
+                tp_delay_ms=0,
+                maker_max_hold_seconds=300,
+                taker_max_hold_seconds=300,
+                max_retries=3,
+            ),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.lollipop.on_entry_fill(100.0, "maker", now_ns=0, entry_side=1)
+        strategy.position.side = 1
+        strategy.position.qty = 100
+        strategy.position.avg_price = 100.0
+        # Advance to ACTIVE
+        strategy.lollipop.tick(_snap(), strategy.position, 0, **_KW)
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.ACTIVE)
+
+        intent = OrderIntent(
+            symbol="9984", exchange=27, side=-1, qty=100,
+            price=102.0, is_market=False, strategy="lollipop_tp",
+            reason="limit_tp", score=0, reference_price=100.0,
+        )
+        tracked = strategy.orders.add_intent(intent, role=ORDER_ROLE_EXIT, now_ns=0)
+        reject_event = BrokerOrderEvent(order_id=tracked.client_order_id, status=OrderStatus.REJECTED)
+        strategy.on_broker_order_event(reject_event)
+
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.TIMEOUT,
+                         "REJECTED exit in ACTIVE should escalate to TIMEOUT")
+
+
+class StopLossZeroBidTests(unittest.TestCase):
+    """Verify stop-loss is not falsely triggered when snapshot prices are zero."""
+
+    def test_stop_loss_not_triggered_when_bid_is_zero(self) -> None:
+        """bid=0 must not cause spurious stop-loss force_exit."""
+        cfg = LollipopConfig(
+            maker_tp_ticks=2.0,
+            taker_tp_ticks=3.0,
+            maker_max_hold_seconds=300,
+            taker_max_hold_seconds=300,
+            tp_delay_ms=0,
+            max_retries=5,
+            stop_loss_ticks=2.0,
+        )
+        mgr = LollipopTPManager(cfg, _TICK, _LOT)
+        mgr.on_entry_fill(100.0, "maker", now_ns=0)
+        pos = _pos(100.0)
+        mgr.tick(_snap(), pos, now_ns=0, **_KW)  # → ACTIVE
+
+        zero_snap = BoardSnapshot(
+            symbol="9984",
+            ts_ns=1_000_000_000,
+            bid=0.0,
+            ask=0.0,
+            bid_size=0,
+            ask_size=0,
+            bids=(),
+            asks=(),
+        )
+        action = mgr.tick(zero_snap, pos, now_ns=1_000_000_000, **_KW)
+        self.assertEqual(action.action, "none",
+                         "Zero bid/ask must not trigger stop-loss force_exit")
+        self.assertEqual(mgr.phase, LollipopPhase.ACTIVE)
+
+
 if __name__ == "__main__":
     unittest.main()

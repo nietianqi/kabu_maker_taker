@@ -117,8 +117,10 @@ class LollipopTPManager:
             return self._handle_scheduled(snapshot, position, now_ns, symbol=symbol, exchange=exchange)
 
         if phase == LollipopPhase.ACTIVE:
-            # Stop-loss check before timeout
-            if self.config.stop_loss_ticks > 0 and position.qty > 0:
+            # Stop-loss check before timeout.
+            # Guard bid/ask > 0: a zero price (uninitialized board, auction, data gap)
+            # would produce a huge loss value and trigger a spurious forced exit.
+            if self.config.stop_loss_ticks > 0 and position.qty > 0 and snapshot.bid > 0 and snapshot.ask > 0:
                 if position.side > 0:
                     loss = (position.avg_price - snapshot.bid) / self.tick_size
                 else:
