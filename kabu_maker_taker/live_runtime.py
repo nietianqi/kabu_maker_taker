@@ -146,24 +146,25 @@ def perform_live_preflight(
         broker_snapshot = executor.snapshot()
     except KabuApiError as exc:
         return False, {"reason": "broker_snapshot_failed", "detail": str(exc)}
-    if broker_snapshot.positions:
-        return False, {
-            "reason": "broker_position_not_flat",
-            "positions": [
-                {
-                    "symbol": p.symbol,
-                    "exchange": p.exchange,
-                    "side": p.side,
-                    "qty": p.qty,
-                    "avg_price": p.avg_price,
-                    "entry_mode": p.entry_mode,
-                }
-                for p in broker_snapshot.positions
-            ],
+    positions_payload = [
+        {
+            "symbol": p.symbol,
+            "exchange": p.exchange,
+            "side": p.side,
+            "qty": p.qty,
+            "avg_price": p.avg_price,
+            "entry_mode": p.entry_mode,
         }
+        for p in broker_snapshot.positions
+    ]
+    if broker_snapshot.positions and config.kabu.startup_position_policy != "restore":
+        return False, {"reason": "broker_position_not_flat", "positions": positions_payload}
     if broker_snapshot.open_orders:
         return False, {"reason": "broker_open_orders_present"}
     ignored_summary = ignored_broker_open_orders_summary(broker_snapshot)
+    restored_summary: dict[str, object] = (
+        {"restored_positions": positions_payload} if positions_payload else {}
+    )
 
     required = max(config.kabu.websocket_preflight_messages, 1)
     deadline = time.monotonic() + max(config.kabu.websocket_preflight_timeout_s, 0.1)
@@ -217,7 +218,7 @@ def perform_live_preflight(
             }
         if seen < required:
             return False, {"reason": "websocket_preflight_timeout", "received_boards": seen, "required_boards": required}
-        return True, {"required_boards": required, **ignored_summary, **last_summary}
+        return True, {"required_boards": required, **restored_summary, **ignored_summary, **last_summary}
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         return False, {"reason": "websocket_bad_message", "detail": str(exc), "received_boards": seen}
     except TimeoutError as exc:
