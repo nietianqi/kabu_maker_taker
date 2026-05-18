@@ -117,10 +117,20 @@ class StrategyConfig:
     maker_retreat_ticks: float = 1.0
     # T-04: minimum consumed ratio for wall-break taker trigger
     wall_consumed_ratio_min: float = 0.60
+    # Taker trigger switches and thresholds. Enabled by default so each trigger
+    # path is tradable, but each can be disabled independently for rollback.
+    use_depth_thin_taker: bool = True
+    use_wall_break_taker: bool = True
+    use_cancel_imbalance_taker: bool = True
+    use_price_breakout_taker: bool = True
+    opposite_depth_ratio_max: float = 0.50
+    cancel_imbalance_ratio_min: float = 0.40
+    cancel_imbalance_extreme_ratio: float = 0.80
+    taker_burst_min: float = 0.0
     # Adverse selection: reject signals older than this (0 = disabled)
     signal_expire_ms: int = 500
     # IOC execution: max allowed slippage ticks
-    max_slip_ticks: float = 1.0
+    max_slip_ticks: float = 2.0
     # v2: fair price via composite alpha
     fair_value_beta: float = 0.75
     max_fair_shift_ticks: float = 3.0
@@ -146,6 +156,10 @@ class StrategyConfig:
     min_order_age_ms: int = 100
     # v2: microprice streak (+1 direction score when streak >= this; 0 = disabled)
     microprice_streak_min: int = 3
+    # Maker working-order cancel guards for short-window flow and same-side queue loss
+    maker_cancel_tape_1s_threshold: float = 0.15
+    maker_cancel_burst_threshold: float = 0.25
+    maker_cancel_cancel_ratio_min: float = 0.60
     # Inventory skew amplifier: |inventory_ratio| >= high_threshold → multiply skew_ticks by high_multiplier
     inventory_high_threshold: float = 0.66
     inventory_high_multiplier: float = 1.5
@@ -171,8 +185,8 @@ class StrategyConfig:
     scale_qty_by_score: bool = False
     scale_qty_score_threshold: int = 11
     scale_qty_multiplier: float = 1.5
-    # Taker: T-09 volatility-expansion alternative entry path (False = disabled)
-    use_vol_expansion_taker: bool = False
+    # Taker: T-09 volatility-expansion alternative entry path
+    use_vol_expansion_taker: bool = True
     # T-09: max spread ticks allowed when vol_expansion fires (0 = inherit RiskConfig.max_spread_ticks)
     vol_expansion_spread_max_ticks: float = 2.0
     # Taker: exec quality — require 1s tape OFI to also confirm direction (0 = disabled)
@@ -203,8 +217,16 @@ class StrategyConfig:
             maker_join_best=bool(payload.get("maker_join_best", True)),
             maker_retreat_ticks=float(payload.get("maker_retreat_ticks", 1.0)),
             wall_consumed_ratio_min=float(payload.get("wall_consumed_ratio_min", 0.60)),
+            use_depth_thin_taker=bool(payload.get("use_depth_thin_taker", True)),
+            use_wall_break_taker=bool(payload.get("use_wall_break_taker", True)),
+            use_cancel_imbalance_taker=bool(payload.get("use_cancel_imbalance_taker", True)),
+            use_price_breakout_taker=bool(payload.get("use_price_breakout_taker", True)),
+            opposite_depth_ratio_max=float(payload.get("opposite_depth_ratio_max", 0.50)),
+            cancel_imbalance_ratio_min=float(payload.get("cancel_imbalance_ratio_min", 0.40)),
+            cancel_imbalance_extreme_ratio=float(payload.get("cancel_imbalance_extreme_ratio", 0.80)),
+            taker_burst_min=float(payload.get("taker_burst_min", 0.0)),
             signal_expire_ms=int(payload.get("signal_expire_ms", 500)),
-            max_slip_ticks=float(payload.get("max_slip_ticks", 1.0)),
+            max_slip_ticks=float(payload.get("max_slip_ticks", 2.0)),
             fair_value_beta=float(payload.get("fair_value_beta", 0.75)),
             max_fair_shift_ticks=float(payload.get("max_fair_shift_ticks", 3.0)),
             inventory_skew_ticks=float(payload.get("inventory_skew_ticks", 1.0)),
@@ -221,6 +243,9 @@ class StrategyConfig:
             spread_expanded_ticks=float(payload.get("spread_expanded_ticks", 4.0)),
             min_order_age_ms=int(payload.get("min_order_age_ms", 100)),
             microprice_streak_min=int(payload.get("microprice_streak_min", 3)),
+            maker_cancel_tape_1s_threshold=float(payload.get("maker_cancel_tape_1s_threshold", 0.15)),
+            maker_cancel_burst_threshold=float(payload.get("maker_cancel_burst_threshold", 0.25)),
+            maker_cancel_cancel_ratio_min=float(payload.get("maker_cancel_cancel_ratio_min", 0.60)),
             inventory_high_threshold=float(payload.get("inventory_high_threshold", 0.66)),
             inventory_high_multiplier=float(payload.get("inventory_high_multiplier", 1.5)),
             max_quote_drift_ticks=float(payload.get("max_quote_drift_ticks", 1.0)),
@@ -236,7 +261,7 @@ class StrategyConfig:
             scale_qty_by_score=bool(payload.get("scale_qty_by_score", False)),
             scale_qty_score_threshold=int(payload.get("scale_qty_score_threshold", 11)),
             scale_qty_multiplier=float(payload.get("scale_qty_multiplier", 1.5)),
-            use_vol_expansion_taker=bool(payload.get("use_vol_expansion_taker", False)),
+            use_vol_expansion_taker=bool(payload.get("use_vol_expansion_taker", True)),
             vol_expansion_spread_max_ticks=float(payload.get("vol_expansion_spread_max_ticks", 2.0)),
             tape_ofi_1s_min=float(payload.get("tape_ofi_1s_min", 0.0)),
             entry_selection_policy=str(payload.get("entry_selection_policy", "adaptive")),

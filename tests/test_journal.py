@@ -26,7 +26,14 @@ def _signal() -> SignalPacket:
         microprice=100.3, mid=100.5,
         obi_z=0.8, lob_ofi_z=0.5, tape_ofi_z=0.4,
         micro_momentum_z=0.3, microprice_tilt_z=0.6,
-        composite=0.55, integrated_ofi=0.20, trade_burst_score=0.10,
+        composite=0.55,
+        integrated_ofi=0.20,
+        tape_ofi_1s=0.18,
+        trade_burst_score=0.10,
+        bid_cancel_ratio=0.25,
+        ask_cancel_ratio=0.45,
+        wall_ask_consumed_ratio=0.60,
+        wall_bid_consumed_ratio=0.15,
     )
 
 
@@ -79,6 +86,11 @@ class TradeJournalTests(unittest.TestCase):
         # Signal columns present
         self.assertAlmostEqual(float(row["obi_z"]), 0.8, places=2)
         self.assertAlmostEqual(float(row["composite"]), 0.55, places=2)
+        self.assertAlmostEqual(float(row["integrated_ofi"]), 0.20, places=2)
+        self.assertAlmostEqual(float(row["tape_ofi_1s"]), 0.18, places=2)
+        self.assertAlmostEqual(float(row["trade_burst_score"]), 0.10, places=2)
+        self.assertAlmostEqual(float(row["ask_cancel_ratio"]), 0.45, places=2)
+        self.assertAlmostEqual(float(row["wall_ask_consumed_ratio"]), 0.60, places=2)
 
     def test_multiple_trades_append(self) -> None:
         """Each on_trade_closed appends a new row; does not overwrite."""

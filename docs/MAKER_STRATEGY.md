@@ -228,7 +228,7 @@ Maker 用法：
 | spread <= 1 tick | QUEUE | one_tick_queue |
 | 其他 | NORMAL | normal_flow |
 
-当前 Python v1 尚未完整实现 `MarketStateDetector`；`NORMAL/QUEUE/ABNORMAL` 是 Maker v2 升级方向。
+当前 Python 版本已经接入 `MarketStateDetector`；`market_state.enabled=true` 时，ABNORMAL 会阻止 maker 开仓，QUEUE 可用于报价模式和复盘分桶。
 
 ---
 
@@ -493,7 +493,7 @@ exit_intent.reason = "timeout_exit"
   vol_expansion = True（波动率异常扩张）
 ```
 
-这是 lollipop v2 的信号敏感退出扩展（当前 v1 只有固定 tick stop 和 timeout）。
+这是 lollipop 的信号敏感退出扩展；当前代码已有 flow-flip taker 逃生和 working-order 撤单保护，持仓后的主退出仍以 TP / timeout / stop 为核心。
 
 ### 7.4 Stranded Partial Fill
 
@@ -503,7 +503,7 @@ exit_intent.reason = "timeout_exit"
 - 不直接假设全撤无风险。
 - 后续由正常 OPEN 状态维护 take-profit quote，或风险退出。
 
-当前 Python v1 还没有完整 broker reconciliation，实盘前需要补齐订单快照和部分成交同步。
+当前 Python 版本已有 broker reconciliation 基础流程；实盘前仍需要用券商订单快照回放验证部分成交、残余库存和重连同步。
 
 ---
 
@@ -629,8 +629,20 @@ stale_quote > 2s
 | `maker_join_best` | true | true 时挂 best bid / best ask；false 时 retreat。 |
 | `maker_retreat_ticks` | 1.0 | `maker_join_best=false` 时退后的 tick 数。 |
 | `wall_consumed_ratio_min` | 0.60 | wall-break taker 的最低消耗比例。 |
+| `use_depth_thin_taker` | true | 启用盘口对手盘变薄 taker 触发。 |
+| `use_wall_break_taker` | true | 启用 wall-break taker 触发。 |
+| `use_cancel_imbalance_taker` | true | 启用 cancel-imbalance taker 触发。 |
+| `use_price_breakout_taker` | true | 启用 price-breakout taker 触发。 |
+| `use_vol_expansion_taker` | true | 启用 volatility-expansion taker 触发。 |
+| `opposite_depth_ratio_max` | 0.50 | 对手盘 best depth / 本方 best depth 的最大比例。 |
+| `cancel_imbalance_ratio_min` | 0.40 | cancel imbalance 的最低撤单比例。 |
+| `cancel_imbalance_extreme_ratio` | 0.80 | 极端撤单比例，达到后阻止追单。 |
+| `taker_burst_min` | 0.0 | taker depth / wall / cancel 触发的最小 burst 分数。 |
+| `maker_cancel_tape_1s_threshold` | 0.15 | working order 反向 1s tape 撤单阈值。 |
+| `maker_cancel_burst_threshold` | 0.25 | working order 反向 burst 撤单阈值。 |
+| `maker_cancel_cancel_ratio_min` | 0.60 | working order 本方队列撤单过快的撤单阈值。 |
 | `signal_expire_ms` | 500 | 信号时效（adverse selection 防护）。 |
-| `max_slip_ticks` | 1.0 | IOC taker 最大允许滑点 tick 数。 |
+| `max_slip_ticks` | 2.0 | IOC taker 最大允许滑点 tick 数；实盘默认挂到对手价外 2 ticks。 |
 
 ### 10.2 `SignalConfig`
 
@@ -682,13 +694,13 @@ stale_quote > 2s
 | 2 | Book Imbalance Maker | ✅ v1 已实现（entry score） | 最高 |
 | 3 | Microprice Maker | ✅ v1 已实现（entry score） | 最高 |
 | 4 | OFI 过滤 Maker | ✅ v1 已实现（entry score） | 最高 |
-| 5 | 动态点差 Maker | 🔧 v2：基于 mid_std_ticks 调整 half spread | 高 |
-| 6 | 库存偏斜 Maker | 🔧 v2：reservation_price + skew_ticks | 高 |
-| 7 | Fair Price / Alpha Tilt | 🔧 v2：composite z-score 驱动 fair_price | 高 |
-| 8 | Queue Defense Mode | 🔧 v2：spread <= 1 tick 时退后一档 | 高 |
-| 9 | Working Order 撤单逻辑 | 🔧 v2：alpha decay / flip / fair drift | 高 |
+| 5 | 动态点差 Maker | ✅ 已实现：基于 `mid_std_ticks` / `vol_expansion` 调整 half spread | 高 |
+| 6 | 库存偏斜 Maker | ✅ 已实现：reservation_price + skew_ticks | 高 |
+| 7 | Fair Price / Alpha Tilt | ✅ 已实现：composite 驱动 fair_price | 高 |
+| 8 | Queue Defense Mode | ✅ 已实现：薄队列退后一档，working order 可按队列变薄撤单 | 高 |
+| 9 | Working Order 撤单逻辑 | ✅ 已实现：alpha decay / flip / fair drift / tape / burst / cancel ratio | 高 |
 | 10 | 多层挂单 Maker | 📋 v3：近端小单，远端大单 | 中高 |
-| 11 | ATR-aware Position Sizing | 🔧 v2：波动大时减量 | 高 |
+| 11 | ATR-aware Position Sizing | ✅ 已实现：可按 score/vol 配置化缩放 | 高 |
 | 12 | Avellaneda-Stoikov 参数化 | 📋 v3：reservation + optimal spread 公式化 | 中高 |
 | 13 | GLFT 模型 | 📋 v3：order arrival intensity + half spread | 中高 |
 | 14 | 跨市场对冲 Maker | 📋 v4：日经 micro + 个股联动 | 中 |
@@ -728,7 +740,7 @@ if tape_ofi_strong_sell:
     不要挂 bid（你的买单被打后继续下跌）
 ```
 
-v2 扩展：将 Tape OFI 从入场确认提升为 working-order 实时撤单条件。
+当前代码已将 `tape_ofi_1s`、`trade_burst_score` 和 same-side cancel ratio 接入 working-order 实时撤单保护。
 
 ### 11.5 Hanging Orders（均值回归 Maker）
 
@@ -866,12 +878,12 @@ def on_board(book, trades, position, now_ns):
 
 建议按以下顺序从 v1 推进到 v2：
 
-1. 将 `MakerStrategy` 的 join/retreat 扩展为基于 `fair_price` + `reservation_price` 的动态报价。
-2. 引入 `composite` z-score 替代纯 raw score，把 alpha 和 inventory skew 纳入 maker price。
-3. 增加 working-order 撤单逻辑：alpha decay、alpha flip、fair drift、spread expanded、stale quote。
-4. 增加 `MarketStateDetector`（NORMAL/QUEUE/ABNORMAL），在 ABNORMAL 时禁止 maker 开仓。
-5. 增加 queue ahead 和 paper fill model，复盘 maker fill quality。
-6. 增加 dynamic spread（基于 `mid_std_ticks` 和 `vol_expansion`）。
+1. ✅ `MakerStrategy` 已从 join/retreat 扩展到 `fair_price` + `reservation_price` 动态报价。
+2. ✅ `composite`、inventory skew 和 fair drift 已进入 maker price / 撤单判断。
+3. ✅ working-order 撤单已覆盖 alpha decay、alpha flip、fair drift、spread expanded、stale quote、短窗口 tape、burst、queue/cancel 防守。
+4. ✅ `MarketStateDetector`（NORMAL/QUEUE/ABNORMAL）已接入，ABNORMAL 时禁止 maker 开仓。
+5. 🔧 queue ahead / paper fill model 仍建议继续加强，用于复盘 maker fill quality。
+6. ✅ dynamic spread 已基于 `mid_std_ticks` 和 `vol_expansion` 接入。
 7. 串联 lollipop active TP 的撤单/重挂/force-exit，避免 TP 和逃生单冲突。
 8. 增加 maker markout 日志，按 entry score、spread、queue、market state 分桶。
 9. 在 kabu 回放中验证 maker fill 后 100ms / 500ms / 1s markout，再考虑实盘上线。

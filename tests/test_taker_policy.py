@@ -356,7 +356,7 @@ class VolExpansionTakerTests(unittest.TestCase):
 
     def _make_vol_snap(self, spread_ticks: float = 1.0) -> BoardSnapshot:
         """Snapshot with configurable spread; ask = bid + spread."""
-        return _snap(bid=100.0, ask=100.0 + spread_ticks, bid_size=500, ask_size=100)
+        return _snap(bid=100.0, ask=100.0 + spread_ticks, bid_size=500, ask_size=500)
 
     def _make_vol_signal(self, vol_expansion: bool = True) -> SignalPacket:
         """Signal with directional OBI+tape+tilt all passing thresholds."""
@@ -383,7 +383,7 @@ class VolExpansionTakerTests(unittest.TestCase):
             vol_expansion=vol_expansion,
         )
 
-    def test_vol_expansion_disabled_by_default(self) -> None:
+    def test_vol_expansion_disabled_by_flag(self) -> None:
         """use_vol_expansion_taker=False → T-09 path inactive even with vol_expansion=True."""
         # Standard breakout checks will fail (opposite side not thin, no breakout_long)
         t = _make_taker(use_vol_expansion_taker=False)
@@ -391,8 +391,8 @@ class VolExpansionTakerTests(unittest.TestCase):
         sig = self._make_vol_signal(vol_expansion=True)
         decision = t.evaluate(snap, sig)
         # T-09 disabled → must hit taker_breakout (not T-09 path)
-        if not decision.allow:
-            self.assertIn("taker_breakout", decision.reason)
+        self.assertFalse(decision.allow)
+        self.assertIn("taker_breakout", decision.reason)
 
     def test_vol_expansion_triggers_entry_when_enabled(self) -> None:
         """T-09 enabled + vol_expansion=True + narrow spread + directional signals → entry allowed."""

@@ -266,7 +266,46 @@ This document records live-trading issues found during the kabu maker/taker work
 - `kabu_maker_taker/telemetry.py`
 - `tests/test_live_websocket.py`
 
+## 2026-05-18: WebSocket PUSH logs looked like REST market data
+
+### Symptom
+- Live stdout showed `live_reconciled`, `live_websocket_connected`, `live_websocket_reconnect`, and large `ignored_boards` values.
+- This made it look like行情可能不是 WebSocket，或者 `Connection timed out` meant kabu had stopped sending market data.
+
+### Cause
+- kabu market data still comes from WebSocket PUSH.
+- REST is used for token acquisition, `/kabusapi/register`, `/kabusapi/unregister`, and startup/reconnect order/position snapshots.
+- The official PUSH docs say WebSocket sends data for REST-registered symbols and only when values update: https://kabucom.github.io/kabusapi/ptal/push.html
+- In multi-symbol workers, one worker can receive PUSH boards for another registered symbol and filter them out.
+- During quiet market periods or lunch break, a receive timeout can happen while the worker is flat; this is an idle wait condition, not proof of REST polling.
+
+### Fix
+- `live_reconciled` stdout and runtime summary now include `source="rest_snapshot"`.
+- `live_websocket_connected`, `live_websocket_reconnect`, and `live_websocket_idle_timeout` now include `source="websocket_push"`.
+- WebSocket logs also include `symbol`, `trade_exchange`, `register_exchange`, and `recv_timeout_s`.
+- Preflight success summaries include `market_data_source="websocket_push"` and `register_source="rest_register"`.
+- `ignored_boards` is split into:
+- `ignored_symbol_mismatch`: PUSH board was for another symbol.
+- `ignored_invalid_quote`: PUSH board had missing/null/zero quote fields and was skipped.
+- `ignored_exchange_mismatch`: PUSH board venue did not match the allowed trading/register exchange mapping.
+- Runtime summary JSONL writes the same source fields so future AI agents can diagnose live logs without guessing.
+
+### Expected Behavior
+- `live_reconciled source=rest_snapshot` means startup or reconnect reconciliation used REST.
+- `live_websocket_* source=websocket_push` means market data is being received from the WebSocket PUSH channel.
+- Large `ignored_symbol_mismatch` means this worker is filtering other registered symbols, not that its own行情 is necessarily broken.
+- Large `ignored_invalid_quote` means kabu sent incomplete quote data; the worker waits for a valid board.
+- `live_websocket_idle_timeout has_exposure=false` means an empty-position worker will reconnect and keep waiting.
+
+### Files
+- `kabu_maker_taker/app.py`
+- `kabu_maker_taker/live_runtime.py`
+- `kabu_maker_taker/telemetry.py`
+- `tests/test_live_websocket.py`
+- `tests/test_kabu_rest.py`
+- `tests/test_telemetry.py`
+
 ## Verification
 - `python -m json.tool config.live.multi.json`
 - `python -m unittest discover -s tests -p "test_*.py"`
-- Latest full result: 413 tests OK.
+- Latest full result: 415 tests OK.

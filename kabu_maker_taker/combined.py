@@ -257,6 +257,7 @@ class CombinedMakerTakerStrategy:
                     order_age_ns=order_age_ns,
                     desired_price=desired_price,
                     board_stale=board_stale,
+                    same_side_top_qty=maker_diag.top_queue_qty if maker_diag is not None else 0,
                 )
                 if raw_cancel_signal:
                     allowed_cancel, blocked_reason = self.risk.can_send_cancel_signal(raw_cancel_signal, ts)
@@ -1047,7 +1048,10 @@ class CombinedMakerTakerStrategy:
 
     def _taker_setup_type(self, trigger: str, decision: EntryDecision) -> str:
         mapping = {
-            "depth_breakout": "taker_depth_breakout",
+            "depth_breakout": "taker_depth_thin",
+            "depth_thin": "taker_depth_thin",
+            "wall_break": "taker_wall_break",
+            "cancel_imbalance": "taker_cancel_imbalance",
             "price_breakout": "taker_price_breakout",
             "vol_expansion": "taker_vol_expansion",
         }
@@ -1064,7 +1068,7 @@ class CombinedMakerTakerStrategy:
         if not decision.allow:
             return 0
         score = 0
-        if trigger in {"depth_breakout", "price_breakout", "vol_expansion"}:
+        if trigger in {"depth_breakout", "depth_thin", "wall_break", "cancel_imbalance", "price_breakout", "vol_expansion"}:
             score += 2
         if exec_quality >= max(self.config.strategy.exec_quality_min_score, 8):
             score += 1

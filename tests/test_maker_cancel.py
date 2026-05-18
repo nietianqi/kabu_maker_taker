@@ -40,12 +40,17 @@ def _signal(
     composite: float = 0.5,
     obi_raw: float = 0.3,
     tape_ofi_raw: float = 0.2,
+    tape_ofi_1s: float = 0.0,
     lob_ofi_raw: float = 0.2,
     micro_momentum_raw: float = 0.1,
     microprice_tilt_raw: float = 0.1,
     microprice: float = 100.4,
     mid: float = 100.5,
     mid_std_ticks: float = 0.5,
+    integrated_ofi: float = 0.0,
+    trade_burst_score: float = 0.0,
+    bid_cancel_ratio: float = 0.0,
+    ask_cancel_ratio: float = 0.0,
 ) -> SignalPacket:
     return SignalPacket(
         ts_ns=0,
@@ -54,6 +59,7 @@ def _signal(
         obi_z=obi_raw * 2,
         tape_ofi_raw=tape_ofi_raw,
         tape_ofi_z=tape_ofi_raw * 2,
+        tape_ofi_1s=tape_ofi_1s,
         lob_ofi_raw=lob_ofi_raw,
         lob_ofi_z=lob_ofi_raw * 2,
         micro_momentum_raw=micro_momentum_raw,
@@ -63,6 +69,10 @@ def _signal(
         microprice=microprice,
         mid=mid,
         mid_std_ticks=mid_std_ticks,
+        integrated_ofi=integrated_ofi,
+        trade_burst_score=trade_burst_score,
+        bid_cancel_ratio=bid_cancel_ratio,
+        ask_cancel_ratio=ask_cancel_ratio,
     )
 
 
@@ -234,6 +244,64 @@ class QueueRetreatTests(unittest.TestCase):
             signal=sig, position=pos, max_inventory_qty=300,
         )
         self.assertEqual(intent.price, 100.0)
+
+
+# ---------------------------------------------------------------------------
+# Fix 2b: Working-order flow and queue defense
+# ---------------------------------------------------------------------------
+
+class WorkingOrderDefenseTests(unittest.TestCase):
+
+    def test_working_bid_cancels_on_short_window_sell_pressure(self) -> None:
+        maker = _maker(min_order_age_ms=0)
+        reason = maker.calc_cancel_reason(
+            _signal(tape_ofi_1s=-0.20),
+            1,
+            working_price=100.0,
+            order_age_ns=200_000_000,
+        )
+        self.assertEqual(reason, "tape_1s_flip")
+
+    def test_working_ask_cancels_on_short_window_buy_pressure(self) -> None:
+        maker = _maker(min_order_age_ms=0)
+        reason = maker.calc_cancel_reason(
+            _signal(tape_ofi_1s=0.20),
+            -1,
+            working_price=101.0,
+            order_age_ns=200_000_000,
+        )
+        self.assertEqual(reason, "tape_1s_flip")
+
+    def test_working_bid_cancels_on_opposite_burst(self) -> None:
+        maker = _maker(min_order_age_ms=0)
+        reason = maker.calc_cancel_reason(
+            _signal(trade_burst_score=-0.30),
+            1,
+            working_price=100.0,
+            order_age_ns=200_000_000,
+        )
+        self.assertEqual(reason, "burst_flip")
+
+    def test_working_ask_cancels_on_same_side_cancel_ratio(self) -> None:
+        maker = _maker(min_order_age_ms=0)
+        reason = maker.calc_cancel_reason(
+            _signal(ask_cancel_ratio=0.70),
+            -1,
+            working_price=101.0,
+            order_age_ns=10_000_000,
+        )
+        self.assertEqual(reason, "same_side_cancel")
+
+    def test_working_bid_cancels_when_queue_thins(self) -> None:
+        maker = _maker(queue_min_top_qty=300, min_order_age_ms=0)
+        reason = maker.calc_cancel_reason(
+            _signal(),
+            1,
+            working_price=100.0,
+            order_age_ns=10_000_000,
+            same_side_top_qty=100,
+        )
+        self.assertEqual(reason, "queue_thin")
 
 
 # ---------------------------------------------------------------------------

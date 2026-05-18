@@ -234,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         summary.update(_ignored_broker_open_orders_summary(broker_snapshot))
         print(
             json.dumps(
-                {"status": "live_reconciled", "summary": summary},
+                {"status": "live_reconciled", "source": "rest_snapshot", "summary": summary},
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -242,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_summary_writer.write(
             strategy=strategy,
             status="live_reconciled",
+            source="rest_snapshot",
             reason="",
             auth=live_executor.auth_context(),
             now_ns=broker_snapshot.ts_ns or time.time_ns(),

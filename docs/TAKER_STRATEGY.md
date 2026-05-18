@@ -279,11 +279,11 @@ OrderIntent(
 | 执行方式 | 状态 |
 | --- | --- |
 | 市价单 | 当前意图可直接映射，但滑点风险最高。 |
-| IOC aggressive limit | 后续扩展，建议用于控制最大滑点。 |
+| IOC aggressive limit | 已接入实盘适配器；`is_market` taker intent 会映射为 aggressive IOC limit。 |
 | FOK | 后续扩展，只适合必须全成且深度足够的场景。 |
 | 立即可成交限价单 | 后续扩展，可用 `best_ask + slip_ticks` 控制买入上限。 |
 
-建议实盘优先扩展 IOC aggressive limit：
+实盘 taker 默认使用 IOC aggressive limit：
 
 ```text
 buy_limit = best_ask + max_slip_ticks * tick_size
@@ -291,7 +291,7 @@ sell_limit = best_bid - max_slip_ticks * tick_size
 time_in_force = IOC
 ```
 
-在未实现 IOC 字段前，文档和日志必须把当前行为标记为 market-style taker intent。
+默认 `max_slip_ticks=2.0`，即做多挂到 `best_ask + 2 ticks`，做空/逃生挂到 `best_bid - 2 ticks`。日志仍保留 `is_market` intent 语义，但实盘执行层会按 `max_slip_ticks` 生成 IOC 限价单。
 
 ## 7. 出场模型
 
@@ -356,7 +356,7 @@ Taker 成本高，必须比 maker 更严格。当前系统已有以下过滤：
 | working entry | `entry_order_active` | 已有入场订单时拒绝重复开仓。 |
 | lollipop active | `lollipop.is_busy` | 持仓退出管理中拒绝新开仓。 |
 
-建议后续加入但当前未实现的过滤：
+仍建议重点复盘或继续强化的过滤：
 
 - order latency / cancel latency 异常熔断。
 - 连续亏损冷却。
@@ -382,6 +382,15 @@ Taker 成本高，必须比 maker 更严格。当前系统已有以下过滤：
 | `microprice_tilt_long` | microprice tilt 同向阈值。 |
 | `mom_long_threshold` | micro momentum 同向阈值。 |
 | `strong_signal_multiplier` | strong tape 倍数。 |
+| `use_depth_thin_taker` | 默认 true，启用盘口对手盘变薄触发。 |
+| `use_wall_break_taker` | 默认 true，启用墙被吃穿触发。 |
+| `use_cancel_imbalance_taker` | 默认 true，启用对手盘撤单失衡触发。 |
+| `use_price_breakout_taker` | 默认 true，启用短窗口价格突破触发。 |
+| `use_vol_expansion_taker` | 默认 true，启用波动率扩张触发。 |
+| `opposite_depth_ratio_max` | 默认 0.50，对手盘 best depth / 本方 best depth 的最大比例。 |
+| `cancel_imbalance_ratio_min` | 默认 0.40，cancel imbalance 的最低撤单比例。 |
+| `cancel_imbalance_extreme_ratio` | 默认 0.80，达到后阻止追单。 |
+| `taker_burst_min` | 默认 0.0，depth / wall / cancel 触发需要的最小 burst 分数。 |
 
 ### 9.2 `SignalConfig`
 
@@ -427,6 +436,8 @@ Taker 不能只看胜率，必须按成本复盘。
 每笔入场建议记录：
 
 - `entry_mode`
+- `setup_type`（`taker_depth_thin` / `taker_wall_break` / `taker_cancel_imbalance` / `taker_price_breakout` / `taker_vol_expansion`）
+- `selection_reason`
 - `entry_score`
 - `required_confirm`
 - `confirm_progress`
@@ -438,10 +449,13 @@ Taker 不能只看胜率，必须按成本复盘。
 - `signal.obi_raw`
 - `signal.lob_ofi_raw`
 - `signal.tape_ofi_raw`
+- `signal.tape_ofi_1s`
 - `signal.microprice_tilt_raw`
 - `signal.micro_momentum_raw`
 - `signal.integrated_ofi`
 - `signal.trade_burst_score`
+- `signal.wall_ask_consumed_ratio` / `signal.wall_bid_consumed_ratio`
+- `signal.ask_cancel_ratio` / `signal.bid_cancel_ratio`
 
 核心复盘指标：
 
@@ -480,12 +494,12 @@ avg_win_ticks * win_rate
 | T-01 | Weighted Book Imbalance | ✅ 已实现（OBI 组件） | 盘口单边失衡 |
 | T-02 | Tape OFI Taker | ✅ 已实现 | 主动成交流强劲 |
 | T-03 | Microprice Momentum | ✅ 已实现 | 微价格趋势延续 |
-| T-04 | Wall Break Taker | 🔧 规格已定义，待实现 | 大单墙被突破 |
-| T-05 | Cancel Imbalance Taker | 📋 规格已定义 | 流动性突然消失 |
-| T-06 | Breakout Taker | 📋 规格已定义 | 价格突破短期高低点 |
+| T-04 | Wall Break Taker | ✅ 已实现，默认参与交易 | 大单墙被突破 |
+| T-05 | Cancel Imbalance Taker | ✅ 已实现，默认参与交易；极端撤单比例会阻止追单 | 流动性突然消失 |
+| T-06 | Breakout Taker | ✅ 已实现，默认参与交易 | 价格突破短期高低点 |
 | T-07 | Cross-market Lead Taker | 📋 规格已定义 | 日经/期货领先个股 |
 | T-08 | Event-driven Taker | 📋 规格已定义 | 财报、新闻、政策 |
-| T-09 | Volatility Expansion Taker | 📋 规格已定义 | 波动率从压缩突然扩张 |
+| T-09 | Volatility Expansion Taker | ✅ 已实现，默认参与交易 | 波动率从压缩突然扩张 |
 | T-10 | Pullback Re-entry Taker | 📋 规格已定义 | 趋势中第一次回调后追入 |
 
 ---
@@ -840,7 +854,7 @@ ask_eaten_recently: ask_size 开始减少
 
 ## 12. IOC 执行规格
 
-当前 `OrderIntent` 只输出意图，实盘适配器应按以下规则映射执行方式：
+当前 `OrderIntent` 仍以 taker intent 表达入场意图，实盘适配器按以下规则映射执行方式：
 
 ### 12.1 标准 Taker → IOC Aggressive Limit
 
@@ -862,7 +876,7 @@ time_in_force = IOC
 
 | 场景 | 建议值 |
 |-----|-------|
-| 正常盘口，spread = 1 tick | 1 tick |
+| 正常盘口，spread = 1 tick | 2 ticks（当前默认，用 IOC 控制上限） |
 | 波动扩张，spread = 2 ticks | 2 ticks |
 | 突破扫盘场景 | 2–3 ticks |
 | 不允许滑点 | 0（退化为 Maker） |
@@ -1016,16 +1030,16 @@ consecutive_losses >= 3:
 
 建议按以下顺序推进：
 
-1. **执行适配器**：把 taker `OrderIntent` 映射为 IOC aggressive limit（见第 12 节规格）。
-2. **滑点字段**：记录 `reference_price`、实际成交价、`slippage_ticks`。
-3. **多窗口 tape**：500ms / 1s / 3s，分开统计 burst 和 sustained flow。
+1. ✅ **执行适配器**：taker `OrderIntent` 已映射为 IOC aggressive limit（见第 12 节规格）。
+2. ✅ **滑点字段**：记录 `reference_price`、实际成交价、`slippage_ticks`。
+3. ✅ **多窗口 tape**：已接入 `tape_ofi_1s`、burst 和 sustained flow 字段。
 4. **lollipop 回报**：TP 活跃单撤单后自动 reschedule 或 force exit。
-5. **Wall Break（T-04）**：先只做日志观测（记录墙识别和消耗），再进入交易打分。
-6. **Cancel Imbalance（T-05）**：配合 tape_ofi 阈值一起实验。
+5. ✅ **Wall Break（T-04）**：已进入交易触发，`setup_type=taker_wall_break`。
+6. ✅ **Cancel Imbalance（T-05）**：已进入交易触发，`setup_type=taker_cancel_imbalance`，极端比例默认阻断追单。
 7. **Cross-market Lead（T-07）**：先做开盘和权重股回放，验证 lead-lag 延迟后再实盘。
 8. **连续亏损熔断**：在 `RiskManager` 中加入 `consecutive_loss_cooling`。
 9. **Adverse selection markout**：在 journal 中按入场后 100ms / 500ms / 1s / 3s 记录 PnL。
-10. **Event-driven / Volatility（T-08、T-09）**：只在有新闻接入和 mid_std 扩展后开启。
+10. **Event-driven / Volatility（T-08、T-09）**：T-09 已基于 `vol_expansion` 默认启用；T-08 仍需新闻/事件源后再开启。
 
 当前 v1 的可实盘最小闭环是：
 

@@ -210,6 +210,10 @@ def _null_quote_websocket_payload(ts_ns: int, *, symbol: str = "9984", exchange:
     )
 
 
+def _json_stdout_lines(output: str) -> list[dict[str, object]]:
+    return [json.loads(line) for line in output.splitlines() if line.strip().startswith("{")]
+
+
 class LiveWebSocketTests(unittest.TestCase):
     def test_process_live_board_polls_traces_and_submits_entry(self) -> None:
         config = _config()
@@ -256,7 +260,18 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertEqual(executor.registered, 2)
         self.assertEqual(executor.unregistered, 2)
         self.assertEqual(executor.snapshots, 1)
-        self.assertIn("live_websocket_reconnect", stdout.getvalue())
+        rows = _json_stdout_lines(stdout.getvalue())
+        connected = next(row for row in rows if row["status"] == "live_websocket_connected")
+        reconnect = next(row for row in rows if row["status"] == "live_websocket_reconnect")
+        self.assertEqual(connected["source"], "websocket_push")
+        self.assertEqual(connected["symbol"], "9984")
+        self.assertEqual(connected["trade_exchange"], 27)
+        self.assertEqual(connected["register_exchange"], 1)
+        self.assertEqual(connected["recv_timeout_s"], 2.0)
+        self.assertEqual(reconnect["source"], "websocket_push")
+        self.assertEqual(reconnect["trade_exchange"], 27)
+        self.assertEqual(reconnect["register_exchange"], 1)
+        self.assertEqual(reconnect["recv_timeout_s"], 2.0)
 
     def test_websocket_flat_idle_timeout_reconnects_past_attempt_limit(self) -> None:
         config = _config(websocket_reconnect_attempts=0, websocket_reconnect_forever_when_flat=True)
@@ -284,6 +299,13 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertIn("live_websocket_idle_timeout", output)
         self.assertIn('"has_exposure":false', output)
         self.assertNotIn("websocket_reconnect_exhausted", output)
+        idle = next(row for row in _json_stdout_lines(output) if row["status"] == "live_websocket_idle_timeout")
+        self.assertEqual(idle["source"], "websocket_push")
+        self.assertEqual(idle["ignored_boards"], 0)
+        self.assertEqual(idle["ignored_symbol_mismatch"], 0)
+        self.assertEqual(idle["ignored_invalid_quote"], 0)
+        self.assertEqual(idle["ignored_exchange_mismatch"], 0)
+        self.assertEqual(idle["recv_timeout_s"], 2.0)
 
     def test_websocket_runtime_summary_records_connect_idle_and_halt(self) -> None:
         config = _config(websocket_reconnect_attempts=0, websocket_reconnect_forever_when_flat=True)
@@ -323,8 +345,19 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertIn("live_websocket_idle_timeout", statuses)
         self.assertIn("live_halted", statuses)
         idle = next(row for row in rows if row["status"] == "live_websocket_idle_timeout")
+        connected = next(row for row in rows if row["status"] == "live_websocket_connected")
+        self.assertEqual(connected["source"], "websocket_push")
+        self.assertEqual(connected["websocket"]["source"], "websocket_push")
+        self.assertEqual(connected["websocket"]["trade_exchange"], 27)
+        self.assertEqual(connected["websocket"]["register_exchange"], 1)
+        self.assertEqual(connected["websocket"]["recv_timeout_s"], 2.0)
+        self.assertEqual(idle["source"], "websocket_push")
+        self.assertEqual(idle["websocket"]["source"], "websocket_push")
         self.assertFalse(idle["websocket"]["has_exposure"])
         self.assertIn("ignored_boards", idle["websocket"])
+        self.assertIn("ignored_symbol_mismatch", idle["websocket"])
+        self.assertIn("ignored_invalid_quote", idle["websocket"])
+        self.assertIn("ignored_exchange_mismatch", idle["websocket"])
         self.assertIn("auth", idle)
 
     def test_websocket_forever_flat_does_not_hide_api_register_failure(self) -> None:
@@ -461,6 +494,10 @@ class LiveWebSocketTests(unittest.TestCase):
 
         self.assertTrue(ok, summary)
         self.assertEqual(summary["received_boards"], 2)
+        self.assertEqual(summary["market_data_source"], "websocket_push")
+        self.assertEqual(summary["register_source"], "rest_register")
+        self.assertEqual(summary["trade_exchange"], 27)
+        self.assertEqual(summary["register_exchange"], 1)
         self.assertEqual(executor.registered, 1)
         self.assertEqual(executor.unregistered, 1)
         self.assertEqual(executor.submitted, [])
@@ -483,6 +520,9 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertTrue(ok, summary)
         self.assertEqual(summary["received_boards"], 1)
         self.assertEqual(summary["ignored_boards"], 1)
+        self.assertEqual(summary["ignored_symbol_mismatch"], 1)
+        self.assertEqual(summary["ignored_invalid_quote"], 0)
+        self.assertEqual(summary["ignored_exchange_mismatch"], 0)
 
     def test_preflight_ignores_null_quote_boards_until_valid_quote(self) -> None:
         config = _config(websocket_preflight_messages=1, websocket_preflight_timeout_s=1.0)
@@ -500,6 +540,25 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertTrue(ok, summary)
         self.assertEqual(summary["received_boards"], 1)
         self.assertEqual(summary["ignored_boards"], 1)
+        self.assertEqual(summary["ignored_symbol_mismatch"], 0)
+        self.assertEqual(summary["ignored_invalid_quote"], 1)
+        self.assertEqual(summary["ignored_exchange_mismatch"], 0)
+
+    def test_preflight_counts_exchange_mismatch_boards(self) -> None:
+        config = _config(websocket_preflight_messages=1, websocket_preflight_timeout_s=1.0)
+        executor = FakeExecutor()
+        ws = SequenceWebSocket([_websocket_payload(time.time_ns(), exchange=3)])
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertFalse(ok)
+        self.assertEqual(summary["reason"], "exchange_mismatch")
+        self.assertEqual(summary["ignored_boards"], 1)
+        self.assertEqual(summary["ignored_symbol_mismatch"], 0)
+        self.assertEqual(summary["ignored_invalid_quote"], 0)
+        self.assertEqual(summary["ignored_exchange_mismatch"], 1)
+        self.assertEqual(summary["market_data_source"], "websocket_push")
+        self.assertEqual(summary["register_source"], "rest_register")
 
     def test_preflight_accepts_tse_board_for_sor_trading_exchange(self) -> None:
         config = AppConfig(

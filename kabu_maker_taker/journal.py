@@ -27,6 +27,9 @@ _TRADE_FIELDS = [
     "entry_price", "exit_price", "realized_pnl", "hold_ms",
     "exit_reason", "entry_mode",
     "obi_z", "lob_ofi_z", "tape_ofi_z", "momentum_z", "composite",
+    "integrated_ofi", "tape_ofi_1s", "trade_burst_score",
+    "bid_cancel_ratio", "ask_cancel_ratio",
+    "wall_ask_consumed_ratio", "wall_bid_consumed_ratio",
 ]
 _MARKOUT_FIELDS = [
     "entry_ts_jst", "exit_ts_jst", "symbol",
@@ -150,6 +153,13 @@ class TradeJournal:
             "tape_ofi_z": round(signal.tape_ofi_z, 4) if signal else 0.0,
             "momentum_z": round(signal.micro_momentum_z, 4) if signal else 0.0,
             "composite": round(signal.composite, 4) if signal else 0.0,
+            "integrated_ofi": round(signal.integrated_ofi, 4) if signal else 0.0,
+            "tape_ofi_1s": round(signal.tape_ofi_1s, 4) if signal else 0.0,
+            "trade_burst_score": round(signal.trade_burst_score, 4) if signal else 0.0,
+            "bid_cancel_ratio": round(signal.bid_cancel_ratio, 4) if signal else 0.0,
+            "ask_cancel_ratio": round(signal.ask_cancel_ratio, 4) if signal else 0.0,
+            "wall_ask_consumed_ratio": round(signal.wall_ask_consumed_ratio, 4) if signal else 0.0,
+            "wall_bid_consumed_ratio": round(signal.wall_bid_consumed_ratio, 4) if signal else 0.0,
         })
         self._trades_fh.flush()
 

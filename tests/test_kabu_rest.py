@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -8,9 +9,12 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
-from kabu_maker_taker.app import _handle_live_execution, _validate_live_config
+from kabu_maker_taker.app import _handle_live_execution, _validate_live_config, main as app_main
+from kabu_maker_taker.broker import BrokerReconciliationSnapshot
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
 from kabu_maker_taker.config import AppConfig, KabuConfig, OrderProfile, RiskConfig, StrategyConfig
 from kabu_maker_taker.execution.client import SHARED_KABU_TOKEN_ENABLED_ENV, SHARED_KABU_TOKEN_ENV
@@ -31,6 +35,8 @@ def _intent(
     client_order_id: str = "entry-1",
     reference_price: float = 1000.0,
     max_slip_ticks: float = 0.0,
+    setup_type: str = "",
+    selection_reason: str = "",
 ) -> OrderIntent:
     return OrderIntent(
         symbol="9984",
@@ -45,6 +51,8 @@ def _intent(
         reference_price=reference_price,
         max_slip_ticks=max_slip_ticks,
         client_order_id=client_order_id,
+        setup_type=setup_type,
+        selection_reason=selection_reason,
     )
 
 
@@ -56,6 +64,7 @@ class KabuConfigTests(unittest.TestCase):
         self.assertEqual(config.kabu.base_url, "http://localhost:18080")
         self.assertEqual(config.kabu.order_profile.mode, "margin")
         self.assertEqual(config.kabu.order_profile.account_type, 4)
+        self.assertEqual(config.strategy.max_slip_ticks, 2.0)
 
     def test_kabu_config_parses_profile_overrides(self) -> None:
         config = AppConfig.from_dict(
@@ -319,6 +328,30 @@ class KabuRestExecutorTests(unittest.TestCase):
         self.assertEqual(events[0].broker_order_id, "B-ENTRY")
         self.assertEqual(result.request_kind, "submit")
         self.assertGreaterEqual(result.latency_ms, 0.0)
+
+    def test_prepare_ioc_intent_preserves_setup_metadata(self) -> None:
+        config = AppConfig(
+            tick_size=1.0,
+            strategy=StrategyConfig(max_slip_ticks=1.0),
+            kabu=KabuConfig(api_password="pw", poll_interval_ms=0, order_profile=OrderProfile(front_order_type_ioc_limit=27)),
+        )
+        executor = KabuRestExecutor(config, client=self.FakeClient())  # type: ignore[arg-type]
+
+        prepared, front_order_type = executor._prepare_live_intent(
+            _intent(
+                is_market=True,
+                reference_price=1000.0,
+                max_slip_ticks=1.0,
+                setup_type="taker_depth_thin",
+                selection_reason="taker_urgent",
+            )
+        )
+
+        self.assertEqual(front_order_type, 27)
+        self.assertFalse(prepared.is_market)
+        self.assertEqual(prepared.price, 1001.0)
+        self.assertEqual(prepared.setup_type, "taker_depth_thin")
+        self.assertEqual(prepared.selection_reason, "taker_urgent")
 
     def test_live_position_snapshot_uses_broker_unknown_entry_mode(self) -> None:
         class PositionClient(self.FakeClient):
@@ -1501,6 +1534,56 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("missing or invalid ts_ns", completed.stderr)
+
+    def test_live_reconciled_logs_rest_snapshot_source(self) -> None:
+        class FakeLiveExecutor:
+            def __init__(self) -> None:
+                self.started = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def snapshot(self) -> BrokerReconciliationSnapshot:
+                return BrokerReconciliationSnapshot(ts_ns=1_700_000_000_000_000_000)
+
+            def auth_context(self) -> dict[str, object]:
+                return {"token_sha256_8": "abcd1234", "token_refresh_count": 0}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.json"
+            config = self._live_safe_config(
+                log_dir=str(tmp_path),
+                diagnostics={"runtime_summary_jsonl_path": "runtime_summary.jsonl"},
+            )
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            executor = FakeLiveExecutor()
+            stdout = io.StringIO()
+
+            with mock.patch("kabu_maker_taker.app.KabuRestExecutor", return_value=executor):
+                with mock.patch("kabu_maker_taker.app._validate_live_preflight_stamp", return_value=""):
+                    with mock.patch("kabu_maker_taker.app._run_websocket_live", return_value=0):
+                        with redirect_stdout(stdout):
+                            code = app_main(["--config", str(config_path), "--live", "--shadow"])
+
+            stdout_rows = [
+                json.loads(line)
+                for line in stdout.getvalue().splitlines()
+                if line.strip().startswith("{")
+            ]
+            reconciled = next(row for row in stdout_rows if row["status"] == "live_reconciled")
+            runtime_rows = [
+                json.loads(line)
+                for line in (tmp_path / "runtime_summary.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            runtime_reconciled = next(row for row in runtime_rows if row["status"] == "live_reconciled")
+
+        self.assertEqual(code, 0)
+        self.assertTrue(executor.started)
+        self.assertEqual(reconciled["source"], "rest_snapshot")
+        self.assertEqual(runtime_reconciled["source"], "rest_snapshot")
+        self.assertEqual(runtime_reconciled["auth"]["token_sha256_8"], "abcd1234")
 
 
 if __name__ == "__main__":

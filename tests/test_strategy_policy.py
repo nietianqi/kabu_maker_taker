@@ -101,6 +101,108 @@ class StrategyPolicyTests(unittest.TestCase):
         self.assertTrue(decision.allow)
         self.assertEqual(decision.entry_mode, "taker")
 
+    def test_depth_thin_trigger_is_classified(self) -> None:
+        config = StrategyConfig(taker_score_threshold=9, strong_signal_multiplier=1.5)
+        strategy = TakerStrategy(config)
+        signal = strong_long_signal()
+
+        decision = strategy.evaluate(self.snapshot, signal, now_ns=1)
+
+        self.assertTrue(decision.allow)
+        self.assertEqual(strategy.classify_entry_trigger(self.snapshot, signal, 1), "depth_thin")
+
+    def test_depth_thin_switch_disables_depth_trigger(self) -> None:
+        config = StrategyConfig(taker_score_threshold=9, use_depth_thin_taker=False)
+        decision = TakerStrategy(config).evaluate(self.snapshot, strong_long_signal(), now_ns=1)
+
+        self.assertFalse(decision.allow)
+        self.assertEqual(decision.reason, "taker_breakout")
+
+    def test_wall_break_trigger_is_classified_and_switchable(self) -> None:
+        balanced_depth = BoardSnapshot(
+            symbol="9984",
+            ts_ns=1,
+            bid=100.0,
+            ask=101.0,
+            bid_size=1000,
+            ask_size=1000,
+            bids=(Level(100.0, 1000),),
+            asks=(Level(101.0, 1000),),
+        )
+        signal = strong_long_signal(wall_ask_consumed=True, wall_ask_consumed_ratio=0.75)
+
+        enabled = TakerStrategy(StrategyConfig(taker_score_threshold=9))
+        disabled = TakerStrategy(StrategyConfig(taker_score_threshold=9, use_wall_break_taker=False))
+
+        self.assertTrue(enabled.evaluate(balanced_depth, signal, now_ns=1).allow)
+        self.assertEqual(enabled.classify_entry_trigger(balanced_depth, signal, 1), "wall_break")
+        self.assertFalse(disabled.evaluate(balanced_depth, signal, now_ns=1).allow)
+
+    def test_cancel_imbalance_trigger_is_classified_and_switchable(self) -> None:
+        balanced_depth = BoardSnapshot(
+            symbol="9984",
+            ts_ns=1,
+            bid=100.0,
+            ask=101.0,
+            bid_size=1000,
+            ask_size=1000,
+            bids=(Level(100.0, 1000),),
+            asks=(Level(101.0, 1000),),
+        )
+        signal = strong_long_signal(ask_cancel_ratio=0.45)
+
+        enabled = TakerStrategy(StrategyConfig(taker_score_threshold=9))
+        disabled = TakerStrategy(StrategyConfig(taker_score_threshold=9, use_cancel_imbalance_taker=False))
+
+        self.assertTrue(enabled.evaluate(balanced_depth, signal, now_ns=1).allow)
+        self.assertEqual(enabled.classify_entry_trigger(balanced_depth, signal, 1), "cancel_imbalance")
+        self.assertFalse(disabled.evaluate(balanced_depth, signal, now_ns=1).allow)
+
+    def test_cancel_imbalance_extreme_blocks_chasing(self) -> None:
+        signal = strong_long_signal(ask_cancel_ratio=0.80)
+        decision = TakerStrategy(StrategyConfig(taker_score_threshold=9)).evaluate(
+            self.snapshot,
+            signal,
+            now_ns=1,
+        )
+
+        self.assertFalse(decision.allow)
+        self.assertEqual(decision.reason, "taker_cancel_extreme")
+
+    def test_price_breakout_trigger_is_classified(self) -> None:
+        balanced_depth = BoardSnapshot(
+            symbol="9984",
+            ts_ns=1,
+            bid=100.0,
+            ask=101.0,
+            bid_size=1000,
+            ask_size=1000,
+            bids=(Level(100.0, 1000),),
+            asks=(Level(101.0, 1000),),
+        )
+        signal = strong_long_signal(breakout_long=True, trade_burst_score=0.0)
+        strategy = TakerStrategy(StrategyConfig(taker_score_threshold=9))
+
+        self.assertTrue(strategy.evaluate(balanced_depth, signal, now_ns=1).allow)
+        self.assertEqual(strategy.classify_entry_trigger(balanced_depth, signal, 1), "price_breakout")
+
+    def test_vol_expansion_trigger_is_classified_by_default(self) -> None:
+        balanced_depth = BoardSnapshot(
+            symbol="9984",
+            ts_ns=1,
+            bid=100.0,
+            ask=101.0,
+            bid_size=1000,
+            ask_size=1000,
+            bids=(Level(100.0, 1000),),
+            asks=(Level(101.0, 1000),),
+        )
+        signal = strong_long_signal(vol_expansion=True, trade_burst_score=0.0)
+        strategy = TakerStrategy(StrategyConfig(taker_score_threshold=9))
+
+        self.assertTrue(strategy.evaluate(balanced_depth, signal, now_ns=1).allow)
+        self.assertEqual(strategy.classify_entry_trigger(balanced_depth, signal, 1), "vol_expansion")
+
 
 if __name__ == "__main__":
     unittest.main()

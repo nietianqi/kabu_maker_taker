@@ -408,6 +408,7 @@ class MakerStrategy:
         order_age_ns: int = 0,
         desired_price: float = 0.0,
         board_stale: bool = False,
+        same_side_top_qty: int = 0,
     ) -> str:
         """Return a non-empty string if the working maker order should be cancelled.
 
@@ -431,9 +432,21 @@ class MakerStrategy:
                 return "spread_expanded"
         if self.config.max_pending_ms > 0 and order_age_ns >= self.config.max_pending_ms * 1_000_000:
             return "pending_timeout"
+        if self.config.maker_cancel_cancel_ratio_min > 0:
+            same_side_cancel_ratio = signal.bid_cancel_ratio if sign > 0 else signal.ask_cancel_ratio
+            if same_side_cancel_ratio >= self.config.maker_cancel_cancel_ratio_min:
+                return "same_side_cancel"
+        if self.config.queue_min_top_qty > 0 and 0 < same_side_top_qty < self.config.queue_min_top_qty:
+            return "queue_thin"
         # Min order age guard — suppress signal-based cancels during order's min lifetime
         if self.config.min_order_age_ms > 0 and 0 < order_age_ns < self.config.min_order_age_ms * 1_000_000:
             return ""
+        if self.config.maker_cancel_tape_1s_threshold > 0:
+            if sign * signal.tape_ofi_1s <= -self.config.maker_cancel_tape_1s_threshold:
+                return "tape_1s_flip"
+        if self.config.maker_cancel_burst_threshold > 0:
+            if sign * signal.trade_burst_score <= -self.config.maker_cancel_burst_threshold:
+                return "burst_flip"
         if sign * signal.composite < -self.config.alpha_exit_threshold:
             return "alpha_flip"
         if abs(signal.composite) < self.config.alpha_entry_threshold * 0.6:
@@ -590,10 +603,9 @@ class TakerStrategy:
             if q < self.config.exec_quality_min_score:
                 return EntryDecision(False, f"exec_quality:{q}/{self.config.exec_quality_min_score}")
 
-        if not self._breakout_ready(snapshot, signal, diagnostics.direction):
-            if not self._breakout_price_ready(signal, diagnostics.direction):
-                if not self._vol_expansion_ready(snapshot, signal, diagnostics.direction):
-                    return EntryDecision(False, "taker_breakout")
+        trigger, trigger_blocked_reason = self._classify_entry_trigger(snapshot, signal, diagnostics.direction)
+        if not trigger:
+            return EntryDecision(False, trigger_blocked_reason or "taker_breakout")
 
         # Determine required confirmation ticks
         confirm = max(self.config.taker_confirm_ticks, 1)
@@ -676,13 +688,8 @@ class TakerStrategy:
     def classify_entry_trigger(self, snapshot: BoardSnapshot, signal: SignalPacket, direction: int) -> str:
         if direction == 0:
             return ""
-        if self._breakout_ready(snapshot, signal, direction):
-            return "depth_breakout"
-        if self._breakout_price_ready(signal, direction):
-            return "price_breakout"
-        if self._vol_expansion_ready(snapshot, signal, direction):
-            return "vol_expansion"
-        return ""
+        trigger, _ = self._classify_entry_trigger(snapshot, signal, direction)
+        return trigger
 
     def _best_direction(self, snapshot: BoardSnapshot, signal: SignalPacket) -> EntryLayerDiagnostics | None:
         long_diag = entry_layer_diagnostics(snapshot, signal, self.config, direction=1)
@@ -692,41 +699,84 @@ class TakerStrategy:
         return long_diag if long_diag.entry_score >= short_diag.entry_score else short_diag
 
     def _breakout_ready(self, snapshot: BoardSnapshot, signal: SignalPacket, direction: int) -> bool:
+        trigger, _ = self._classify_entry_trigger(snapshot, signal, direction)
+        return trigger in {"depth_thin", "wall_break", "cancel_imbalance"}
+
+    def _classify_entry_trigger(
+        self,
+        snapshot: BoardSnapshot,
+        signal: SignalPacket,
+        direction: int,
+    ) -> tuple[str, str]:
+        if direction == 0:
+            return "", ""
         sign = 1 if direction > 0 else -1
-        same = _same_side_depth(snapshot, direction)
-        opposite = _opposite_depth(snapshot, direction)
-        if same <= 0:
-            return False
+        cancel_ratio = self._opposite_cancel_ratio(signal, sign)
+        if (
+            self.config.cancel_imbalance_extreme_ratio > 0
+            and cancel_ratio >= self.config.cancel_imbalance_extreme_ratio
+        ):
+            return "", "taker_cancel_extreme"
+        if self._wall_break_ready(signal, sign) and self._trigger_confirmations_ready(signal, sign):
+            return "wall_break", ""
+        if self._cancel_imbalance_ready(signal, sign) and self._trigger_confirmations_ready(signal, sign):
+            return "cancel_imbalance", ""
+        if self._depth_thin_ready(snapshot, direction) and self._trigger_confirmations_ready(signal, sign):
+            return "depth_thin", ""
+        if self._breakout_price_ready(signal, direction):
+            return "price_breakout", ""
+        if self._vol_expansion_ready(snapshot, signal, direction):
+            return "vol_expansion", ""
+        return "", ""
 
-        # Original thin-opposite condition (T-01)
-        opposite_thin = opposite <= 0.5 * same
-
-        # T-04: wall on opposite side was consumed by trades
-        wall_consumed = (
-            (sign > 0 and signal.wall_ask_consumed
-             and signal.wall_ask_consumed_ratio >= self.config.wall_consumed_ratio_min)
-            or (sign < 0 and signal.wall_bid_consumed
-                and signal.wall_bid_consumed_ratio >= self.config.wall_consumed_ratio_min)
-        )
-
-        # T-05: opposite side liquidity rapidly cancelled
-        cancel_side_clearing = (
-            (sign > 0 and signal.ask_cancel_ratio >= 0.40)
-            or (sign < 0 and signal.bid_cancel_ratio >= 0.40)
-        )
-
-        depth_clear = opposite_thin or wall_consumed or cancel_side_clearing
-
+    def _trigger_confirmations_ready(self, signal: SignalPacket, sign: int) -> bool:
         strong_tape = sign * signal.tape_ofi_raw >= self.config.tape_imbalance_long * max(
             self.config.strong_signal_multiplier, 1.0
         )
         tilt = sign * signal.microprice_tilt_raw >= self.config.microprice_tilt_long
         integrated = sign * signal.integrated_ofi > 0.0
-        burst = sign * signal.trade_burst_score > 0.0
-        return depth_clear and strong_tape and tilt and integrated and burst
+        return strong_tape and tilt and integrated and self._burst_ready(signal, sign)
+
+    def _burst_ready(self, signal: SignalPacket, sign: int) -> bool:
+        return sign * signal.trade_burst_score > max(self.config.taker_burst_min, 0.0)
+
+    def _opposite_cancel_ratio(self, signal: SignalPacket, sign: int) -> float:
+        return signal.ask_cancel_ratio if sign > 0 else signal.bid_cancel_ratio
+
+    def _depth_thin_ready(self, snapshot: BoardSnapshot, direction: int) -> bool:
+        if not self.config.use_depth_thin_taker:
+            return False
+        same = _same_side_depth(snapshot, direction)
+        opposite = _opposite_depth(snapshot, direction)
+        if same <= 0:
+            return False
+        return opposite <= max(self.config.opposite_depth_ratio_max, 0.0) * same
+
+    def _wall_break_ready(self, signal: SignalPacket, sign: int) -> bool:
+        if not self.config.use_wall_break_taker:
+            return False
+        return (
+            (
+                sign > 0
+                and signal.wall_ask_consumed
+                and signal.wall_ask_consumed_ratio >= self.config.wall_consumed_ratio_min
+            )
+            or (
+                sign < 0
+                and signal.wall_bid_consumed
+                and signal.wall_bid_consumed_ratio >= self.config.wall_consumed_ratio_min
+            )
+        )
+
+    def _cancel_imbalance_ready(self, signal: SignalPacket, sign: int) -> bool:
+        if not self.config.use_cancel_imbalance_taker:
+            return False
+        return self._opposite_cancel_ratio(signal, sign) >= self.config.cancel_imbalance_ratio_min
 
     def _breakout_price_ready(self, signal: SignalPacket, direction: int) -> bool:
         """T-06: price-breakout alternative entry path."""
+        if not self.config.use_price_breakout_taker:
+            return False
         sign = 1 if direction > 0 else -1
         strong_tape = sign * signal.tape_ofi_raw >= self.config.tape_imbalance_long * max(
             self.config.strong_signal_multiplier, 1.0
@@ -734,7 +784,7 @@ class TakerStrategy:
         tape = sign * signal.tape_ofi_raw > self.config.tape_imbalance_long
         tilt = sign * signal.microprice_tilt_raw >= self.config.microprice_tilt_long
         integrated = sign * signal.integrated_ofi > 0.0
-        burst_or_strong_tape = sign * signal.trade_burst_score > 0.0 or strong_tape
+        burst_or_strong_tape = self._burst_ready(signal, sign) or strong_tape
         if sign > 0:
             return (
                 signal.breakout_long

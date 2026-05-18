@@ -33,6 +33,15 @@ def _result(
         obi_z=0.8, lob_ofi_z=0.5, tape_ofi_z=0.4,
         micro_momentum_z=0.3, microprice_tilt_z=0.6,
         composite=0.55,
+        integrated_ofi=0.22,
+        tape_ofi_1s=0.18,
+        trade_burst_score=0.31,
+        wall_ask_consumed_ratio=0.66,
+        wall_bid_consumed_ratio=0.12,
+        bid_cancel_ratio=0.20,
+        ask_cancel_ratio=0.45,
+        breakout_long=True,
+        vol_expansion=True,
     )
     return StrategyResult(
         intent=OrderIntent(
@@ -92,7 +101,7 @@ def _result(
         taker_candidate_allow=True,
         taker_candidate_reason="",
         taker_candidate_score=10,
-        taker_candidate_trigger="depth_breakout",
+        taker_candidate_trigger="depth_thin",
         taker_candidate_exec_quality=9,
     )
 
@@ -153,12 +162,19 @@ class DecisionTraceWriterTests(unittest.TestCase):
         self.assertEqual(row["position_qty"], 100)
         self.assertEqual(row["position_side"], 1)
         self.assertAlmostEqual(row["signal_composite"], 0.55, places=2)
+        self.assertAlmostEqual(row["signal_integrated_ofi"], 0.22, places=2)
+        self.assertAlmostEqual(row["signal_tape_ofi_1s"], 0.18, places=2)
+        self.assertAlmostEqual(row["signal_trade_burst_score"], 0.31, places=2)
+        self.assertAlmostEqual(row["signal_wall_ask_consumed_ratio"], 0.66, places=2)
+        self.assertAlmostEqual(row["signal_ask_cancel_ratio"], 0.45, places=2)
+        self.assertTrue(row["signal_breakout_long"])
+        self.assertTrue(row["signal_vol_expansion"])
         self.assertEqual(row["market_state_reason"], "normal_flow")
         self.assertEqual(row["maker_quote_mode"], "PASSIVE_FAIR_VALUE")
         self.assertEqual(row["setup_type"], "maker_passive_fair")
         self.assertEqual(row["selection_reason"], "maker_edge_better")
         self.assertTrue(row["maker_candidate_allow"])
-        self.assertEqual(row["taker_candidate_trigger"], "depth_breakout")
+        self.assertEqual(row["taker_candidate_trigger"], "depth_thin")
 
     def test_ts_jst_present_for_nonzero_timestamp(self) -> None:
         """ts_jst is a non-empty string when now_ns > 0."""
@@ -258,6 +274,7 @@ class RuntimeSummaryWriterTests(unittest.TestCase):
         writer.write(
             strategy=StrategyStub(),
             status="live_heartbeat",
+            source="websocket_push",
             websocket={"connected": True},
             auth={
                 "token": "SECRET-TOKEN",
@@ -273,6 +290,7 @@ class RuntimeSummaryWriterTests(unittest.TestCase):
         row = json.loads(path.read_text(encoding="utf-8").strip())
         self.assertEqual(row["type"], "runtime_summary")
         self.assertEqual(row["status"], "live_heartbeat")
+        self.assertEqual(row["source"], "websocket_push")
         self.assertEqual(row["symbol"], "9984")
         self.assertEqual(row["position"]["qty"], 100)
         self.assertEqual(row["active_orders"][0]["client_order_id"], "entry-1")

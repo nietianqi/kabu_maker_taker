@@ -153,6 +153,7 @@ def _write_runtime_summary(
     *,
     strategy: CombinedMakerTakerStrategy,
     status: str,
+    source: str = "",
     reason: str = "",
     websocket: dict[str, object] | None = None,
     auth: dict[str, object] | None = None,
@@ -167,6 +168,7 @@ def _write_runtime_summary(
     write_fn(
         strategy=strategy,
         status=status,
+        source=source,
         reason=reason,
         websocket=websocket,
         auth=auth,
@@ -265,9 +267,21 @@ def perform_live_preflight(
     )
     seen = 0
     ignored_boards = 0
+    ignored_symbol_mismatch = 0
+    ignored_invalid_quote = 0
+    ignored_exchange_mismatch = 0
     stale_boards = 0
     last_stale_ms = 0.0
     last_summary: dict[str, object] = {}
+
+    def ignored_diagnostics() -> dict[str, object]:
+        return {
+            "ignored_boards": ignored_boards,
+            "ignored_symbol_mismatch": ignored_symbol_mismatch,
+            "ignored_invalid_quote": ignored_invalid_quote,
+            "ignored_exchange_mismatch": ignored_exchange_mismatch,
+        }
+
     ws = None
     registered = False
     try:
@@ -290,22 +304,23 @@ def perform_live_preflight(
             target_error = _snapshot_target_error(snapshot, config)
             if target_error == "symbol_mismatch":
                 ignored_boards += 1
+                ignored_symbol_mismatch += 1
                 continue
             if target_error:
+                ignored_boards += 1
+                if target_error == "exchange_mismatch":
+                    ignored_exchange_mismatch += 1
                 return False, {
                     "reason": target_error,
                     "received_boards": seen,
-                    "ignored_boards": ignored_boards,
+                    **ignored_diagnostics(),
                     "symbol": snapshot.symbol,
                     "exchange": snapshot.exchange,
-                    "trade_exchange": config.exchange,
-                    "register_exchange": effective_register_exchange(
-                        config.exchange,
-                        config.kabu.register_exchange,
-                    ),
+                    **_preflight_source_fields(config),
                 }
             if not snapshot.valid:
                 ignored_boards += 1
+                ignored_invalid_quote += 1
                 continue
             stale_detail, stale_ms = _websocket_snapshot_stale_warning(snapshot, config, now_ns=now_ns)
             if stale_detail:
@@ -316,7 +331,7 @@ def perform_live_preflight(
                 return False, {
                     "reason": error,
                     "received_boards": seen,
-                    "ignored_boards": ignored_boards,
+                    **ignored_diagnostics(),
                     "stale_boards": stale_boards,
                     "last_stale_ms": last_stale_ms,
                 }
@@ -329,20 +344,19 @@ def perform_live_preflight(
                     "reason": "market_state_abnormal",
                     "market_state_reason": diagnostics.reason,
                     "received_boards": seen,
-                    "ignored_boards": ignored_boards,
+                    **ignored_diagnostics(),
                     "stale_boards": stale_boards,
                     "last_stale_ms": last_stale_ms,
                 }
             seen += 1
             last_summary = {
                 "received_boards": seen,
-                "ignored_boards": ignored_boards,
+                **ignored_diagnostics(),
                 "stale_boards": stale_boards,
                 "last_stale_ms": last_stale_ms,
                 "symbol": snapshot.symbol,
                 "exchange": snapshot.exchange,
-                "trade_exchange": config.exchange,
-                "register_exchange": effective_register_exchange(config.exchange, config.kabu.register_exchange),
+                **_preflight_source_fields(config),
                 "bid": snapshot.bid,
                 "ask": snapshot.ask,
                 "market_state": market_state.value,
@@ -360,7 +374,7 @@ def perform_live_preflight(
             return False, {
                 "reason": "websocket_preflight_timeout",
                 "received_boards": seen,
-                "ignored_boards": ignored_boards,
+                **ignored_diagnostics(),
                 "stale_boards": stale_boards,
                 "last_stale_ms": last_stale_ms,
                 "required_boards": required,
@@ -371,7 +385,7 @@ def perform_live_preflight(
             "reason": "websocket_bad_message",
             "detail": str(exc),
             "received_boards": seen,
-            "ignored_boards": ignored_boards,
+            **ignored_diagnostics(),
             "stale_boards": stale_boards,
             "last_stale_ms": last_stale_ms,
         }
@@ -388,7 +402,7 @@ def perform_live_preflight(
             "reason": "websocket_preflight_timeout",
             "detail": str(exc),
             "received_boards": seen,
-            "ignored_boards": ignored_boards,
+            **ignored_diagnostics(),
             "stale_boards": stale_boards,
             "last_stale_ms": last_stale_ms,
             "required_boards": required,
@@ -398,7 +412,7 @@ def perform_live_preflight(
             "reason": "websocket_preflight_failed",
             "detail": str(exc),
             "received_boards": seen,
-            "ignored_boards": ignored_boards,
+            **ignored_diagnostics(),
             "stale_boards": stale_boards,
             "last_stale_ms": last_stale_ms,
         }
@@ -484,8 +498,19 @@ def run_websocket_live(
     last_snapshot = _empty_snapshot(config, time.time_ns())
     last_error = ""
     ignored_boards = 0
+    ignored_symbol_mismatch = 0
+    ignored_invalid_quote = 0
+    ignored_exchange_mismatch = 0
     attempt = 0
     next_heartbeat_at = time.monotonic()
+
+    def ignored_diagnostics() -> dict[str, object]:
+        return {
+            "ignored_boards": ignored_boards,
+            "ignored_symbol_mismatch": ignored_symbol_mismatch,
+            "ignored_invalid_quote": ignored_invalid_quote,
+            "ignored_exchange_mismatch": ignored_exchange_mismatch,
+        }
 
     def halt(reason: str, *, cleanup: dict[str, object] | None = None, websocket: dict[str, object] | None = None) -> int:
         return live_halted(
@@ -507,7 +532,7 @@ def run_websocket_live(
             ws = _open_websocket(config, websocket_factory=websocket_factory)
             print(
                 json.dumps(
-                    {"status": "live_websocket_connected", "attempt": attempt},
+                    {"status": "live_websocket_connected", **_websocket_log_fields(config), "attempt": attempt},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -516,7 +541,8 @@ def run_websocket_live(
                 runtime_summary_writer,
                 strategy=strategy,
                 status="live_websocket_connected",
-                websocket={"connected": True, "attempt": attempt},
+                source="websocket_push",
+                websocket={**_websocket_log_fields(config), "connected": True, "attempt": attempt},
                 auth=_executor_auth_context(executor),
             )
             while True:
@@ -531,8 +557,12 @@ def run_websocket_live(
                 target_error = _snapshot_target_error(snapshot, config)
                 if target_error == "symbol_mismatch":
                     ignored_boards += 1
+                    ignored_symbol_mismatch += 1
                     continue
                 if target_error:
+                    ignored_boards += 1
+                    if target_error == "exchange_mismatch":
+                        ignored_exchange_mismatch += 1
                     cleanup = _fault_cleanup(
                         strategy,
                         executor,
@@ -547,10 +577,11 @@ def run_websocket_live(
                             f"register_exchange={effective_register_exchange(config.exchange, config.kabu.register_exchange)}"
                         ),
                     )
-                    cleanup["ignored_boards"] = ignored_boards
+                    cleanup.update(ignored_diagnostics())
                     return halt(f"websocket_{target_error}", cleanup=cleanup)
                 if not snapshot.valid:
                     ignored_boards += 1
+                    ignored_invalid_quote += 1
                     continue
                 last_snapshot = snapshot
                 freshness_error = _websocket_snapshot_fatal_time_error(snapshot, config, now_ns=now_ns)
@@ -587,11 +618,13 @@ def run_websocket_live(
                         strategy=strategy,
                         status="live_heartbeat",
                         websocket={
+                            **_websocket_log_fields(config),
                             "connected": True,
                             "attempt": attempt,
-                            "ignored_boards": ignored_boards,
+                            **ignored_diagnostics(),
                             "last_target_board_age_ms": _last_target_board_age_ms(snapshot, now_ns=now_ns),
                         },
+                        source="websocket_push",
                         auth=_executor_auth_context(executor),
                         now_ns=now_ns,
                     )
@@ -632,7 +665,7 @@ def run_websocket_live(
             if exhausted and not can_wait_flat:
                 return halt(
                     "websocket_reconnect_exhausted",
-                    cleanup={"last_error": last_error, "ignored_boards": ignored_boards},
+                    cleanup={"last_error": last_error, **ignored_diagnostics()},
                 )
             reconnect_error = _reconcile_before_reconnect(strategy, executor)
             if reconnect_error:
@@ -664,10 +697,10 @@ def run_websocket_live(
                 json.dumps(
                     {
                         "status": "live_websocket_idle_timeout" if exhausted else "live_websocket_reconnect",
-                        "symbol": config.symbol,
+                        **_websocket_log_fields(config),
                         "attempt": attempt + 1,
                         "reason": last_error,
-                        "ignored_boards": ignored_boards,
+                        **ignored_diagnostics(),
                         "last_target_board_age_ms": _last_target_board_age_ms(last_snapshot, now_ns=time.time_ns()),
                         "has_exposure": False,
                     },
@@ -679,11 +712,13 @@ def run_websocket_live(
                 runtime_summary_writer,
                 strategy=strategy,
                 status="live_websocket_idle_timeout" if exhausted else "live_websocket_reconnect",
+                source="websocket_push",
                 reason=last_error,
                 websocket={
+                    **_websocket_log_fields(config),
                     "connected": False,
                     "attempt": attempt + 1,
-                    "ignored_boards": ignored_boards,
+                    **ignored_diagnostics(),
                     "last_target_board_age_ms": _last_target_board_age_ms(last_snapshot, now_ns=time.time_ns()),
                     "has_exposure": False,
                 },
@@ -1021,6 +1056,25 @@ def _websocket_recv_timeout_s(config: AppConfig) -> float:
     board_timeout_ms = config.risk.stale_board_ms if config.risk.stale_board_ms > 0 else 0
     quote_timeout_ms = config.risk.stale_quote_ms if config.risk.stale_quote_ms > 0 else 0
     return max(board_timeout_ms, quote_timeout_ms, 1000) / 1000.0
+
+
+def _websocket_log_fields(config: AppConfig) -> dict[str, object]:
+    return {
+        "source": "websocket_push",
+        "symbol": config.symbol,
+        "trade_exchange": config.exchange,
+        "register_exchange": effective_register_exchange(config.exchange, config.kabu.register_exchange),
+        "recv_timeout_s": _websocket_recv_timeout_s(config),
+    }
+
+
+def _preflight_source_fields(config: AppConfig) -> dict[str, object]:
+    return {
+        "market_data_source": "websocket_push",
+        "register_source": "rest_register",
+        "trade_exchange": config.exchange,
+        "register_exchange": effective_register_exchange(config.exchange, config.kabu.register_exchange),
+    }
 
 
 def _empty_snapshot(config: AppConfig, ts_ns: int) -> BoardSnapshot:

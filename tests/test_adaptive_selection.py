@@ -103,15 +103,15 @@ class AdaptiveEntrySelectionTests(unittest.TestCase):
         self.assertTrue(selection.taker_decision.allow)
         self.assertGreaterEqual(selection.maker_edge_ticks, 0.25)
 
-    def test_adaptive_chooses_taker_when_depth_breakout_is_urgent(self) -> None:
+    def test_adaptive_chooses_taker_when_depth_thin_is_urgent(self) -> None:
         strategy = _strategy()
-        _patch_candidates(strategy, taker_trigger="depth_breakout", taker_exec_quality=9)
+        _patch_candidates(strategy, taker_trigger="depth_thin", taker_exec_quality=9)
 
         selection = strategy._select_entry(_snapshot(), _signal(), 1_000_000_000)
 
         self.assertEqual(selection.decision.entry_mode, ENTRY_MODE_TAKER)
         self.assertEqual(selection.selection_reason, "taker_urgent")
-        self.assertEqual(selection.setup_type, "taker_depth_breakout")
+        self.assertEqual(selection.setup_type, "taker_depth_thin")
 
     def test_adaptive_chooses_taker_when_maker_edge_is_too_low(self) -> None:
         strategy = _strategy()
@@ -134,7 +134,7 @@ class AdaptiveEntrySelectionTests(unittest.TestCase):
 
     def test_maker_priority_policy_prefers_maker_even_when_taker_is_urgent(self) -> None:
         strategy = _strategy(entry_selection_policy="maker_priority")
-        _patch_candidates(strategy, taker_trigger="depth_breakout", taker_exec_quality=9)
+        _patch_candidates(strategy, taker_trigger="depth_thin", taker_exec_quality=9)
 
         selection = strategy._select_entry(_snapshot(), _signal(), 1_000_000_000)
 

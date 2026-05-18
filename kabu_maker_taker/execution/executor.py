@@ -166,6 +166,8 @@ class KabuRestExecutor:
                 reference_price=intent.reference_price,
                 max_slip_ticks=intent.max_slip_ticks,
                 client_order_id=intent.client_order_id,
+                setup_type=intent.setup_type,
+                selection_reason=intent.selection_reason,
             ),
             self.config.kabu.order_profile.front_order_type_ioc_limit,
         )
