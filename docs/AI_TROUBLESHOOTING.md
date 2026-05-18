@@ -167,7 +167,43 @@ This document records live-trading issues found during the kabu maker/taker work
 - If a later valid board arrives before timeout, preflight succeeds and reports the invalid board in `ignored_boards`.
 - If only null/invalid boards arrive, preflight times out with `websocket_preflight_timeout` and a nonzero `ignored_boards` count.
 
+## 2026-05-18: flat workers stopped after WebSocket idle timeout
+
+### Symptom
+- Launcher preflight passed and both workers started.
+- WebSocket connected, then reconnected once after `Connection timed out`.
+- After the configured reconnect attempts were exhausted, the worker emitted:
+- `live_halted reason=websocket_reconnect_exhausted cleanup.last_error="Connection timed out"`
+- The launcher then stopped every symbol because one worker exited with return code `3`.
+
+### Cause
+- Live config used `kabu.websocket_reconnect_attempts=1`.
+- In flat state, kabu PUSH can be quiet or repeatedly timeout without meaning the strategy has live exposure.
+- The old worker loop treated an exhausted receive timeout the same as a dangerous live disconnect and returned `websocket_reconnect_exhausted`.
+- Launcher behavior is intentionally strict: any nonzero live worker exit stops the whole multi-symbol run.
+
+### Fix
+- Added `kabu.websocket_reconnect_forever_when_flat`.
+- Live example configs enable it so a flat worker keeps unregistering, re-registering, reconnecting, and waiting for the next valid board.
+- The forever loop is only allowed when `_has_live_exposure(strategy)==False`.
+- It only applies to WebSocket idle/timeout/disconnect style errors. REST/API failures such as register 401 still halt after the configured attempts.
+- If a position or active entry/exit order exists, WebSocket failure still emits `websocket_disconnected` and goes through fault cleanup.
+- Flat idle reconnect logs `live_websocket_idle_timeout` with `symbol`, `attempt`, `ignored_boards`, `last_target_board_age_ms`, and `has_exposure=false`.
+
+### Files
+- `kabu_maker_taker/config.py`
+- `kabu_maker_taker/live_runtime.py`
+- `config.live.multi.example.json`
+- `config.live.shadow.example.json`
+- `tests/test_live_websocket.py`
+- `tests/test_kabu_rest.py`
+
+### Expected Behavior
+- With no position and no active orders, repeated WebSocket receive timeouts no longer stop the worker.
+- With any position or active order, WebSocket loss still stops live trading and starts cleanup.
+- REST/API failures are not hidden by the flat forever-reconnect setting.
+
 ## Verification
 - `python -m json.tool config.live.multi.json`
 - `python -m unittest discover -s tests -p "test_*.py"`
-- Latest full result: 396 tests OK.
+- Latest full result: 400 tests OK.

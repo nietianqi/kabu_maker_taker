@@ -17,6 +17,7 @@
     "poll_interval_ms": 250,
     "websocket_url": "",
     "websocket_reconnect_attempts": 3,
+    "websocket_reconnect_forever_when_flat": false,
     "websocket_preflight_messages": 3,
     "websocket_preflight_timeout_s": 15.0,
     "live_preflight_max_age_minutes": 30,

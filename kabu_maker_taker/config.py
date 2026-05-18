@@ -407,6 +407,7 @@ class KabuConfig:
     register_exchange: int = 0
     websocket_url: str = ""
     websocket_reconnect_attempts: int = 3
+    websocket_reconnect_forever_when_flat: bool = False
     websocket_preflight_messages: int = 3
     websocket_preflight_timeout_s: float = 15.0
     live_preflight_max_age_minutes: int = 30
@@ -426,6 +427,7 @@ class KabuConfig:
             register_exchange=int(payload.get("register_exchange", 0)),
             websocket_url=str(payload.get("websocket_url", "")),
             websocket_reconnect_attempts=int(payload.get("websocket_reconnect_attempts", 3)),
+            websocket_reconnect_forever_when_flat=bool(payload.get("websocket_reconnect_forever_when_flat", False)),
             websocket_preflight_messages=int(payload.get("websocket_preflight_messages", 3)),
             websocket_preflight_timeout_s=float(payload.get("websocket_preflight_timeout_s", 15.0)),
             live_preflight_max_age_minutes=int(payload.get("live_preflight_max_age_minutes", 30)),

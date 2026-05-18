@@ -18,6 +18,7 @@
     "register_exchange": 0,
     "websocket_url": "",
     "websocket_reconnect_attempts": 1,
+    "websocket_reconnect_forever_when_flat": true,
     "websocket_preflight_messages": 3,
     "websocket_preflight_timeout_s": 15.0,
     "live_preflight_max_age_minutes": 30,

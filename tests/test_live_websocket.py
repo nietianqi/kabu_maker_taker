@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 from kabu_maker_taker.broker import BrokerOpenOrderSnapshot, BrokerPositionSnapshot, BrokerReconciliationSnapshot
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
 from kabu_maker_taker.config import AppConfig, KabuConfig, MarketStateConfig, RiskConfig, StrategyConfig
+from kabu_maker_taker.execution import KabuApiError
 from kabu_maker_taker.kabu_rest import LiveExecutionResult
 from kabu_maker_taker.live_runtime import (
     perform_live_preflight,
@@ -24,6 +25,7 @@ from kabu_maker_taker.models import (
     EntryDecision,
     Level,
     MarketState,
+    OrderIntent,
     OrderStatus,
     SignalPacket,
 )
@@ -149,6 +151,20 @@ class RaisingWebSocket:
         pass
 
 
+class BadMessageWebSocket:
+    def recv(self):
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+class RegisterFailingExecutor(FakeExecutor):
+    def register_market_data(self) -> None:
+        self.registered += 1
+        raise KabuApiError("register failed", status=401)
+
+
 class SequenceWebSocket:
     def __init__(self, payloads) -> None:
         self.payloads = list(payloads)
@@ -239,6 +255,110 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertEqual(executor.unregistered, 2)
         self.assertEqual(executor.snapshots, 1)
         self.assertIn("live_websocket_reconnect", stdout.getvalue())
+
+    def test_websocket_flat_idle_timeout_reconnects_past_attempt_limit(self) -> None:
+        config = _config(websocket_reconnect_attempts=0, websocket_reconnect_forever_when_flat=True)
+        strategy = CombinedMakerTakerStrategy(config)
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+        calls = 0
+
+        def factory(_url, timeout=0):
+            _ = timeout
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                return SequenceWebSocket([])
+            return BadMessageWebSocket()
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            code = run_websocket_live(strategy, executor, config, tracer, websocket_factory=factory)
+
+        output = stdout.getvalue()
+        self.assertEqual(code, 3)
+        self.assertEqual(calls, 3)
+        self.assertEqual(executor.registered, 3)
+        self.assertEqual(executor.snapshots, 2)
+        self.assertIn("live_websocket_idle_timeout", output)
+        self.assertIn('"has_exposure":false', output)
+        self.assertNotIn("websocket_reconnect_exhausted", output)
+
+    def test_websocket_forever_flat_does_not_hide_api_register_failure(self) -> None:
+        config = _config(websocket_reconnect_attempts=0, websocket_reconnect_forever_when_flat=True)
+        strategy = CombinedMakerTakerStrategy(config)
+        executor = RegisterFailingExecutor()
+        tracer = FakeTracer()
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            code = run_websocket_live(
+                strategy,
+                executor,
+                config,
+                tracer,
+                websocket_factory=lambda *_args, **_kwargs: BadMessageWebSocket(),
+            )
+
+        output = stdout.getvalue()
+        self.assertEqual(code, 3)
+        self.assertEqual(executor.registered, 1)
+        self.assertEqual(executor.snapshots, 0)
+        self.assertIn("websocket_reconnect_exhausted", output)
+        self.assertNotIn("live_websocket_idle_timeout", output)
+
+    def test_websocket_timeout_halts_with_position_even_when_flat_reconnect_enabled(self) -> None:
+        config = _config(websocket_reconnect_attempts=0, websocket_reconnect_forever_when_flat=True)
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.restore_position(side=1, qty=100, avg_price=100.0, now_ns=time.time_ns(), manage_exit=False)
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            code = run_websocket_live(
+                strategy,
+                executor,
+                config,
+                tracer,
+                websocket_factory=lambda *_args, **_kwargs: RaisingWebSocket(),
+            )
+
+        self.assertEqual(code, 3)
+        self.assertIn('"reason":"websocket_disconnected"', stdout.getvalue())
+        self.assertNotIn("live_websocket_idle_timeout", stdout.getvalue())
+
+    def test_websocket_timeout_halts_with_active_order_even_when_flat_reconnect_enabled(self) -> None:
+        config = _config(websocket_reconnect_attempts=0, websocket_reconnect_forever_when_flat=True)
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.orders.add_intent(
+            OrderIntent(
+                symbol="9984",
+                exchange=27,
+                side=1,
+                qty=100,
+                price=100.0,
+                is_market=False,
+                strategy="maker",
+                reason="test_entry",
+                score=1,
+                reference_price=100.0,
+            ),
+            role="entry",
+            now_ns=time.time_ns(),
+        )
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            code = run_websocket_live(
+                strategy,
+                executor,
+                config,
+                tracer,
+                websocket_factory=lambda *_args, **_kwargs: RaisingWebSocket(),
+            )
+
+        self.assertEqual(code, 3)
+        self.assertIn('"reason":"websocket_disconnected"', stdout.getvalue())
+        self.assertNotIn("live_websocket_idle_timeout", stdout.getvalue())
 
     def test_board_snapshot_uses_quote_timestamps_for_websocket_payload(self) -> None:
         now_ns = time.time_ns()

@@ -439,11 +439,13 @@ def run_websocket_live(
     websocket_factory: Callable[..., object] | None = None,
     shadow: bool = False,
 ) -> int:
-    attempts = max(config.kabu.websocket_reconnect_attempts, 0) + 1
+    max_attempts = max(config.kabu.websocket_reconnect_attempts, 0) + 1
     last_snapshot = _empty_snapshot(config, time.time_ns())
     last_error = ""
     ignored_boards = 0
-    for attempt in range(attempts):
+    attempt = 0
+    while True:
+        attempt += 1
         ws = None
         registered = False
         try:
@@ -452,7 +454,7 @@ def run_websocket_live(
             ws = _open_websocket(config, websocket_factory=websocket_factory)
             print(
                 json.dumps(
-                    {"status": "live_websocket_connected", "attempt": attempt + 1},
+                    {"status": "live_websocket_connected", "attempt": attempt},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -548,7 +550,13 @@ def run_websocket_live(
                         shadow=shadow,
                     ),
                 )
-            if attempt >= attempts - 1:
+            exhausted = attempt >= max_attempts
+            can_wait_flat = (
+                exhausted
+                and config.kabu.websocket_reconnect_forever_when_flat
+                and _is_websocket_idle_disconnect(exc)
+            )
+            if exhausted and not can_wait_flat:
                 return live_halted(
                     strategy,
                     "websocket_reconnect_exhausted",
@@ -583,7 +591,15 @@ def run_websocket_live(
                 )
             print(
                 json.dumps(
-                    {"status": "live_websocket_reconnect", "attempt": attempt + 2, "reason": last_error},
+                    {
+                        "status": "live_websocket_idle_timeout" if exhausted else "live_websocket_reconnect",
+                        "symbol": config.symbol,
+                        "attempt": attempt + 1,
+                        "reason": last_error,
+                        "ignored_boards": ignored_boards,
+                        "last_target_board_age_ms": _last_target_board_age_ms(last_snapshot, now_ns=time.time_ns()),
+                        "has_exposure": False,
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -599,12 +615,6 @@ def run_websocket_live(
                     executor.unregister_market_data()
                 except KabuApiError:
                     pass
-    return live_halted(
-        strategy,
-        "websocket_reconnect_exhausted",
-        cleanup={"last_error": last_error, "ignored_boards": ignored_boards},
-    )
-
 
 def process_live_board(
     strategy: CombinedMakerTakerStrategy,
@@ -920,6 +930,37 @@ def _empty_snapshot(config: AppConfig, ts_ns: int) -> BoardSnapshot:
         bid_size=0,
         ask_size=0,
     )
+
+
+def _last_target_board_age_ms(snapshot: BoardSnapshot, *, now_ns: int) -> float:
+    if not snapshot.valid or snapshot.ts_ns <= 0:
+        return 0.0
+    return max((now_ns - snapshot.ts_ns) / 1_000_000, 0.0)
+
+
+def _is_websocket_idle_disconnect(exc: Exception) -> bool:
+    if isinstance(exc, KabuApiError):
+        return False
+    if isinstance(exc, TimeoutError):
+        return True
+    exc_name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    if "timeout" in exc_name or "connectionclosed" in exc_name:
+        return True
+    retryable_fragments = (
+        "connection timed out",
+        "timed out",
+        "receive timeout",
+        "recv timeout",
+        "connection closed",
+        "connection is already closed",
+        "disconnected",
+        "remote host",
+        "forcibly closed",
+        "10053",
+        "10054",
+    )
+    return any(fragment in message for fragment in retryable_fragments)
 
 
 def _preflight_snapshot_error(snapshot: BoardSnapshot, config: AppConfig, *, now_ns: int) -> str:

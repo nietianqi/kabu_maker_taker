@@ -67,6 +67,7 @@ class KabuConfigTests(unittest.TestCase):
                     "poll_interval_ms": 0,
                     "websocket_url": "ws://localhost:18081/kabusapi/websocket",
                     "websocket_reconnect_attempts": 5,
+                    "websocket_reconnect_forever_when_flat": True,
                     "register_exchange": 3,
                     "order_profile": {
                         "mode": "cash",
@@ -82,6 +83,7 @@ class KabuConfigTests(unittest.TestCase):
         self.assertEqual(config.kabu.api_password, "secret")
         self.assertEqual(config.kabu.websocket_url, "ws://localhost:18081/kabusapi/websocket")
         self.assertEqual(config.kabu.websocket_reconnect_attempts, 5)
+        self.assertTrue(config.kabu.websocket_reconnect_forever_when_flat)
         self.assertEqual(config.kabu.register_exchange, 3)
         self.assertEqual(config.kabu.startup_open_order_policy, "reject")
         self.assertEqual(config.kabu.order_profile.mode, "cash")
