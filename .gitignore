@@ -16,6 +16,7 @@ env/
 logs/
 config.json
 config.live.multi.json
+live_arm*.txt
 
 .claude/
 .idea/
