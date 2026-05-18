@@ -53,7 +53,7 @@
     "maker_retreat_ticks": 1.0,
     "wall_consumed_ratio_min": 0.60,
     "signal_expire_ms": 500,
-    "max_slip_ticks": 1.0,
+    "max_slip_ticks": 0.0,
     "fair_value_beta": 0.75,
     "max_fair_shift_ticks": 3.0,
     "inventory_skew_ticks": 1.0,
@@ -145,10 +145,10 @@
   },
   "lollipop": {
     "maker_tp_ticks": 2.0,
-    "taker_tp_ticks": 3.0,
+    "taker_tp_ticks": 2.0,
     "maker_max_hold_seconds": 45,
     "taker_max_hold_seconds": 30,
-    "tp_delay_ms": 50,
+    "tp_delay_ms": 0,
     "max_retries": 5,
     "stop_loss_ticks": 0.0
   },
