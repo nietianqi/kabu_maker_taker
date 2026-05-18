@@ -438,6 +438,20 @@ class KabuConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DiagnosticsConfig:
+    runtime_summary_jsonl_path: str = ""
+    heartbeat_interval_s: int = 15
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "DiagnosticsConfig":
+        payload = payload or {}
+        return cls(
+            runtime_summary_jsonl_path=str(payload.get("runtime_summary_jsonl_path", "")),
+            heartbeat_interval_s=int(payload.get("heartbeat_interval_s", 15)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     symbol: str = "9984"
     exchange: int = 27
@@ -450,6 +464,7 @@ class AppConfig:
     lollipop: LollipopConfig = field(default_factory=LollipopConfig)
     market_state: MarketStateConfig = field(default_factory=MarketStateConfig)
     kabu: KabuConfig = field(default_factory=KabuConfig)
+    diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
     # Trade journal: write trades.csv + markouts.csv to log_dir
     log_dir: str = "logs"
     enable_journal: bool = False
@@ -473,6 +488,7 @@ class AppConfig:
             lollipop=LollipopConfig.from_dict(payload.get("lollipop")),
             market_state=MarketStateConfig.from_dict(payload.get("market_state")),
             kabu=KabuConfig.from_dict(payload.get("kabu")),
+            diagnostics=DiagnosticsConfig.from_dict(payload.get("diagnostics")),
             log_dir=str(payload.get("log_dir", "logs")),
             enable_journal=bool(payload.get("enable_journal", False)),
             enable_decision_trace=bool(payload.get("enable_decision_trace", False)),

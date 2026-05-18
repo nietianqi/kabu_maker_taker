@@ -18,6 +18,7 @@ from kabu_maker_taker.launcher import (
     _run_workers,
     build_child_specs,
     materialize_symbol_config,
+    validate_account_risk,
 )
 
 
@@ -104,6 +105,51 @@ class LauncherConfigTests(unittest.TestCase):
 
             self.assertIn("--shadow", shadow_specs[0].args)
             self.assertIn("--preflight-live", preflight_specs[0].args)
+
+    def test_account_risk_disabled_keeps_legacy_launcher_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = _payload()
+            payload["generated_config_dir"] = str(Path(tmp) / "generated")
+            payload["account_risk"] = {
+                "enabled": False,
+                "max_total_inventory_qty": 1,
+                "max_total_notional": 1,
+            }
+            specs = build_child_specs(payload, mode="real", config_path=Path(tmp) / "config.live.multi.json")
+
+            validate_account_risk(payload, specs)
+
+    def test_account_risk_rejects_total_inventory_over_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = _payload()
+            payload["generated_config_dir"] = str(Path(tmp) / "generated")
+            payload["account_risk"] = {
+                "enabled": True,
+                "max_total_inventory_qty": 100,
+                "max_total_notional": 0,
+            }
+            specs = build_child_specs(payload, mode="real", config_path=Path(tmp) / "config.live.multi.json")
+
+            with self.assertRaises(ValueError) as ctx:
+                validate_account_risk(payload, specs)
+
+        self.assertIn("max_total_inventory_qty exceeded", str(ctx.exception))
+
+    def test_account_risk_rejects_total_notional_over_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = _payload()
+            payload["generated_config_dir"] = str(Path(tmp) / "generated")
+            payload["account_risk"] = {
+                "enabled": True,
+                "max_total_inventory_qty": 0,
+                "max_total_notional": 400000,
+            }
+            specs = build_child_specs(payload, mode="real", config_path=Path(tmp) / "config.live.multi.json")
+
+            with self.assertRaises(ValueError) as ctx:
+                validate_account_risk(payload, specs)
+
+        self.assertIn("max_total_notional exceeded", str(ctx.exception))
 
     def test_arm_real_workers_creates_and_cleans_temporary_arm_files(self) -> None:
         old_cwd = Path.cwd()

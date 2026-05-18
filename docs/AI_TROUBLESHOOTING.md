@@ -203,7 +203,70 @@ This document records live-trading issues found during the kabu maker/taker work
 - With any position or active order, WebSocket loss still stops live trading and starts cleanup.
 - REST/API failures are not hidden by the flat forever-reconnect setting.
 
+## 2026-05-18: borrowed diagnostics and auth retry from kabu_micro_edge_c
+
+### Symptom
+- Python workers had useful JSON stdout, but no compact per-symbol runtime summary file for other agents to inspect after a live run.
+- REST 401/403 recovery existed only for the startup shared-token snapshot path.
+- Multi-symbol launcher had per-worker risk caps but no startup check for aggregate configured account exposure.
+
+### Comparison
+- `D:\kabu_micro_edge_c\include\kabu_micro_edge\diagnostics.hpp` writes compact runtime summaries.
+- `D:\kabu_micro_edge_c\include\kabu_micro_edge\app\runtime.hpp` retries 401/403 by refreshing token once.
+- `D:\kabu_micro_edge_c\config.example.json` includes diagnostics heartbeat and account-risk fields.
+- Python keeps its multi-worker launcher and only borrows these safety/diagnostic pieces.
+
+### Fix
+- Added `diagnostics.runtime_summary_jsonl_path` and `diagnostics.heartbeat_interval_s`.
+- Added `RuntimeSummaryWriter`; live examples write `runtime_summary.jsonl` under each worker `log_dir`.
+- Runtime summary includes `websocket`, `position`, `active_orders`, `metrics`, `risk`, `auth`, and `consistency`.
+- `auth` only records safe fields: `shared_token`, `token_source`, `token_sha256_8`, and `token_refresh_count`.
+- Added generic one-shot 401/403 token refresh retry for `snapshot/register/unregister/submit/cancel/poll/positions/open_order_snapshots`.
+- `poll_order_events()` now uses one full `/orders` query when more than one active order exists, then matches by broker order id locally.
+- Added root-level launcher `account_risk.enabled/max_total_inventory_qty/max_total_notional` static validation.
+
+### Files
+- `kabu_maker_taker/config.py`
+- `kabu_maker_taker/telemetry.py`
+- `kabu_maker_taker/execution/executor.py`
+- `kabu_maker_taker/launcher.py`
+- `config.live.multi.example.json`
+- `config.live.shadow.example.json`
+- `docs/KABU_MICRO_EDGE_C_COMPARISON.md`
+- `tests/test_kabu_rest.py`
+- `tests/test_launcher.py`
+- `tests/test_telemetry.py`
+
+### Expected Behavior
+- A worker can recover once from 401/403 without exposing the raw token.
+- Persistent auth failure still returns the original live-safe halt/error path.
+- 429/5xx and missing `OrderId` are not retried as auth errors.
+- `account_risk` only blocks unsafe startup configuration; it is not realtime cross-worker account risk.
+
+## 2026-05-18: live consistency guard added
+
+### Symptom
+- Some dangerous local state contradictions were only visible indirectly through later order or position behavior.
+
+### Fix
+- Added `CombinedMakerTakerStrategy.status_snapshot()` and `consistency_issues()`.
+- The live board path checks consistency after poll, after strategy decision, and after submit/cancel branches.
+- High-severity issues return `consistency_violation` and go through `live_halted`.
+
+### High-Severity Issues
+- Active exit order while local position is flat.
+- Active exit side does not reduce current position.
+- Active exit quantity exceeds current position quantity.
+- Order cumulative quantity exceeds intent quantity.
+- Position quantity exceeds `risk.max_inventory_qty`.
+
+### Files
+- `kabu_maker_taker/combined.py`
+- `kabu_maker_taker/live_runtime.py`
+- `kabu_maker_taker/telemetry.py`
+- `tests/test_live_websocket.py`
+
 ## Verification
 - `python -m json.tool config.live.multi.json`
 - `python -m unittest discover -s tests -p "test_*.py"`
-- Latest full result: 400 tests OK.
+- Latest full result: 413 tests OK.

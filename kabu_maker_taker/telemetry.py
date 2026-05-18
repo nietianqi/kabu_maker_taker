@@ -13,8 +13,10 @@ Set ``enabled=False`` (via ``config.enable_decision_trace = false``) to make
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Any
 
 from .models import PositionState, StrategyResult
 
@@ -120,3 +122,103 @@ class DecisionTraceWriter:
             self._fh.flush()
             self._fh.close()
             self._fh = None
+
+
+class RuntimeSummaryWriter:
+    """Append compact live-runtime health snapshots to a JSONL file."""
+
+    def __init__(
+        self,
+        *,
+        log_dir: str,
+        symbol: str,
+        path: str = "",
+        enabled: bool = True,
+        strict: bool = False,
+    ) -> None:
+        self.enabled = enabled and bool(str(path).strip())
+        self.symbol = symbol
+        self._fh = None
+        if not self.enabled:
+            return
+        try:
+            raw_path = Path(path)
+            log_path = raw_path if raw_path.is_absolute() else Path(log_dir) / raw_path
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = log_path.open("a", encoding="utf-8")
+        except OSError:
+            if strict:
+                raise
+            self.enabled = False
+
+    def write(
+        self,
+        *,
+        strategy: Any,
+        status: str,
+        reason: str = "",
+        websocket: dict[str, Any] | None = None,
+        auth: dict[str, Any] | None = None,
+        cleanup: dict[str, Any] | None = None,
+        now_ns: int = 0,
+    ) -> None:
+        if not self.enabled or self._fh is None:
+            return
+        ts_ns = now_ns if now_ns > 0 else time.time_ns()
+        strategy_snapshot = _strategy_status_snapshot(strategy)
+        row = {
+            "type": "runtime_summary",
+            "status": status,
+            "reason": reason,
+            "ts_ns": ts_ns,
+            "ts_jst": datetime.fromtimestamp(ts_ns / 1e9, tz=JST).strftime("%Y-%m-%dT%H:%M:%S.%f"),
+            "symbol": self.symbol,
+            "websocket": websocket or {},
+            "position": strategy_snapshot.get("position", {}),
+            "active_orders": strategy_snapshot.get("active_orders", []),
+            "metrics": strategy_snapshot.get("metrics", {}),
+            "risk": strategy_snapshot.get("risk", {}),
+            "auth": _safe_auth_context(auth or {}),
+            "consistency": strategy_snapshot.get("consistency", {}),
+        }
+        if cleanup:
+            row["cleanup"] = cleanup
+        self._fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.flush()
+            self._fh.close()
+            self._fh = None
+
+
+def _strategy_status_snapshot(strategy: Any) -> dict[str, Any]:
+    snapshot_fn = getattr(strategy, "status_snapshot", None)
+    if callable(snapshot_fn):
+        return snapshot_fn()
+    position = getattr(strategy, "position", PositionState())
+    orders = getattr(getattr(strategy, "orders", None), "active", lambda: [])()
+    metrics = getattr(getattr(strategy, "metrics", None), "to_dict", lambda: {})()
+    return {
+        "position": {
+            "side": getattr(position, "side", 0),
+            "qty": getattr(position, "qty", 0),
+            "avg_price": getattr(position, "avg_price", 0.0),
+        },
+        "active_orders": [getattr(order, "to_dict", lambda: {})() for order in orders],
+        "metrics": metrics,
+        "risk": {},
+        "consistency": {"ok": True, "issues": []},
+    }
+
+
+def _safe_auth_context(auth: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    allowed_token_fields = {"shared_token", "token_source", "token_sha256_8", "token_refresh_count"}
+    for key, value in auth.items():
+        normalized = str(key).lower()
+        if "token" in normalized and key not in allowed_token_fields:
+            continue
+        safe[key] = value
+    return safe

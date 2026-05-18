@@ -95,6 +95,17 @@ class KabuConfigTests(unittest.TestCase):
 
         self.assertEqual(config.kabu.startup_open_order_policy, "ignore")
 
+    def test_diagnostics_config_defaults_disabled_and_parses_overrides(self) -> None:
+        default_config = AppConfig.from_dict({})
+        live_config = AppConfig.from_dict(
+            {"diagnostics": {"runtime_summary_jsonl_path": "runtime_summary.jsonl", "heartbeat_interval_s": 7}}
+        )
+
+        self.assertEqual(default_config.diagnostics.runtime_summary_jsonl_path, "")
+        self.assertEqual(default_config.diagnostics.heartbeat_interval_s, 15)
+        self.assertEqual(live_config.diagnostics.runtime_summary_jsonl_path, "runtime_summary.jsonl")
+        self.assertEqual(live_config.diagnostics.heartbeat_interval_s, 7)
+
     def test_order_profile_defaults_ioc_limit_type(self) -> None:
         config = AppConfig.from_dict({"symbol": "9984"})
 
@@ -433,6 +444,139 @@ class KabuRestExecutorTests(unittest.TestCase):
             executor.auth_context()["token_sha256_8"],
             hashlib.sha256(b"WORKER-TOKEN").hexdigest()[:8],
         )
+        self.assertEqual(executor.auth_context()["token_refresh_count"], 1)
+
+    def test_submit_refreshes_token_once_after_401(self) -> None:
+        class Submit401Client(self.FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.get_token_calls = 0
+                self.submit_calls = 0
+
+            def get_token(self, password: str) -> str:
+                self.get_token_calls += 1
+                return f"TOKEN-{self.get_token_calls}"
+
+            def send_entry_order(self, **_kwargs):
+                self.submit_calls += 1
+                if self.submit_calls == 1:
+                    raise KabuApiError("unauthorized", status=401, payload={"Message": "API key mismatch"})
+                return {"OrderId": "B-ENTRY"}
+
+        config = AppConfig(kabu=KabuConfig(api_password="pw", poll_interval_ms=0))
+        client = Submit401Client()
+        executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+        executor.start()
+
+        result = executor.submit(_intent(), role="entry", now_ns=123)
+
+        self.assertTrue(result.api_success)
+        self.assertEqual(client.submit_calls, 2)
+        self.assertEqual(client.get_token_calls, 2)
+        self.assertEqual(executor.auth_context()["token_source"], "worker_retry_after_auth_401")
+        self.assertEqual(executor.auth_context()["token_refresh_count"], 1)
+
+    def test_cancel_refreshes_token_once_after_403(self) -> None:
+        class Cancel403Client(self.FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.get_token_calls = 0
+                self.cancel_calls = 0
+
+            def get_token(self, password: str) -> str:
+                self.get_token_calls += 1
+                return f"TOKEN-{self.get_token_calls}"
+
+            def cancel_order(self, _order_id: str):
+                self.cancel_calls += 1
+                if self.cancel_calls == 1:
+                    raise KabuApiError("forbidden", status=403)
+                return {"ResultCode": 0}
+
+        config = AppConfig(kabu=KabuConfig(api_password="pw", poll_interval_ms=0))
+        client = Cancel403Client()
+        executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+        executor.start()
+        order = OrderState(client_order_id="entry-1", intent=_intent(), role="entry", broker_order_id="B-ENTRY")
+
+        result = executor.cancel(order, now_ns=123)
+
+        self.assertTrue(result.api_success)
+        self.assertEqual(client.cancel_calls, 2)
+        self.assertEqual(client.get_token_calls, 2)
+        self.assertEqual(executor.auth_context()["token_source"], "worker_retry_after_auth_403")
+        self.assertEqual(executor.auth_context()["token_refresh_count"], 1)
+
+    def test_register_and_snapshot_refresh_token_after_auth_failure(self) -> None:
+        class RegisterSnapshot401Client(self.FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.get_token_calls = 0
+                self.register_calls_count = 0
+                self.get_orders_calls = 0
+
+            def get_token(self, password: str) -> str:
+                self.get_token_calls += 1
+                return f"TOKEN-{self.get_token_calls}"
+
+            def register_symbol(self, symbol: str, exchange: int):
+                self.register_calls_count += 1
+                if self.register_calls_count == 1:
+                    raise KabuApiError("register unauthorized", status=401)
+                return super().register_symbol(symbol, exchange)
+
+            def get_orders(self, order_id=None, product=0, lane="poll"):
+                _ = (order_id, product, lane)
+                self.get_orders_calls += 1
+                if self.get_orders_calls == 1:
+                    raise KabuApiError("orders unauthorized", status=403)
+                return []
+
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            kabu=KabuConfig(api_password="pw", startup_open_order_policy="ignore"),
+        )
+        client = RegisterSnapshot401Client()
+        executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+        executor.start()
+
+        executor.register_market_data()
+        snapshot = executor.snapshot()
+
+        self.assertEqual(snapshot.positions, ())
+        self.assertEqual(client.register_calls_count, 2)
+        self.assertEqual(client.get_orders_calls, 2)
+        self.assertEqual(client.get_token_calls, 3)
+        self.assertEqual(executor.auth_context()["token_refresh_count"], 2)
+
+    def test_auth_retry_does_not_retry_rate_limit_or_server_errors(self) -> None:
+        class Submit500Client(self.FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.get_token_calls = 0
+                self.submit_calls = 0
+
+            def get_token(self, password: str) -> str:
+                self.get_token_calls += 1
+                return f"TOKEN-{self.get_token_calls}"
+
+            def send_entry_order(self, **_kwargs):
+                self.submit_calls += 1
+                raise KabuApiError("server error", status=500)
+
+        config = AppConfig(kabu=KabuConfig(api_password="pw", poll_interval_ms=0))
+        client = Submit500Client()
+        executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+        executor.start()
+
+        result = executor.submit(_intent(), role="entry", now_ns=123)
+
+        self.assertTrue(result.api_error)
+        self.assertEqual(result.halt_reason, "submit_unknown")
+        self.assertEqual(client.submit_calls, 1)
+        self.assertEqual(client.get_token_calls, 1)
+        self.assertEqual(executor.auth_context()["token_refresh_count"], 0)
 
     def test_start_ignores_shared_token_without_launcher_enable_flag(self) -> None:
         class TokenClient(self.FakeClient):
@@ -742,6 +886,50 @@ class KabuRestExecutorTests(unittest.TestCase):
         self.assertEqual(status.cum_qty, 50)
         self.assertEqual(result.request_kind, "poll")
         self.assertGreaterEqual(result.latency_ms, 0.0)
+
+    def test_poll_multiple_active_orders_uses_single_full_orders_query(self) -> None:
+        class BatchPollClient(self.FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[tuple[object, int, str]] = []
+
+            def get_orders(self, order_id=None, product=0, lane="poll"):
+                self.calls.append((order_id, product, lane))
+                return [
+                    {
+                        "ID": "B-ENTRY-1",
+                        "State": 3,
+                        "OrderState": 3,
+                        "Side": "2",
+                        "OrderQty": 100,
+                        "CumQty": 0,
+                        "Price": 1000.0,
+                    },
+                    {
+                        "ID": "B-ENTRY-2",
+                        "State": 3,
+                        "OrderState": 3,
+                        "Side": "2",
+                        "OrderQty": 100,
+                        "CumQty": 100,
+                        "Price": 1002.0,
+                    },
+                ]
+
+        config = AppConfig(kabu=KabuConfig(api_password="pw", poll_interval_ms=0))
+        client = BatchPollClient()
+        executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+        orders = [
+            OrderState(client_order_id="entry-1", intent=_intent(client_order_id="entry-1"), role="entry", broker_order_id="B-ENTRY-1"),
+            OrderState(client_order_id="entry-2", intent=_intent(client_order_id="entry-2"), role="entry", broker_order_id="B-ENTRY-2"),
+        ]
+
+        result = executor.poll_order_events(orders, now_ns=456)
+
+        self.assertTrue(result.api_success)
+        self.assertEqual(client.calls, [(None, 0, "poll")])
+        order_events = [event for event in result.events if isinstance(event, BrokerOrderEvent)]
+        self.assertEqual([event.order_id for event in order_events], ["entry-1", "entry-2"])
 
     def test_slow_submit_latency_is_recorded_without_hiding_ack(self) -> None:
         class SlowSubmitClient(self.FakeClient):

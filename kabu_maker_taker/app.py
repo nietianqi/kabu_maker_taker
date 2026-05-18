@@ -31,7 +31,7 @@ from .live_runtime import (
 from .models import BoardSnapshot, BrokerFillEvent, BrokerOrderEvent, OrderIntent, TradePrint
 from .simulator import DryRunSimulator
 from .strategy import ORDER_ROLE_ENTRY, ORDER_ROLE_EXIT
-from .telemetry import DecisionTraceWriter
+from .telemetry import DecisionTraceWriter, RuntimeSummaryWriter
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -163,6 +163,12 @@ def main(argv: list[str] | None = None) -> int:
             enabled=config.enable_decision_trace,
             strict=args.live or args.preflight_live,
         )
+        runtime_summary_writer = RuntimeSummaryWriter(
+            log_dir=config.log_dir,
+            symbol=config.symbol,
+            path=config.diagnostics.runtime_summary_jsonl_path,
+            strict=args.live or args.preflight_live,
+        )
     except OSError as exc:
         print(
             json.dumps(
@@ -192,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
                 strategy.journal.flush()
                 strategy.journal.close()
             tracer.close()
+            runtime_summary_writer.close()
 
     live_executor: KabuRestExecutor | None = None
     if args.live:
@@ -232,14 +239,29 @@ def main(argv: list[str] | None = None) -> int:
                 separators=(",", ":"),
             )
         )
+        runtime_summary_writer.write(
+            strategy=strategy,
+            status="live_reconciled",
+            reason="",
+            auth=live_executor.auth_context(),
+            now_ns=broker_snapshot.ts_ns or time.time_ns(),
+        )
         if not args.events:
             try:
-                return _run_websocket_live(strategy, live_executor, config, tracer, shadow=args.shadow)
+                return _run_websocket_live(
+                    strategy,
+                    live_executor,
+                    config,
+                    tracer,
+                    shadow=args.shadow,
+                    runtime_summary_writer=runtime_summary_writer,
+                )
             finally:
                 if strategy.journal is not None:
                     strategy.journal.flush()
                     strategy.journal.close()
                 tracer.close()
+                runtime_summary_writer.close()
 
     if args.broker_snapshot:
         broker_snapshot = JsonBrokerSnapshotAdapter(args.broker_snapshot).snapshot()
@@ -261,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         events = _sample_events(config)
     else:
         print(json.dumps({"status": "no_events", "hint": "use --sample or --events events.jsonl"}))
+        runtime_summary_writer.close()
         return 0
 
     for event in events:
@@ -379,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
         strategy.journal.flush()
         strategy.journal.close()
     tracer.close()
+    runtime_summary_writer.close()
 
     final = strategy.last_result.to_dict() if strategy.last_result else {}
     print(

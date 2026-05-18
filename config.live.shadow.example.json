@@ -7,6 +7,10 @@
   "log_dir": "logs/live_shadow",
   "enable_journal": true,
   "enable_decision_trace": true,
+  "diagnostics": {
+    "runtime_summary_jsonl_path": "runtime_summary.jsonl",
+    "heartbeat_interval_s": 15
+  },
   "kill_switch_path": "halt.txt",
   "kill_switch_hard_path": "halt_hard.txt",
   "kabu": {

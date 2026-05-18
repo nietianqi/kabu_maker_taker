@@ -135,6 +135,46 @@ def apply_broker_events(
             strategy.on_broker_fill(event)
 
 
+def live_consistency_halt_reason(strategy: CombinedMakerTakerStrategy) -> str:
+    issues_fn = getattr(strategy, "consistency_issues", None)
+    if not callable(issues_fn):
+        return ""
+    issues = issues_fn()
+    return "consistency_violation" if any(issue.get("severity") == "high" for issue in issues) else ""
+
+
+def _executor_auth_context(executor: KabuRestExecutor) -> dict[str, object]:
+    auth_fn = getattr(executor, "auth_context", None)
+    return auth_fn() if callable(auth_fn) else {}
+
+
+def _write_runtime_summary(
+    writer,
+    *,
+    strategy: CombinedMakerTakerStrategy,
+    status: str,
+    reason: str = "",
+    websocket: dict[str, object] | None = None,
+    auth: dict[str, object] | None = None,
+    cleanup: dict[str, object] | None = None,
+    now_ns: int = 0,
+) -> None:
+    if writer is None:
+        return
+    write_fn = getattr(writer, "write", None)
+    if not callable(write_fn):
+        return
+    write_fn(
+        strategy=strategy,
+        status=status,
+        reason=reason,
+        websocket=websocket,
+        auth=auth,
+        cleanup=cleanup,
+        now_ns=now_ns,
+    )
+
+
 def sleep_before_live_poll(config: AppConfig) -> None:
     poll_interval_ms = max(config.kabu.poll_interval_ms, 0)
     if poll_interval_ms:
@@ -438,12 +478,25 @@ def run_websocket_live(
     *,
     websocket_factory: Callable[..., object] | None = None,
     shadow: bool = False,
+    runtime_summary_writer=None,
 ) -> int:
     max_attempts = max(config.kabu.websocket_reconnect_attempts, 0) + 1
     last_snapshot = _empty_snapshot(config, time.time_ns())
     last_error = ""
     ignored_boards = 0
     attempt = 0
+    next_heartbeat_at = time.monotonic()
+
+    def halt(reason: str, *, cleanup: dict[str, object] | None = None, websocket: dict[str, object] | None = None) -> int:
+        return live_halted(
+            strategy,
+            reason,
+            cleanup=cleanup,
+            runtime_summary_writer=runtime_summary_writer,
+            websocket=websocket,
+            auth=_executor_auth_context(executor),
+        )
+
     while True:
         attempt += 1
         ws = None
@@ -458,6 +511,13 @@ def run_websocket_live(
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
+            )
+            _write_runtime_summary(
+                runtime_summary_writer,
+                strategy=strategy,
+                status="live_websocket_connected",
+                websocket={"connected": True, "attempt": attempt},
+                auth=_executor_auth_context(executor),
             )
             while True:
                 raw = ws.recv()  # type: ignore[attr-defined]
@@ -488,7 +548,7 @@ def run_websocket_live(
                         ),
                     )
                     cleanup["ignored_boards"] = ignored_boards
-                    return live_halted(strategy, f"websocket_{target_error}", cleanup=cleanup)
+                    return halt(f"websocket_{target_error}", cleanup=cleanup)
                 if not snapshot.valid:
                     ignored_boards += 1
                     continue
@@ -506,11 +566,10 @@ def run_websocket_live(
                         shadow=shadow,
                         detail=freshness_error,
                     )
-                    return live_halted(strategy, reason, cleanup=cleanup)
+                    return halt(reason, cleanup=cleanup)
                 halt_reason = process_live_board(strategy, executor, config, tracer, snapshot, now_ns, shadow=shadow)
                 if halt_reason:
-                    return live_halted(
-                        strategy,
+                    return halt(
                         halt_reason,
                         cleanup=_fault_cleanup(
                             strategy,
@@ -522,6 +581,21 @@ def run_websocket_live(
                             shadow=shadow,
                         ),
                     )
+                if runtime_summary_writer is not None and time.monotonic() >= next_heartbeat_at:
+                    _write_runtime_summary(
+                        runtime_summary_writer,
+                        strategy=strategy,
+                        status="live_heartbeat",
+                        websocket={
+                            "connected": True,
+                            "attempt": attempt,
+                            "ignored_boards": ignored_boards,
+                            "last_target_board_age_ms": _last_target_board_age_ms(snapshot, now_ns=now_ns),
+                        },
+                        auth=_executor_auth_context(executor),
+                        now_ns=now_ns,
+                    )
+                    next_heartbeat_at = time.monotonic() + max(config.diagnostics.heartbeat_interval_s, 1)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             cleanup = _fault_cleanup(
                 strategy,
@@ -533,12 +607,11 @@ def run_websocket_live(
                 shadow=shadow,
                 detail=str(exc),
             )
-            return live_halted(strategy, "websocket_bad_message", cleanup=cleanup)
+            return halt("websocket_bad_message", cleanup=cleanup)
         except Exception as exc:  # websocket-client raises several transport-specific exception classes.
             last_error = str(exc)
             if _has_live_exposure(strategy):
-                return live_halted(
-                    strategy,
+                return halt(
                     "websocket_disconnected",
                     cleanup=_fault_cleanup(
                         strategy,
@@ -557,8 +630,7 @@ def run_websocket_live(
                 and _is_websocket_idle_disconnect(exc)
             )
             if exhausted and not can_wait_flat:
-                return live_halted(
-                    strategy,
+                return halt(
                     "websocket_reconnect_exhausted",
                     cleanup={"last_error": last_error, "ignored_boards": ignored_boards},
                 )
@@ -574,10 +646,9 @@ def run_websocket_live(
                     shadow=shadow,
                 )
                 cleanup["last_error"] = last_error
-                return live_halted(strategy, reconnect_error, cleanup=cleanup)
+                return halt(reconnect_error, cleanup=cleanup)
             if _has_live_exposure(strategy):
-                return live_halted(
-                    strategy,
+                return halt(
                     "websocket_disconnected_with_exposure",
                     cleanup=_fault_cleanup(
                         strategy,
@@ -603,6 +674,20 @@ def run_websocket_live(
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
+            )
+            _write_runtime_summary(
+                runtime_summary_writer,
+                strategy=strategy,
+                status="live_websocket_idle_timeout" if exhausted else "live_websocket_reconnect",
+                reason=last_error,
+                websocket={
+                    "connected": False,
+                    "attempt": attempt + 1,
+                    "ignored_boards": ignored_boards,
+                    "last_target_board_age_ms": _last_target_board_age_ms(last_snapshot, now_ns=time.time_ns()),
+                    "has_exposure": False,
+                },
+                auth=_executor_auth_context(executor),
             )
         finally:
             if ws is not None:
@@ -634,8 +719,14 @@ def process_live_board(
     halt_reason = poll_live(strategy, executor, now_ns=now_ns)
     if halt_reason:
         return halt_reason
+    consistency_reason = live_consistency_halt_reason(strategy)
+    if consistency_reason:
+        return consistency_reason
     result = strategy.on_board(snapshot, now_ns=now_ns)
     tracer.record(result, strategy.position, now_ns)
+    consistency_reason = live_consistency_halt_reason(strategy)
+    if consistency_reason:
+        return consistency_reason
     if result.exit_cancel_signal:
         if shadow:
             halt_reason = _handle_shadow_exit_cancel_signal(
@@ -655,6 +746,9 @@ def process_live_board(
             )
         if halt_reason:
             return halt_reason
+        consistency_reason = live_consistency_halt_reason(strategy)
+        if consistency_reason:
+            return consistency_reason
     if result.entry_cancel_signal:
         halt_reason = (
             _handle_shadow_entry_cancel_signal(strategy, result.entry_cancel_signal, now_ns)
@@ -663,6 +757,9 @@ def process_live_board(
         )
         if halt_reason:
             return halt_reason
+        consistency_reason = live_consistency_halt_reason(strategy)
+        if consistency_reason:
+            return consistency_reason
     if result.intent is not None:
         print(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
         halt_reason = (
@@ -672,6 +769,9 @@ def process_live_board(
         )
         if halt_reason:
             return halt_reason
+        consistency_reason = live_consistency_halt_reason(strategy)
+        if consistency_reason:
+            return consistency_reason
     if result.exit_intent is not None:
         halt_reason = (
             shadow_submit(strategy, result.exit_intent, ORDER_ROLE_EXIT, now_ns)
@@ -680,6 +780,9 @@ def process_live_board(
         )
         if halt_reason:
             return halt_reason
+        consistency_reason = live_consistency_halt_reason(strategy)
+        if consistency_reason:
+            return consistency_reason
     return ""
 
 
@@ -1263,7 +1366,24 @@ def _order_state_from_broker_snapshot(broker_order, config: AppConfig, reason: s
     )
 
 
-def live_halted(strategy: CombinedMakerTakerStrategy, reason: str, *, cleanup: dict[str, object] | None = None) -> int:
+def live_halted(
+    strategy: CombinedMakerTakerStrategy,
+    reason: str,
+    *,
+    cleanup: dict[str, object] | None = None,
+    runtime_summary_writer=None,
+    websocket: dict[str, object] | None = None,
+    auth: dict[str, object] | None = None,
+) -> int:
+    _write_runtime_summary(
+        runtime_summary_writer,
+        strategy=strategy,
+        status="live_halted",
+        reason=reason,
+        websocket=websocket,
+        auth=auth,
+        cleanup=cleanup,
+    )
     print(
         json.dumps(
             {
@@ -1271,6 +1391,7 @@ def live_halted(strategy: CombinedMakerTakerStrategy, reason: str, *, cleanup: d
                 "reason": reason,
                 "orders": strategy.orders.snapshot(),
                 "metrics": strategy.metrics.to_dict(),
+                "consistency": strategy.status_snapshot().get("consistency", {}),
                 **({"cleanup": cleanup} if cleanup is not None else {}),
             },
             ensure_ascii=False,

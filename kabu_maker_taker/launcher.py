@@ -84,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = _load_json(config_path)
         mode = _resolve_mode(payload, args.mode)
         specs = build_child_specs(payload, mode=mode, config_path=config_path)
+        validate_account_risk(payload, specs)
     except (OSError, ValueError) as exc:
         print(json.dumps({"status": "launcher_config_error", "reason": str(exc)}, ensure_ascii=False, separators=(",", ":")))
         return 2
@@ -167,6 +168,47 @@ def build_child_specs(payload: dict[str, Any], *, mode: str, config_path: Path) 
             )
         )
     return specs
+
+
+def validate_account_risk(payload: dict[str, Any], specs: list[ChildRunSpec]) -> None:
+    """Static launcher-level cap for the sum of per-worker live risk limits."""
+    account_risk = payload.get("account_risk")
+    if account_risk is None:
+        return
+    if not isinstance(account_risk, dict):
+        raise ValueError("account_risk must be an object")
+    if not bool(account_risk.get("enabled", False)):
+        return
+    max_total_inventory_qty = int(account_risk.get("max_total_inventory_qty", 0) or 0)
+    max_total_notional = float(account_risk.get("max_total_notional", 0.0) or 0.0)
+    if max_total_inventory_qty < 0:
+        raise ValueError("account_risk.max_total_inventory_qty must be >= 0")
+    if max_total_notional < 0:
+        raise ValueError("account_risk.max_total_notional must be >= 0")
+
+    total_inventory_qty = 0
+    total_notional = 0.0
+    details: list[dict[str, object]] = []
+    for spec in specs:
+        if spec.app_config is None:
+            raise ValueError(f"{spec.symbol}: missing app config")
+        risk = spec.app_config.risk
+        qty = max(int(risk.max_inventory_qty), 0)
+        notional = max(float(risk.max_notional), 0.0)
+        total_inventory_qty += qty
+        total_notional += notional
+        details.append({"symbol": spec.symbol, "max_inventory_qty": qty, "max_notional": notional})
+
+    if max_total_inventory_qty > 0 and total_inventory_qty > max_total_inventory_qty:
+        raise ValueError(
+            "account_risk.max_total_inventory_qty exceeded "
+            f"configured={total_inventory_qty} limit={max_total_inventory_qty} details={details}"
+        )
+    if max_total_notional > 0 and total_notional > max_total_notional:
+        raise ValueError(
+            "account_risk.max_total_notional exceeded "
+            f"configured={total_notional:.0f} limit={max_total_notional:.0f} details={details}"
+        )
 
 
 def materialize_symbol_config(base: dict[str, Any], stock: dict[str, Any]) -> dict[str, Any]:

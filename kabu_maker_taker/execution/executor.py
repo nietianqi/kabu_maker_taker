@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 from ..broker import BrokerOpenOrderSnapshot, BrokerPositionSnapshot, BrokerReconciliationSnapshot
 from ..config import AppConfig, effective_register_exchange
@@ -30,6 +30,7 @@ class KabuRestExecutor:
         self._using_shared_token = False
         self._token_fingerprint = ""
         self._token_source = ""
+        self._token_refresh_count = 0
 
     def start(self) -> str:
         if not self.config.kabu.api_password:
@@ -40,11 +41,13 @@ class KabuRestExecutor:
             self._using_shared_token = True
             self._token_source = "shared"
             self._token_fingerprint = _token_fingerprint(token)
+            self._token_refresh_count = 0
             return token
         token = self.client.get_token(self.config.kabu.api_password)
         self._using_shared_token = False
         self._token_source = "worker"
         self._token_fingerprint = _token_fingerprint(token)
+        self._token_refresh_count = 0
         return token
 
     def auth_context(self) -> dict[str, object]:
@@ -52,6 +55,7 @@ class KabuRestExecutor:
             "shared_token": self._using_shared_token,
             "token_source": self._token_source,
             "token_sha256_8": self._token_fingerprint,
+            "token_refresh_count": self._token_refresh_count,
         }
 
     def submit(self, intent: OrderIntent, *, role: str, now_ns: int = 0) -> LiveExecutionResult:
@@ -59,26 +63,30 @@ class KabuRestExecutor:
         try:
             submit_intent, front_order_type = self._prepare_live_intent(intent)
             if role == "exit":
-                payload = self.client.send_exit_order(
-                    symbol=submit_intent.symbol,
-                    exchange=submit_intent.exchange,
-                    position_side=-submit_intent.side,
-                    qty=submit_intent.qty,
-                    price=submit_intent.price,
-                    is_market=submit_intent.is_market,
-                    profile=self.config.kabu.order_profile,
-                    front_order_type=front_order_type,
+                payload = self._with_auth_retry(
+                    lambda: self.client.send_exit_order(
+                        symbol=submit_intent.symbol,
+                        exchange=submit_intent.exchange,
+                        position_side=-submit_intent.side,
+                        qty=submit_intent.qty,
+                        price=submit_intent.price,
+                        is_market=submit_intent.is_market,
+                        profile=self.config.kabu.order_profile,
+                        front_order_type=front_order_type,
+                    )
                 )
             else:
-                payload = self.client.send_entry_order(
-                    symbol=submit_intent.symbol,
-                    exchange=submit_intent.exchange,
-                    side=submit_intent.side,
-                    qty=submit_intent.qty,
-                    price=submit_intent.price,
-                    is_market=submit_intent.is_market,
-                    profile=self.config.kabu.order_profile,
-                    front_order_type=front_order_type,
+                payload = self._with_auth_retry(
+                    lambda: self.client.send_entry_order(
+                        symbol=submit_intent.symbol,
+                        exchange=submit_intent.exchange,
+                        side=submit_intent.side,
+                        qty=submit_intent.qty,
+                        price=submit_intent.price,
+                        is_market=submit_intent.is_market,
+                        profile=self.config.kabu.order_profile,
+                        front_order_type=front_order_type,
+                    )
                 )
             broker_order_id = _extract_order_id(payload)
             if not broker_order_id:
@@ -173,7 +181,7 @@ class KabuRestExecutor:
             return LiveExecutionResult(events=(event,), halt_reason="missing_broker_order_id")
         started_ns = time.perf_counter_ns()
         try:
-            self.client.cancel_order(order.broker_order_id)
+            self._with_auth_retry(lambda: self.client.cancel_order(order.broker_order_id))
             event = BrokerOrderEvent(
                 order_id=order.client_order_id,
                 broker_order_id=order.broker_order_id,
@@ -209,11 +217,10 @@ class KabuRestExecutor:
         now_ns: int = 0,
     ) -> LiveExecutionResult:
         events: list[BrokerOrderEvent | BrokerFillEvent] = []
-        api_error = False
-        api_success = False
-        started_ns = time.perf_counter_ns()
-        measured = False
-        for order in active_orders:
+        active = list(active_orders)
+        if not active:
+            return LiveExecutionResult()
+        for order in active:
             if not order.broker_order_id:
                 events.append(
                     BrokerOrderEvent(
@@ -227,14 +234,32 @@ class KabuRestExecutor:
                     events=tuple(events),
                     halt_reason="missing_broker_order_id",
                 )
-            try:
-                raw_orders = self.client.get_orders(order.broker_order_id, lane=_REQUEST_LANE_POLL)
-                measured = True
-                api_success = True
-            except KabuApiError as exc:
-                measured = True
-                api_error = True
-                api_success = False
+        started_ns = time.perf_counter_ns()
+        try:
+            if len(active) > 1:
+                raw_orders = self._with_auth_retry(
+                    lambda: self.client.get_orders(product=0, lane=_REQUEST_LANE_POLL)
+                )
+                snapshots = [
+                    snapshot
+                    for snapshot in (order_snapshot(raw) for raw in raw_orders)
+                    if snapshot is not None
+                ]
+                snapshot_by_id = {snapshot.order_id: snapshot for snapshot in snapshots}
+                for order in active:
+                    snapshot = snapshot_by_id.get(order.broker_order_id)
+                    if snapshot is not None:
+                        events.extend(_events_from_order_snapshot(order, snapshot, now_ns))
+            else:
+                order = active[0]
+                raw_orders = self._with_auth_retry(
+                    lambda: self.client.get_orders(order.broker_order_id, lane=_REQUEST_LANE_POLL)
+                )
+                snapshot = _find_order_snapshot(raw_orders, order.broker_order_id)
+                if snapshot is not None:
+                    events.extend(_events_from_order_snapshot(order, snapshot, now_ns))
+        except KabuApiError as exc:
+            for order in active:
                 events.append(
                     BrokerOrderEvent(
                         order_id=order.client_order_id,
@@ -244,47 +269,21 @@ class KabuRestExecutor:
                         reason=str(exc),
                     )
                 )
-                continue
-            snapshot = _find_order_snapshot(raw_orders, order.broker_order_id)
-            if snapshot is None:
-                continue
-            for fill in snapshot.fills:
-                events.append(
-                    BrokerFillEvent(
-                        order_id=order.client_order_id,
-                        broker_order_id=order.broker_order_id,
-                        qty=fill.qty,
-                        price=fill.price,
-                        ts_ns=fill.ts_ns or now_ns,
-                        trade_id=fill.trade_id,
-                    )
-                )
-            events.append(
-                BrokerOrderEvent(
-                    order_id=order.client_order_id,
-                    broker_order_id=order.broker_order_id,
-                    status=snapshot.status,
-                    ts_ns=now_ns or snapshot.fill_ts_ns,
-                    cum_qty=snapshot.cum_qty,
-                    avg_fill_price=snapshot.avg_fill_price,
-                    reason=snapshot.reason,
-                )
+            return LiveExecutionResult(
+                events=tuple(events),
+                api_error=True,
+                request_kind="poll",
+                latency_ms=_elapsed_ms(started_ns),
             )
         return LiveExecutionResult(
             events=tuple(events),
-            api_success=api_success and not api_error,
-            api_error=api_error,
-            request_kind="poll" if measured else "",
-            latency_ms=_elapsed_ms(started_ns) if measured else 0.0,
+            api_success=True,
+            request_kind="poll",
+            latency_ms=_elapsed_ms(started_ns),
         )
 
     def snapshot(self) -> BrokerReconciliationSnapshot:
-        try:
-            return self._snapshot()
-        except KabuApiError as exc:
-            if self._refresh_shared_token_after_unauthorized(exc):
-                return self._snapshot()
-            raise
+        return self._with_auth_retry(self._snapshot)
 
     def _snapshot(self) -> BrokerReconciliationSnapshot:
         positions = self._position_snapshot()
@@ -310,19 +309,33 @@ class KabuRestExecutor:
             ignored_open_orders=ignored_orders,
         )
 
-    def _refresh_shared_token_after_unauthorized(self, exc: KabuApiError) -> bool:
-        if exc.status != 401 or not self._using_shared_token or not self.config.kabu.api_password:
+    def _with_auth_retry(self, operation: Callable[[], Any]) -> Any:
+        try:
+            return operation()
+        except KabuApiError as exc:
+            if not self._refresh_token_after_auth_failure(exc):
+                raise
+            return operation()
+
+    def _refresh_token_after_auth_failure(self, exc: KabuApiError) -> bool:
+        if exc.status not in {401, 403} or not self.config.kabu.api_password:
             return False
+        was_shared = self._using_shared_token
         token = self.client.get_token(self.config.kabu.api_password)
         self._using_shared_token = False
-        self._token_source = "worker_retry_after_shared_401"
+        self._token_source = (
+            "worker_retry_after_shared_401"
+            if was_shared and exc.status == 401
+            else f"worker_retry_after_auth_{exc.status}"
+        )
         self._token_fingerprint = _token_fingerprint(token)
+        self._token_refresh_count += 1
         return True
 
     def register_market_data(self) -> None:
         exchange = self.market_data_exchange
         try:
-            self.client.register_symbol(self.config.symbol, exchange)
+            self._with_auth_retry(lambda: self.client.register_symbol(self.config.symbol, exchange))
         except KabuApiError as exc:
             raise KabuApiError(
                 (
@@ -338,7 +351,7 @@ class KabuRestExecutor:
     def unregister_market_data(self) -> None:
         exchange = self.market_data_exchange
         try:
-            self.client.unregister_symbol(self.config.symbol, exchange)
+            self._with_auth_retry(lambda: self.client.unregister_symbol(self.config.symbol, exchange))
         except KabuApiError as exc:
             raise KabuApiError(
                 (
@@ -356,11 +369,11 @@ class KabuRestExecutor:
         return effective_register_exchange(self.config.exchange, self.config.kabu.register_exchange)
 
     def open_order_snapshots(self) -> tuple[KabuOrderSnapshot, ...]:
-        raw_orders = self.client.get_orders(product=0, lane=_REQUEST_LANE_POLL)
+        raw_orders = self._with_auth_retry(lambda: self.client.get_orders(product=0, lane=_REQUEST_LANE_POLL))
         return self._open_order_snapshots(raw_orders)
 
     def position_snapshot(self) -> tuple[BrokerPositionSnapshot, ...]:
-        return self._position_snapshot()
+        return self._with_auth_retry(self._position_snapshot)
 
     def _position_snapshot(self) -> tuple[BrokerPositionSnapshot, ...]:
         lots = [
@@ -435,6 +448,37 @@ def _extract_order_id(payload: Any) -> str:
     if isinstance(payload, dict):
         return str(payload.get("OrderId") or payload.get("ID") or "")
     return ""
+
+
+def _events_from_order_snapshot(
+    order: OrderState,
+    snapshot: KabuOrderSnapshot,
+    now_ns: int,
+) -> list[BrokerOrderEvent | BrokerFillEvent]:
+    events: list[BrokerOrderEvent | BrokerFillEvent] = []
+    for fill in snapshot.fills:
+        events.append(
+            BrokerFillEvent(
+                order_id=order.client_order_id,
+                broker_order_id=order.broker_order_id,
+                qty=fill.qty,
+                price=fill.price,
+                ts_ns=fill.ts_ns or now_ns,
+                trade_id=fill.trade_id,
+            )
+        )
+    events.append(
+        BrokerOrderEvent(
+            order_id=order.client_order_id,
+            broker_order_id=order.broker_order_id,
+            status=snapshot.status,
+            ts_ns=now_ns or snapshot.fill_ts_ns,
+            cum_qty=snapshot.cum_qty,
+            avg_fill_price=snapshot.avg_fill_price,
+            reason=snapshot.reason,
+        )
+    )
+    return events
 
 
 def _kabu_order_final(order: KabuOrderSnapshot) -> bool:

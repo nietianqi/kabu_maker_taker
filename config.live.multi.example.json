@@ -3,6 +3,11 @@
   "preflight_before_real": true,
   "auto_arm_after_preflight": true,
   "generated_config_dir": "logs/generated_live_configs",
+  "account_risk": {
+    "enabled": true,
+    "max_total_inventory_qty": 800,
+    "max_total_notional": 900000
+  },
   "base_config": {
     "tick_size": 1.0,
     "lot_size": 100,
@@ -10,6 +15,10 @@
     "log_dir": "logs/live",
     "enable_journal": true,
     "enable_decision_trace": true,
+    "diagnostics": {
+      "runtime_summary_jsonl_path": "runtime_summary.jsonl",
+      "heartbeat_interval_s": 15
+    },
     "kill_switch_path": "halt.txt",
     "kill_switch_hard_path": "halt_hard.txt",
     "kabu": {

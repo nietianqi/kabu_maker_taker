@@ -6,6 +6,7 @@ import time
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 
 from kabu_maker_taker.broker import BrokerOpenOrderSnapshot, BrokerPositionSnapshot, BrokerReconciliationSnapshot
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
@@ -29,6 +30,7 @@ from kabu_maker_taker.models import (
     OrderStatus,
     SignalPacket,
 )
+from kabu_maker_taker.telemetry import RuntimeSummaryWriter
 
 
 def _signal(ts_ns: int) -> SignalPacket:
@@ -283,6 +285,48 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertIn('"has_exposure":false', output)
         self.assertNotIn("websocket_reconnect_exhausted", output)
 
+    def test_websocket_runtime_summary_records_connect_idle_and_halt(self) -> None:
+        config = _config(websocket_reconnect_attempts=0, websocket_reconnect_forever_when_flat=True)
+        strategy = CombinedMakerTakerStrategy(config)
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+        calls = 0
+
+        def factory(_url, timeout=0):
+            _ = timeout
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return SequenceWebSocket([])
+            return BadMessageWebSocket()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = RuntimeSummaryWriter(log_dir=tmp, symbol="9984", path="runtime_summary.jsonl")
+            with redirect_stdout(io.StringIO()):
+                code = run_websocket_live(
+                    strategy,
+                    executor,
+                    config,
+                    tracer,
+                    websocket_factory=factory,
+                    runtime_summary_writer=writer,
+                )
+            writer.close()
+            rows = [
+                json.loads(line)
+                for line in (Path(tmp) / "runtime_summary.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(code, 3)
+        statuses = [row["status"] for row in rows]
+        self.assertIn("live_websocket_connected", statuses)
+        self.assertIn("live_websocket_idle_timeout", statuses)
+        self.assertIn("live_halted", statuses)
+        idle = next(row for row in rows if row["status"] == "live_websocket_idle_timeout")
+        self.assertFalse(idle["websocket"]["has_exposure"])
+        self.assertIn("ignored_boards", idle["websocket"])
+        self.assertIn("auth", idle)
+
     def test_websocket_forever_flat_does_not_hide_api_register_failure(self) -> None:
         config = _config(websocket_reconnect_attempts=0, websocket_reconnect_forever_when_flat=True)
         strategy = CombinedMakerTakerStrategy(config)
@@ -359,6 +403,37 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn('"reason":"websocket_disconnected"', stdout.getvalue())
         self.assertNotIn("live_websocket_idle_timeout", stdout.getvalue())
+
+    def test_process_live_board_halts_on_exit_order_while_flat(self) -> None:
+        config = _config()
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.orders.restore_order(
+            OrderIntent(
+                symbol="9984",
+                exchange=27,
+                side=-1,
+                qty=100,
+                price=101.0,
+                is_market=False,
+                strategy="lollipop_tp",
+                reason="test_exit",
+                score=0,
+                reference_price=101.0,
+                client_order_id="exit-1",
+            ),
+            role="exit",
+            status=OrderStatus.WORKING,
+            broker_order_id="B-EXIT",
+        )
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+
+        with redirect_stdout(io.StringIO()):
+            halt = process_live_board(strategy, executor, config, tracer, _snapshot(time.time_ns()), time.time_ns())
+
+        self.assertEqual(halt, "consistency_violation")
+        issues = strategy.consistency_issues()
+        self.assertTrue(any(issue["code"] == "exit_without_position" for issue in issues))
 
     def test_board_snapshot_uses_quote_timestamps_for_websocket_payload(self) -> None:
         now_ns = time.time_ns()

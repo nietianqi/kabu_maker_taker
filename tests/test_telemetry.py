@@ -16,7 +16,7 @@ from kabu_maker_taker.models import (
     SignalPacket,
     StrategyResult,
 )
-from kabu_maker_taker.telemetry import DecisionTraceWriter
+from kabu_maker_taker.telemetry import DecisionTraceWriter, RuntimeSummaryWriter
 
 
 def _result(
@@ -233,6 +233,61 @@ class TelemetryInitFallbackTests(unittest.TestCase):
             with mock.patch.object(Path, "open", side_effect=OSError("permission denied")):
                 with self.assertRaises(OSError):
                     DecisionTraceWriter(log_dir="fake_dir", symbol="9984", enabled=True, strict=True)
+
+
+class RuntimeSummaryWriterTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_dir = self._tmpdir.name
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_runtime_summary_writes_safe_jsonl(self) -> None:
+        class StrategyStub:
+            def status_snapshot(self):
+                return {
+                    "position": {"side": 1, "qty": 100, "avg_price": 100.5},
+                    "active_orders": [{"client_order_id": "entry-1"}],
+                    "metrics": {"entry_intent_count": 1},
+                    "risk": {"daily_pnl": 0.0},
+                    "consistency": {"ok": True, "issues": []},
+                }
+
+        writer = RuntimeSummaryWriter(log_dir=self.log_dir, symbol="9984", path="runtime_summary.jsonl")
+        writer.write(
+            strategy=StrategyStub(),
+            status="live_heartbeat",
+            websocket={"connected": True},
+            auth={
+                "token": "SECRET-TOKEN",
+                "api_token": "SECRET-TOKEN",
+                "token_sha256_8": "abcd1234",
+                "token_refresh_count": 1,
+            },
+            now_ns=1_700_000_000_000_000_000,
+        )
+        writer.close()
+
+        path = Path(self.log_dir) / "runtime_summary.jsonl"
+        row = json.loads(path.read_text(encoding="utf-8").strip())
+        self.assertEqual(row["type"], "runtime_summary")
+        self.assertEqual(row["status"], "live_heartbeat")
+        self.assertEqual(row["symbol"], "9984")
+        self.assertEqual(row["position"]["qty"], 100)
+        self.assertEqual(row["active_orders"][0]["client_order_id"], "entry-1")
+        self.assertEqual(row["auth"]["token_sha256_8"], "abcd1234")
+        self.assertEqual(row["auth"]["token_refresh_count"], 1)
+        self.assertNotIn("SECRET-TOKEN", path.read_text(encoding="utf-8"))
+        self.assertNotIn("token", row["auth"])
+        self.assertIn("consistency", row)
+
+    def test_runtime_summary_is_noop_when_path_empty(self) -> None:
+        writer = RuntimeSummaryWriter(log_dir=self.log_dir, symbol="9984", path="")
+        writer.write(strategy=object(), status="disabled")
+        writer.close()
+
+        self.assertFalse((Path(self.log_dir) / "runtime_summary.jsonl").exists())
 
 
 if __name__ == "__main__":

@@ -660,6 +660,82 @@ class CombinedMakerTakerStrategy:
         """Client order IDs of all active (non-final) exit orders."""
         return [o.client_order_id for o in self.orders.active_by_role(ORDER_ROLE_EXIT)]
 
+    def consistency_issues(self) -> list[dict[str, object]]:
+        issues: list[dict[str, object]] = []
+
+        def add(code: str, severity: str, message: str, *, order_id: str = "") -> None:
+            issue: dict[str, object] = {"code": code, "severity": severity, "message": message}
+            if order_id:
+                issue["order_id"] = order_id
+            issues.append(issue)
+
+        if self.position.qty == 0 and self.position.side != 0:
+            add("flat_position_side", "high", "position side must be zero when quantity is flat")
+        if self.position.qty > 0 and self.position.side not in {-1, 1}:
+            add("open_position_side", "high", "position side must be +/-1 when quantity is open")
+        if self.position.qty > self.config.risk.max_inventory_qty:
+            add("position_inventory_limit", "high", "position quantity exceeds risk.max_inventory_qty")
+
+        for order_id, order in self.orders.snapshot().items():
+            intent = order.get("intent", {})
+            intent_qty = int(intent.get("qty", 0) or 0)
+            cum_qty = int(order.get("cum_qty", 0) or 0)
+            role = str(order.get("role", ""))
+            side = int(intent.get("side", 0) or 0)
+            qty = int(intent.get("qty", 0) or 0)
+            if cum_qty > intent_qty:
+                add("order_cum_qty_exceeds_intent", "high", "order cumulative quantity exceeds intent quantity", order_id=order_id)
+            if role not in {ORDER_ROLE_ENTRY, ORDER_ROLE_EXIT}:
+                add("order_unknown_role", "medium", "order has an unknown role", order_id=order_id)
+            if order.get("status") == OrderStatus.UNKNOWN.value:
+                add("order_unknown_status", "medium", "order status is unknown", order_id=order_id)
+            if order.get("status") in {OrderStatus.FILLED.value, OrderStatus.CANCELED.value, OrderStatus.REJECTED.value}:
+                continue
+            if role == ORDER_ROLE_EXIT:
+                if self.position.qty <= 0:
+                    add("exit_without_position", "high", "active exit order exists while local position is flat", order_id=order_id)
+                elif side != -self.position.side:
+                    add("exit_not_reducing_position", "high", "active exit order side does not reduce local position", order_id=order_id)
+                elif qty > self.position.qty:
+                    add("exit_qty_exceeds_position", "high", "active exit order quantity exceeds local position", order_id=order_id)
+            elif role == ORDER_ROLE_ENTRY and self.position.qty > 0 and side not in {0, self.position.side}:
+                add("entry_opposes_position", "high", "active entry order side opposes local position", order_id=order_id)
+        return issues
+
+    def status_snapshot(self) -> dict[str, object]:
+        issues = self.consistency_issues()
+        return {
+            "symbol": self.config.symbol,
+            "exchange": self.config.exchange,
+            "position": {
+                "side": self.position.side,
+                "qty": self.position.qty,
+                "avg_price": self.position.avg_price,
+                "entry_mode": self.position.entry_mode,
+                "entry_ts_ns": self.position.entry_ts_ns,
+            },
+            "active_orders": [order.to_dict() for order in self.orders.active()],
+            "orders": self.orders.snapshot(),
+            "metrics": self.metrics.to_dict(),
+            "risk": {
+                "daily_pnl": self.risk.daily_pnl,
+                "api_cooling_until_ns": self.risk.api_cooling_until_ns,
+                "latency_circuit_open_until_ns": self.risk.latency_circuit_open_until_ns,
+                "submit_latency_last_ms": self.risk.last_latency_ms("submit"),
+                "cancel_latency_last_ms": self.risk.last_latency_ms("cancel"),
+                "poll_latency_last_ms": self.risk.last_latency_ms("poll"),
+                "submit_latency_breach_count": self.risk.latency_breach_count("submit"),
+                "cancel_latency_breach_count": self.risk.latency_breach_count("cancel"),
+                "poll_latency_breach_count": self.risk.latency_breach_count("poll"),
+            },
+            "consistency": {
+                "ok": not any(issue.get("severity") == "high" for issue in issues),
+                "issue_count": len(issues),
+                "high_issue_count": sum(1 for issue in issues if issue.get("severity") == "high"),
+                "issues": issues,
+            },
+        }
+
     def release_deferred_force_exit(self, snapshot: BoardSnapshot, *, now_ns: int) -> OrderIntent | None:
         """Release a force-exit intent after active exit orders have been cleared."""
         if self.position.qty <= 0 or self.working_exit_ids:
