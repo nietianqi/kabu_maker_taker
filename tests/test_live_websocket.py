@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 
-from kabu_maker_taker.broker import BrokerPositionSnapshot, BrokerReconciliationSnapshot
+from kabu_maker_taker.broker import BrokerOpenOrderSnapshot, BrokerPositionSnapshot, BrokerReconciliationSnapshot
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
 from kabu_maker_taker.config import AppConfig, KabuConfig, RiskConfig, StrategyConfig
 from kabu_maker_taker.kabu_rest import LiveExecutionResult
@@ -85,7 +85,7 @@ class FakeTracer:
 
 
 class FakeExecutor:
-    def __init__(self, *, positions=()) -> None:
+    def __init__(self, *, positions=(), ignored_open_orders=()) -> None:
         self.polled = 0
         self.submitted = []
         self.canceled = []
@@ -93,6 +93,7 @@ class FakeExecutor:
         self.unregistered = 0
         self.snapshots = 0
         self.positions = tuple(positions)
+        self.ignored_open_orders = tuple(ignored_open_orders)
 
     def register_market_data(self) -> None:
         self.registered += 1
@@ -127,7 +128,11 @@ class FakeExecutor:
 
     def snapshot(self) -> BrokerReconciliationSnapshot:
         self.snapshots += 1
-        return BrokerReconciliationSnapshot(ts_ns=time.time_ns(), positions=self.positions)
+        return BrokerReconciliationSnapshot(
+            ts_ns=time.time_ns(),
+            positions=self.positions,
+            ignored_open_orders=self.ignored_open_orders,
+        )
 
     def open_order_snapshots(self):
         return ()
@@ -272,6 +277,29 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(summary["reason"], "broker_position_not_flat")
         self.assertEqual(executor.registered, 0)
+
+    def test_preflight_allows_ignored_open_orders_and_reports_them(self) -> None:
+        config = _config(websocket_preflight_messages=1, websocket_preflight_timeout_s=1.0)
+        executor = FakeExecutor(
+            ignored_open_orders=(
+                BrokerOpenOrderSnapshot(
+                    symbol="9984",
+                    exchange=27,
+                    side=1,
+                    qty=100,
+                    price=100.0,
+                    role="entry",
+                    broker_order_id="B-IGNORED",
+                    strategy="broker_ignored",
+                ),
+            )
+        )
+        ws = SequenceWebSocket([_websocket_payload(time.time_ns())])
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertTrue(ok, summary)
+        self.assertEqual(summary["ignored_broker_open_orders"][0]["order_id"], "B-IGNORED")
 
     def test_preflight_stamp_must_be_today_and_recent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

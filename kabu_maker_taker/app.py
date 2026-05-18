@@ -16,6 +16,7 @@ from .live_runtime import (
     check_kill_switch as _check_kill_switch,
     emergency_flatten as _emergency_flatten,
     handle_live_execution as _handle_live_execution,
+    ignored_broker_open_orders_summary as _ignored_broker_open_orders_summary,
     live_event_freshness_error as _runtime_live_event_freshness_error,
     live_halted as _live_halted,
     poll_live as _poll_live,
@@ -221,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             broker_snapshot,
             now_ns=broker_snapshot.ts_ns or time.time_ns(),
         )
+        summary.update(_ignored_broker_open_orders_summary(broker_snapshot))
         print(
             json.dumps(
                 {"status": "live_reconciled", "summary": summary},
@@ -539,6 +541,8 @@ def _validate_live_config(config: AppConfig, *, raw_config: dict[str, Any] | Non
         missing.append("kabu.live_preflight_max_age_minutes>0")
     if not config.kabu.live_arm_path:
         missing.append("kabu.live_arm_path")
+    if config.kabu.startup_open_order_policy.strip().lower() not in {"reject", "ignore"}:
+        missing.append("kabu.startup_open_order_policy valid")
     if raw_config is not None:
         strategy_payload = raw_config.get("strategy")
         if not isinstance(strategy_payload, dict) or "entry_selection_policy" not in strategy_payload:

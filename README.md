@@ -112,6 +112,9 @@ Requirements:
   as `shadow_not_sent`; it never calls kabu `sendorder` or `cancelorder`.
 - `--live` without `--shadow` is rejected unless `--allow-real-orders` is provided, the preflight
   stamp is still fresh, and the configured `kabu.live_arm_path` file exists.
+- `kabu.startup_open_order_policy` defaults to `reject`. Set it to `ignore` only when you want
+  startup to skip existing manual/broker orders without adopting, cancelling, or tracking them.
+  Ignored orders are written as `ignored_broker_open_orders` in startup/preflight output.
 - The multi-symbol launcher keeps these same real-order gates. For each stock it derives separate
   `log_dir`, `halt_SYMBOL.txt`, `halt_hard_SYMBOL.txt`, and `live_arm_SYMBOL.txt` paths unless the
   stock item explicitly overrides them.

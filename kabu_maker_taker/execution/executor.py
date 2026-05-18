@@ -3,9 +3,10 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from ..broker import BrokerPositionSnapshot, BrokerReconciliationSnapshot
+from ..broker import BrokerOpenOrderSnapshot, BrokerPositionSnapshot, BrokerReconciliationSnapshot
 from ..config import AppConfig
 from ..models import BrokerFillEvent, BrokerOrderEvent, OrderIntent, OrderState, OrderStatus
+from ..strategy import ORDER_ROLE_ENTRY
 from .client import KabuRestClient, _REQUEST_LANE_POLL
 from .models import KabuApiError, KabuOrderSnapshot, LiveExecutionResult
 from .parsers import _aggressive_limit_price, _elapsed_ms, _find_order_snapshot, order_snapshot, position_lot
@@ -252,21 +253,26 @@ class KabuRestExecutor:
     def snapshot(self) -> BrokerReconciliationSnapshot:
         positions = self._position_snapshot()
         raw_orders = self.client.get_orders(product=0, lane=_REQUEST_LANE_POLL)
-        active_order_ids = []
-        for raw in raw_orders:
-            order = order_snapshot(raw)
-            if order is not None and order.status not in {
-                OrderStatus.FILLED,
-                OrderStatus.CANCELED,
-                OrderStatus.REJECTED,
-            }:
-                active_order_ids.append(order.order_id)
-        if active_order_ids:
+        active_orders = [
+            order
+            for order in (order_snapshot(raw) for raw in raw_orders)
+            if order is not None and not _kabu_order_final(order)
+        ]
+        current_active_orders = [order for order in active_orders if self._is_current_order(order)]
+        ignored_orders = tuple(self._ignored_open_order_snapshot(order) for order in active_orders)
+        policy = self.config.kabu.startup_open_order_policy.strip().lower()
+        if policy not in {"reject", "ignore"}:
+            raise KabuApiError(f"invalid kabu.startup_open_order_policy={self.config.kabu.startup_open_order_policy}")
+        if policy == "reject" and current_active_orders:
             raise KabuApiError(
                 "unsafe active kabu orders at startup; cancel or reconcile them before --live",
-                payload={"order_ids": active_order_ids},
+                payload={"order_ids": [order.order_id for order in current_active_orders]},
             )
-        return BrokerReconciliationSnapshot(ts_ns=time.time_ns(), positions=positions)
+        return BrokerReconciliationSnapshot(
+            ts_ns=time.time_ns(),
+            positions=positions,
+            ignored_open_orders=ignored_orders,
+        )
 
     def register_market_data(self) -> None:
         self.client.register_symbol(self.config.symbol, self.config.exchange)
@@ -325,8 +331,40 @@ class KabuRestExecutor:
             snapshots.append(snapshot)
         return tuple(snapshots)
 
+    def _is_current_order(self, order: KabuOrderSnapshot) -> bool:
+        symbol_matches = not order.symbol or order.symbol == self.config.symbol
+        exchange_matches = order.exchange in {0, self.config.exchange}
+        return symbol_matches and exchange_matches
+
+    def _ignored_open_order_snapshot(self, order: KabuOrderSnapshot) -> BrokerOpenOrderSnapshot:
+        qty = order.leaves_qty or order.order_qty
+        return BrokerOpenOrderSnapshot(
+            symbol=order.symbol,
+            exchange=order.exchange or self.config.exchange,
+            side=order.side,
+            qty=qty,
+            price=order.price,
+            role=ORDER_ROLE_ENTRY,
+            strategy="broker_ignored",
+            reason="startup_open_order_ignored",
+            reference_price=order.price,
+            client_order_id=f"broker-{order.order_id}",
+            broker_order_id=order.order_id,
+            status=order.status,
+            cum_qty=order.cum_qty,
+            avg_fill_price=order.avg_fill_price,
+        )
+
 
 def _extract_order_id(payload: Any) -> str:
     if isinstance(payload, dict):
         return str(payload.get("OrderId") or payload.get("ID") or "")
     return ""
+
+
+def _kabu_order_final(order: KabuOrderSnapshot) -> bool:
+    return order.status in {
+        OrderStatus.FILLED,
+        OrderStatus.CANCELED,
+        OrderStatus.REJECTED,
+    }

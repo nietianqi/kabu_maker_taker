@@ -404,6 +404,7 @@ class KabuConfig:
     websocket_preflight_timeout_s: float = 15.0
     live_preflight_max_age_minutes: int = 30
     live_arm_path: str = "live_arm.txt"
+    startup_open_order_policy: str = "reject"
     order_profile: OrderProfile = field(default_factory=OrderProfile)
 
     @classmethod
@@ -421,6 +422,7 @@ class KabuConfig:
             websocket_preflight_timeout_s=float(payload.get("websocket_preflight_timeout_s", 15.0)),
             live_preflight_max_age_minutes=int(payload.get("live_preflight_max_age_minutes", 30)),
             live_arm_path=str(payload.get("live_arm_path", "live_arm.txt")),
+            startup_open_order_policy=str(payload.get("startup_open_order_policy", "reject")),
             order_profile=OrderProfile.from_dict(payload.get("order_profile")),
         )
 

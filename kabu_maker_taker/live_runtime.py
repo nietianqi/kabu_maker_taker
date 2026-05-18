@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 
+from .broker import BrokerOpenOrderSnapshot, BrokerReconciliationSnapshot
 from .combined import CombinedMakerTakerStrategy
 from .config import AppConfig
 from .execution import KabuApiError, KabuRestExecutor, LiveExecutionResult
@@ -162,6 +163,7 @@ def perform_live_preflight(
         }
     if broker_snapshot.open_orders:
         return False, {"reason": "broker_open_orders_present"}
+    ignored_summary = ignored_broker_open_orders_summary(broker_snapshot)
 
     required = max(config.kabu.websocket_preflight_messages, 1)
     deadline = time.monotonic() + max(config.kabu.websocket_preflight_timeout_s, 0.1)
@@ -215,7 +217,7 @@ def perform_live_preflight(
             }
         if seen < required:
             return False, {"reason": "websocket_preflight_timeout", "received_boards": seen, "required_boards": required}
-        return True, {"required_boards": required, **last_summary}
+        return True, {"required_boards": required, **ignored_summary, **last_summary}
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         return False, {"reason": "websocket_bad_message", "detail": str(exc), "received_boards": seen}
     except TimeoutError as exc:
@@ -282,6 +284,17 @@ def write_live_preflight_stamp(config: AppConfig, ts_ns: int, summary: dict[str,
 
 def live_preflight_stamp_path(config: AppConfig) -> Path:
     return Path(config.log_dir) / PREFLIGHT_STAMP_FILENAME
+
+
+def ignored_broker_open_orders_summary(snapshot: BrokerReconciliationSnapshot) -> dict[str, object]:
+    if not snapshot.ignored_open_orders:
+        return {}
+    return {
+        "ignored_broker_open_orders": [
+            _ignored_open_order_payload(order)
+            for order in snapshot.ignored_open_orders
+        ]
+    }
 
 
 def run_websocket_live(
@@ -750,6 +763,18 @@ def _shadow_cleanup(
 
 def _jst_date(ts_ns: int) -> str:
     return datetime.fromtimestamp(ts_ns / 1e9, tz=JST).strftime("%Y-%m-%d")
+
+
+def _ignored_open_order_payload(order: BrokerOpenOrderSnapshot) -> dict[str, object]:
+    return {
+        "order_id": order.broker_order_id,
+        "symbol": order.symbol,
+        "exchange": order.exchange,
+        "side": order.side,
+        "qty": order.qty,
+        "price": order.price,
+        "status": order.status.value if isinstance(order.status, OrderStatus) else str(order.status),
+    }
 
 
 def _has_live_exposure(strategy: CombinedMakerTakerStrategy) -> bool:

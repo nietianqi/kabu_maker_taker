@@ -58,6 +58,7 @@ class KabuOrderSnapshot:
     reason: str = ""
     fills: tuple[KabuFillDetail, ...] = field(default_factory=tuple)
     symbol: str = ""
+    exchange: int = 0
 
 
 @dataclass(frozen=True, slots=True)

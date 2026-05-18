@@ -23,6 +23,7 @@
       "websocket_preflight_timeout_s": 15.0,
       "live_preflight_max_age_minutes": 30,
       "live_arm_path": "live_arm.txt",
+      "startup_open_order_policy": "reject",
       "order_profile": {
         "mode": "margin",
         "allow_short": false,

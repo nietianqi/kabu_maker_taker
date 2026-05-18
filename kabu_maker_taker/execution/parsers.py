@@ -87,6 +87,7 @@ def order_snapshot(raw: dict[str, Any]) -> KabuOrderSnapshot | None:
         reason=_extract_error_message(raw) or "",
         fills=tuple(fills),
         symbol=str(raw.get("Symbol") or raw.get("symbol") or ""),
+        exchange=_parse_int(raw.get("Exchange"), 0),
     )
 
 

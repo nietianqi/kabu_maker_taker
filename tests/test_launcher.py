@@ -15,6 +15,7 @@ def _payload() -> dict:
             "kabu": {
                 "api_password": "pw",
                 "live_arm_path": "live_arm.txt",
+                "startup_open_order_policy": "ignore",
             },
             "strategy": {
                 "entry_selection_policy": "adaptive",
@@ -43,6 +44,7 @@ class LauncherConfigTests(unittest.TestCase):
         self.assertEqual(child["kill_switch_path"], "halt_9984.txt")
         self.assertEqual(child["kill_switch_hard_path"], "halt_hard_9984.txt")
         self.assertEqual(child["kabu"]["live_arm_path"], "live_arm_9984.txt")
+        self.assertEqual(child["kabu"]["startup_open_order_policy"], "ignore")
 
     def test_build_child_specs_writes_generated_configs_and_real_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

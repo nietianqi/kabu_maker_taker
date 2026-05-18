@@ -78,9 +78,15 @@ class KabuConfigTests(unittest.TestCase):
         self.assertEqual(config.kabu.api_password, "secret")
         self.assertEqual(config.kabu.websocket_url, "ws://localhost:18081/kabusapi/websocket")
         self.assertEqual(config.kabu.websocket_reconnect_attempts, 5)
+        self.assertEqual(config.kabu.startup_open_order_policy, "reject")
         self.assertEqual(config.kabu.order_profile.mode, "cash")
         self.assertEqual(config.kabu.order_profile.front_order_type_market, 120)
         self.assertEqual(config.kabu.order_profile.front_order_type_ioc_limit, 127)
+
+    def test_kabu_config_parses_startup_open_order_policy(self) -> None:
+        config = AppConfig.from_dict({"kabu": {"startup_open_order_policy": "ignore"}})
+
+        self.assertEqual(config.kabu.startup_open_order_policy, "ignore")
 
     def test_order_profile_defaults_ioc_limit_type(self) -> None:
         config = AppConfig.from_dict({"symbol": "9984"})
@@ -693,6 +699,8 @@ class KabuRestExecutorTests(unittest.TestCase):
         snapshot = order_snapshot(
             {
                 "ID": "B-REJECT",
+                "Symbol": "9984",
+                "Exchange": 27,
                 "State": 5,
                 "OrderState": 5,
                 "Side": "2",
@@ -715,6 +723,99 @@ class KabuRestExecutorTests(unittest.TestCase):
         assert snapshot is not None
         self.assertEqual(snapshot.status, OrderStatus.REJECTED)
         self.assertEqual(snapshot.fills, ())
+        self.assertEqual(snapshot.symbol, "9984")
+        self.assertEqual(snapshot.exchange, 27)
+
+    def test_snapshot_rejects_current_symbol_active_order_by_default(self) -> None:
+        class ActiveOrderClient(self.FakeClient):
+            def get_orders(self, order_id=None, product=0, lane="poll"):
+                _ = (order_id, product, lane)
+                return [
+                    {
+                        "ID": "B-ACTIVE",
+                        "Symbol": "9984",
+                        "Exchange": 27,
+                        "State": 3,
+                        "OrderState": 3,
+                        "Side": "2",
+                        "OrderQty": 100,
+                        "CumQty": 0,
+                        "Price": 1000.0,
+                    }
+                ]
+
+        executor = KabuRestExecutor(
+            AppConfig(symbol="9984", exchange=27, kabu=KabuConfig(api_password="pw")),
+            client=ActiveOrderClient(),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaises(KabuApiError) as ctx:
+            executor.snapshot()
+
+        self.assertIn("unsafe active kabu orders", str(ctx.exception))
+
+    def test_snapshot_ignores_active_orders_when_policy_ignore(self) -> None:
+        class ActiveOrderClient(self.FakeClient):
+            def get_orders(self, order_id=None, product=0, lane="poll"):
+                _ = (order_id, product, lane)
+                return [
+                    {
+                        "ID": "B-ACTIVE",
+                        "Symbol": "9984",
+                        "Exchange": 27,
+                        "State": 3,
+                        "OrderState": 3,
+                        "Side": "2",
+                        "OrderQty": 100,
+                        "CumQty": 0,
+                        "Price": 1000.0,
+                    }
+                ]
+
+        executor = KabuRestExecutor(
+            AppConfig(
+                symbol="9984",
+                exchange=27,
+                kabu=KabuConfig(api_password="pw", startup_open_order_policy="ignore"),
+            ),
+            client=ActiveOrderClient(),  # type: ignore[arg-type]
+        )
+
+        snapshot = executor.snapshot()
+
+        self.assertEqual(snapshot.open_orders, ())
+        self.assertEqual(len(snapshot.ignored_open_orders), 1)
+        self.assertEqual(snapshot.ignored_open_orders[0].broker_order_id, "B-ACTIVE")
+        self.assertEqual(snapshot.ignored_open_orders[0].strategy, "broker_ignored")
+
+    def test_snapshot_does_not_block_other_symbol_active_order(self) -> None:
+        class OtherSymbolActiveOrderClient(self.FakeClient):
+            def get_orders(self, order_id=None, product=0, lane="poll"):
+                _ = (order_id, product, lane)
+                return [
+                    {
+                        "ID": "B-OTHER",
+                        "Symbol": "7203",
+                        "Exchange": 27,
+                        "State": 3,
+                        "OrderState": 3,
+                        "Side": "2",
+                        "OrderQty": 100,
+                        "CumQty": 0,
+                        "Price": 1000.0,
+                    }
+                ]
+
+        executor = KabuRestExecutor(
+            AppConfig(symbol="9984", exchange=27, kabu=KabuConfig(api_password="pw")),
+            client=OtherSymbolActiveOrderClient(),  # type: ignore[arg-type]
+        )
+
+        snapshot = executor.snapshot()
+
+        self.assertEqual(snapshot.open_orders, ())
+        self.assertEqual(len(snapshot.ignored_open_orders), 1)
+        self.assertEqual(snapshot.ignored_open_orders[0].symbol, "7203")
 
 
 class KabuLiveCliSafetyTests(unittest.TestCase):
@@ -872,6 +973,14 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
         errors = _validate_live_config(config, raw_config=config_payload)
 
         self.assertIn("strategy.entry_selection_policy valid", errors)
+
+    def test_live_rejects_invalid_startup_open_order_policy(self) -> None:
+        config_payload = self._live_safe_config(kabu={"api_password": "pw", "startup_open_order_policy": "adopt"})
+        config = AppConfig.from_dict(config_payload)
+
+        errors = _validate_live_config(config, raw_config=config_payload)
+
+        self.assertIn("kabu.startup_open_order_policy valid", errors)
 
     def test_live_accepts_supported_entry_selection_policies(self) -> None:
         for policy in ("adaptive", "taker_priority", "maker_priority"):

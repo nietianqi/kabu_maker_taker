@@ -123,16 +123,22 @@ class BrokerReconciliationSnapshot:
     daily_pnl: float = 0.0
     positions: tuple[BrokerPositionSnapshot, ...] = field(default_factory=tuple)
     open_orders: tuple[BrokerOpenOrderSnapshot, ...] = field(default_factory=tuple)
+    ignored_open_orders: tuple[BrokerOpenOrderSnapshot, ...] = field(default_factory=tuple)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BrokerReconciliationSnapshot":
         positions_payload = payload.get("positions", payload.get("Positions", ()))
         orders_payload = payload.get("open_orders", payload.get("OpenOrders", payload.get("orders", ())))
+        ignored_orders_payload = payload.get(
+            "ignored_open_orders",
+            payload.get("IgnoredOpenOrders", payload.get("ignored_orders", ())),
+        )
         return cls(
             ts_ns=int(payload.get("ts_ns", payload.get("timestamp_ns", payload.get("TimestampNs", 0)))),
             daily_pnl=float(payload.get("daily_pnl", payload.get("DailyPnl", 0.0))),
             positions=tuple(BrokerPositionSnapshot.from_dict(item) for item in positions_payload),
             open_orders=tuple(BrokerOpenOrderSnapshot.from_dict(item) for item in orders_payload),
+            ignored_open_orders=tuple(BrokerOpenOrderSnapshot.from_dict(item) for item in ignored_orders_payload),
         )
 
 
