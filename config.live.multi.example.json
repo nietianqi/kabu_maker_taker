@@ -1,0 +1,139 @@
+{
+  "execution_mode": "real",
+  "preflight_before_real": true,
+  "generated_config_dir": "logs/generated_live_configs",
+  "base_config": {
+    "tick_size": 1.0,
+    "lot_size": 100,
+    "dry_run": false,
+    "log_dir": "logs/live",
+    "enable_journal": true,
+    "enable_decision_trace": true,
+    "kill_switch_path": "halt.txt",
+    "kill_switch_hard_path": "halt_hard.txt",
+    "kabu": {
+      "base_url": "http://localhost:18080",
+      "api_password": "",
+      "order_rate_per_sec": 1.0,
+      "poll_rate_per_sec": 2.0,
+      "poll_interval_ms": 500,
+      "websocket_url": "",
+      "websocket_reconnect_attempts": 1,
+      "websocket_preflight_messages": 3,
+      "websocket_preflight_timeout_s": 15.0,
+      "live_preflight_max_age_minutes": 30,
+      "live_arm_path": "live_arm.txt",
+      "order_profile": {
+        "mode": "margin",
+        "allow_short": false,
+        "account_type": 4,
+        "margin_trade_type": 1,
+        "margin_open_fund_type": "11",
+        "margin_open_deliv_type": 0,
+        "margin_close_deliv_type": 2,
+        "front_order_type_limit": 20,
+        "front_order_type_market": 10,
+        "front_order_type_ioc_limit": 27
+      }
+    },
+    "strategy": {
+      "trade_qty": 100,
+      "allow_short": false,
+      "maker_score_threshold": 6,
+      "taker_score_threshold": 9,
+      "maker_confirm_ticks": 2,
+      "taker_confirm_ticks": 1,
+      "book_imbalance_long": 0.18,
+      "of_imbalance_long": 0.10,
+      "tape_imbalance_long": 0.10,
+      "microprice_tilt_long": 0.25,
+      "maker_min_edge_ticks": 0.0,
+      "max_pending_ms": 2500,
+      "entry_selection_policy": "adaptive",
+      "adaptive_maker_min_edge_ticks": 0.25,
+      "adaptive_taker_urgency_score": 2
+    },
+    "risk": {
+      "max_inventory_qty": 100,
+      "max_notional": 300000,
+      "max_spread_ticks": 3.0,
+      "stale_quote_ms": 2000,
+      "enforce_session": true,
+      "consecutive_loss_limit": 1,
+      "cooling_seconds": 300,
+      "daily_loss_limit": 1000.0,
+      "open_start_hhmm": "09:00",
+      "open_end_hhmm": "11:30",
+      "open_start_hhmm_2": "12:30",
+      "open_end_hhmm_2": "15:30",
+      "max_entry_orders_per_minute": 2,
+      "max_cancel_requests_per_minute": 10,
+      "stale_board_ms": 30000,
+      "api_error_limit": 1,
+      "api_cooling_seconds": 300,
+      "order_latency_limit_ms": 3000,
+      "cancel_latency_limit_ms": 3000,
+      "poll_latency_limit_ms": 3000,
+      "latency_breach_limit": 2,
+      "fee_per_share": 0.0,
+      "slippage_ticks_default": 0.0
+    },
+    "signals": {
+      "book_depth_levels": 5,
+      "book_decay": 0.75,
+      "tape_window_seconds": 15,
+      "zscore_window": 120,
+      "mid_std_window": 60,
+      "min_best_volume": 1,
+      "use_microprice_tilt": true,
+      "kabu_bidask_reversed": false,
+      "auto_fix_negative_spread": true
+    },
+    "lollipop": {
+      "maker_tp_ticks": 2.0,
+      "taker_tp_ticks": 3.0,
+      "maker_max_hold_seconds": 45,
+      "taker_max_hold_seconds": 30,
+      "tp_delay_ms": 50,
+      "max_retries": 5,
+      "stop_loss_ticks": 0.0
+    },
+    "market_state": {
+      "enabled": true,
+      "abnormal_spread_ticks": 6.0,
+      "abnormal_event_rate_hz": 160.0,
+      "event_rate_window_seconds": 3,
+      "abnormal_price_jump_ticks": 4.0,
+      "event_burst_min_events": 6,
+      "queue_spread_max_ticks": 1.0
+    }
+  },
+  "stocks": [
+    {
+      "symbol": "9984",
+      "exchange": 27,
+      "tick_size": 1.0,
+      "lot_size": 100,
+      "strategy": {
+        "trade_qty": 100
+      },
+      "risk": {
+        "max_inventory_qty": 100,
+        "max_notional": 300000
+      }
+    },
+    {
+      "symbol": "7203",
+      "exchange": 27,
+      "tick_size": 1.0,
+      "lot_size": 100,
+      "strategy": {
+        "trade_qty": 100
+      },
+      "risk": {
+        "max_inventory_qty": 100,
+        "max_notional": 300000
+      }
+    }
+  ]
+}

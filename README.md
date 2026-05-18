@@ -26,6 +26,30 @@ python main.py --config config.example.json --sample
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
+`python main.py` is now the multi-symbol live launcher. It reads
+`config.live.multi.json` by default, generates one single-symbol worker config per stock, runs
+preflight first when `preflight_before_real=true`, then starts the real live workers.
+
+```powershell
+copy config.live.multi.example.json config.live.multi.json
+notepad config.live.multi.json
+python main.py
+```
+
+For validation runs with the same multi-symbol JSON:
+
+```powershell
+python main.py --mode preflight
+python main.py --mode shadow
+```
+
+The original single-symbol CLI is still available:
+
+```powershell
+python -m kabu_maker_taker.app --config config.example.json --sample
+python main.py --legacy-app --config config.example.json --sample
+```
+
 ## Event JSONL
 
 The CLI can also read normalized JSONL events:
@@ -52,6 +76,13 @@ data and broker snapshots, but never submits or cancels real orders:
 copy config.live.shadow.example.json config.live.shadow.json
 python main.py --config config.live.shadow.json --preflight-live
 python main.py --config config.live.shadow.json --live --shadow
+```
+
+For multi-symbol preflight + shadow, use the launcher:
+
+```powershell
+python main.py --mode preflight
+python main.py --mode shadow
 ```
 
 Real order submission is locked behind two explicit controls and is not recommended for the
@@ -81,6 +112,9 @@ Requirements:
   as `shadow_not_sent`; it never calls kabu `sendorder` or `cancelorder`.
 - `--live` without `--shadow` is rejected unless `--allow-real-orders` is provided, the preflight
   stamp is still fresh, and the configured `kabu.live_arm_path` file exists.
+- The multi-symbol launcher keeps these same real-order gates. For each stock it derives separate
+  `log_dir`, `halt_SYMBOL.txt`, `halt_hard_SYMBOL.txt`, and `live_arm_SYMBOL.txt` paths unless the
+  stock item explicitly overrides them.
 - `risk.order_latency_limit_ms`, `risk.cancel_latency_limit_ms`, `risk.poll_latency_limit_ms`,
   and `risk.latency_breach_limit` protect live mode from slow REST responses. The default is
   `3000ms` for each request class and `3` consecutive breaches.
