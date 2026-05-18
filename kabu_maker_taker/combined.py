@@ -17,9 +17,12 @@ via ``on_broker_fill()`` / ``on_broker_order_event()``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
+from .account_risk import AccountExposure, AccountRiskController
 from .broker import BrokerReconciliationSnapshot
 from .config import AppConfig
+from .volatility import ATREstimator
 from .journal import TradeJournal
 from .lollipop import LollipopTPManager
 from .metrics import MetricsCollector
@@ -39,6 +42,7 @@ from .models import (
     StrategyResult,
     TradePrint,
 )
+from .filters import FlowFlipDetector, JumpFilter
 from .orders import OrderLedger
 from .risk import RiskManager
 from .signals import MicrostructureSignalEngine
@@ -78,7 +82,13 @@ class CombinedMakerTakerStrategy:
         self.taker = TakerStrategy(config.strategy, tick_size=config.tick_size)
         self.risk = RiskManager(config=config.risk, tick_size=config.tick_size, lot_size=config.lot_size)
         self.confirmation = ConfirmationTracker()
-        self.lollipop = LollipopTPManager(config.lollipop, config.tick_size, config.lot_size)
+        self._atr = ATREstimator(
+            tick_size=config.tick_size,
+            alpha=config.lollipop.atr_ema_alpha,
+        ) if config.lollipop.atr_tp_enabled else None
+        self.lollipop = LollipopTPManager(
+            config.lollipop, config.tick_size, config.lot_size, atr_estimator=self._atr
+        )
         self.market_state_detector = MarketStateDetector(
             config.market_state,
             config.tick_size,
@@ -86,6 +96,18 @@ class CombinedMakerTakerStrategy:
         )
         self.orders = OrderLedger()
         self.metrics = MetricsCollector(tick_size=config.tick_size)
+        self.jump_filter = JumpFilter(
+            jump_mid_ticks=config.strategy.jump_mid_ticks if config.strategy.enable_jump_filter else 0.0,
+            jump_cooldown_ms=config.strategy.jump_cooldown_ms if config.strategy.enable_jump_filter else 0,
+        )
+        self.flow_flip = FlowFlipDetector(
+            threshold=config.strategy.flow_flip_threshold,
+            lob_enabled=config.strategy.flow_flip_lob_enabled,
+        )
+        self.account_risk = AccountRiskController(config.account_risk)
+        self._exposure_dir: Path | None = (
+            Path(config.account_risk.exposure_dir) if config.account_risk.enabled else None
+        )
         self.last_result: StrategyResult | None = None
         self.journal: TradeJournal | None = None   # set by app.py when enable_journal=True
         self._last_entry_signal: SignalPacket | None = None  # captured at entry fill
@@ -175,19 +197,21 @@ class CombinedMakerTakerStrategy:
         market_state = self.market_state_detector.update(snapshot, ts)
         market_fields = self._market_result_fields()
         signal = self.signals.on_board(snapshot)
+        self.jump_filter.on_board(snapshot.mid, self.config.tick_size, ts)
+        if self._atr is not None:
+            self._atr.update(snapshot.mid, snapshot.spread)
         self.metrics.on_board(snapshot)
         if self.journal is not None:
             self.journal.on_board(snapshot)
 
-        # Force-exit taker position when tape/LOB OFI flips to strong negative flow.
+        # Force-exit any position (Maker or Taker) when order-flow reverses strongly.
         if (
             self.position.qty > 0
-            and self.position.entry_mode == ENTRY_MODE_TAKER
-            and self.config.strategy.flow_flip_threshold > 0
             and self.lollipop.state.phase != LollipopPhase.TIMEOUT
-            and (
-                signal.tape_ofi_raw <= -self.config.strategy.flow_flip_threshold
-                or signal.lob_ofi_raw <= -self.config.strategy.flow_flip_threshold
+            and self.flow_flip.should_force_exit(
+                signal.tape_ofi_raw,
+                signal.lob_ofi_raw,
+                self.position.side,
             )
         ):
             self.lollipop.force_exit_next_tick()
@@ -283,6 +307,44 @@ class CombinedMakerTakerStrategy:
             )
             self.last_result = result
             return result
+
+        if self.jump_filter.is_blocked(ts):
+            self.confirmation.observe(EntryDecision(False, "jump_filter"))
+            result = StrategyResult(
+                None,
+                EntryDecision(False, "jump_filter"),
+                signal,
+                blocked_reason="jump_filter",
+                exit_intent=exit_intent,
+                exit_cancel_signal=exit_cancel_signal,
+                **market_fields,
+            )
+            self.last_result = result
+            return result
+
+        if self._exposure_dir is not None:
+            acct_ok, acct_reason = self.account_risk.evaluate_from_dir(
+                self._exposure_dir,
+                this_symbol=self.config.symbol,
+                own_inventory_qty=self.position.qty,
+                own_inventory_price=self.position.avg_price,
+                own_daily_pnl=self.risk.daily_pnl,
+                additional_qty=self.config.strategy.trade_qty,
+                additional_price=snapshot.ask,
+            )
+            if not acct_ok:
+                self.confirmation.reset()
+                result = StrategyResult(
+                    None,
+                    EntryDecision(False, acct_reason),
+                    signal,
+                    blocked_reason=acct_reason,
+                    exit_intent=exit_intent,
+                    exit_cancel_signal=exit_cancel_signal,
+                    **market_fields,
+                )
+                self.last_result = result
+                return result
 
         selection = self._select_entry(snapshot, signal, ts, market_state)
         decision = selection.decision
@@ -439,6 +501,7 @@ class CombinedMakerTakerStrategy:
         result = self._apply_broker_fill(order, fill_qty, fill_price, event.ts_ns) if fill_qty > 0 else order.status.value
         self._handle_final_order_state(order, event.ts_ns)
         self._refresh_working_entry_state()
+        self._write_exposure(event.ts_ns)
         return result
 
     def on_broker_fill(self, event: BrokerFillEvent) -> str:
@@ -448,7 +511,20 @@ class CombinedMakerTakerStrategy:
         result = self._apply_broker_fill(order, fill_qty, fill_price, event.ts_ns) if fill_qty > 0 else order.status.value
         self._handle_final_order_state(order, event.ts_ns)
         self._refresh_working_entry_state()
+        self._write_exposure(event.ts_ns)
         return result
+
+    def _write_exposure(self, now_ns: int) -> None:
+        if self._exposure_dir is None:
+            return
+        exposure = AccountExposure(
+            symbol=self.config.symbol,
+            inventory_qty=self.position.qty,
+            inventory_price=self.position.avg_price,
+            daily_pnl=self.risk.daily_pnl,
+            ts_ns=now_ns,
+        )
+        self.account_risk.write_exposure(self._exposure_dir, exposure)
 
     def request_cancel(self, order_id: str, reason: str = "", now_ns: int = 0) -> OrderState | None:
         order = self.orders.mark_cancel_pending(order_id, reason=reason, now_ns=now_ns)

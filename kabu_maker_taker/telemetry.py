@@ -43,6 +43,9 @@ class DecisionTraceWriter:
         result: StrategyResult,
         position: PositionState,
         now_ns: int,
+        *,
+        latency_p95_submit_ms: float = 0.0,
+        latency_p99_submit_ms: float = 0.0,
     ) -> None:
         """Append one JSON line to decisions.jsonl.  No-op when disabled."""
         if not self.enabled or self._fh is None:
@@ -110,6 +113,8 @@ class DecisionTraceWriter:
             "position_avg_price": position.avg_price,
             "position_entry_mode": position.entry_mode,
             "position_entry_ts_ns": position.entry_ts_ns,
+            "latency_p95_submit_ms": round(latency_p95_submit_ms, 3),
+            "latency_p99_submit_ms": round(latency_p99_submit_ms, 3),
         }
         self._fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
         self._fh.flush()

@@ -283,8 +283,8 @@ class FlowFlipExitTests(unittest.TestCase):
         # After flow-flip, lollipop should have transitioned to TIMEOUT
         self.assertEqual(strategy.lollipop.phase, LollipopPhase.TIMEOUT)
 
-    def test_flow_flip_not_triggered_for_maker_position(self) -> None:
-        """Flow-flip guard only applies to taker entries; maker positions are unaffected."""
+    def test_flow_flip_triggered_for_maker_position(self) -> None:
+        """Flow-flip guard applies to both Maker and Taker positions."""
         strategy = _make_strategy(flow_flip_threshold=0.15)
         strategy.position = PositionState(
             side=1, qty=100, avg_price=100.0, entry_mode=ENTRY_MODE_MAKER
@@ -292,7 +292,6 @@ class FlowFlipExitTests(unittest.TestCase):
         ts = 1_000_000_000_000
         strategy.lollipop.on_entry_fill(avg_price=100.0, entry_mode=ENTRY_MODE_MAKER,
                                         now_ns=ts, entry_side=1)
-        phase_after_entry = strategy.lollipop.phase  # SCHEDULED
 
         bad_signal = _signal(tape_ofi_raw=-0.20, lob_ofi_raw=-0.20)
         strategy.signals.on_board = MagicMock(return_value=bad_signal)
@@ -300,8 +299,8 @@ class FlowFlipExitTests(unittest.TestCase):
         snap = _snap(ts_ns=ts + 500_000_000)
         strategy.on_board(snap, now_ns=ts + 500_000_000)
 
-        # Maker position must NOT be force-exited by flow-flip
-        self.assertNotEqual(strategy.lollipop.phase, LollipopPhase.TIMEOUT)
+        # Maker position IS force-exited by flow-flip (extended coverage vs old behaviour)
+        self.assertEqual(strategy.lollipop.phase, LollipopPhase.TIMEOUT)
 
     def test_flow_flip_disabled_when_zero(self) -> None:
         """flow_flip_threshold=0 → no force exit even with extreme negative tape."""

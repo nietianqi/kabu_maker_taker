@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .account_risk import AccountRiskConfig
+
 
 @dataclass(frozen=True, slots=True)
 class SignalWeights:
@@ -180,6 +182,12 @@ class StrategyConfig:
     adaptive_maker_min_edge_ticks: float = 0.25
     # Adaptive selector: urgency score required for taker to beat a valid maker quote
     adaptive_taker_urgency_score: int = 2
+    # Jump filter (P0-B): block entry for jump_cooldown_ms after mid moves > jump_mid_ticks (0 = disabled)
+    enable_jump_filter: bool = False
+    jump_mid_ticks: float = 3.0
+    jump_cooldown_ms: int = 500
+    # Flow flip (P0-C): also check lob_ofi (in addition to tape_ofi) when deciding forced exit
+    flow_flip_lob_enabled: bool = True
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "StrategyConfig":
@@ -239,6 +247,10 @@ class StrategyConfig:
             entry_selection_policy=str(payload.get("entry_selection_policy", "adaptive")),
             adaptive_maker_min_edge_ticks=float(payload.get("adaptive_maker_min_edge_ticks", 0.25)),
             adaptive_taker_urgency_score=int(payload.get("adaptive_taker_urgency_score", 2)),
+            enable_jump_filter=bool(payload.get("enable_jump_filter", False)),
+            jump_mid_ticks=float(payload.get("jump_mid_ticks", 3.0)),
+            jump_cooldown_ms=int(payload.get("jump_cooldown_ms", 500)),
+            flow_flip_lob_enabled=bool(payload.get("flow_flip_lob_enabled", True)),
         )
 
 
@@ -271,6 +283,9 @@ class RiskConfig:
     latency_breach_limit: int = 3
     # Stale-board guard: block entry + cancel working order if inter-board gap > this ms (0 = disabled)
     stale_board_ms: int = 0
+    # Requote budget: cap maker-order reprices per minute + cooldown on exhaustion (0 = disabled)
+    max_requotes_per_minute: int = 0
+    requote_cooldown_ms: int = 5000
     # Cost model for dry-run accounting/backtest estimates
     fee_per_share: float = 0.0
     slippage_ticks_default: float = 0.0
@@ -300,6 +315,8 @@ class RiskConfig:
             poll_latency_limit_ms=int(payload.get("poll_latency_limit_ms", 3000)),
             latency_breach_limit=int(payload.get("latency_breach_limit", 3)),
             stale_board_ms=int(payload.get("stale_board_ms", 0)),
+            max_requotes_per_minute=int(payload.get("max_requotes_per_minute", 0)),
+            requote_cooldown_ms=int(payload.get("requote_cooldown_ms", 5000)),
             fee_per_share=float(payload.get("fee_per_share", 0.0)),
             slippage_ticks_default=float(payload.get("slippage_ticks_default", 0.0)),
         )
@@ -338,6 +355,11 @@ class LollipopConfig:
     tp_delay_ms: int = 50
     max_retries: int = 5
     stop_loss_ticks: float = 0.0  # 0 = disabled
+    # ATR-adaptive TP: scale TP ticks by recent volatility (disabled by default)
+    atr_tp_enabled: bool = False
+    atr_tp_multiplier: float = 1.5
+    atr_tp_max_ticks: float = 5.0
+    atr_ema_alpha: float = 0.1
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "LollipopConfig":
@@ -350,6 +372,10 @@ class LollipopConfig:
             tp_delay_ms=int(payload.get("tp_delay_ms", 50)),
             max_retries=int(payload.get("max_retries", 5)),
             stop_loss_ticks=float(payload.get("stop_loss_ticks", 0.0)),
+            atr_tp_enabled=bool(payload.get("atr_tp_enabled", False)),
+            atr_tp_multiplier=float(payload.get("atr_tp_multiplier", 1.5)),
+            atr_tp_max_ticks=float(payload.get("atr_tp_max_ticks", 5.0)),
+            atr_ema_alpha=float(payload.get("atr_ema_alpha", 0.1)),
         )
 
 
@@ -405,6 +431,7 @@ class KabuConfig:
     live_preflight_max_age_minutes: int = 30
     live_arm_path: str = "live_arm.txt"
     startup_open_order_policy: str = "reject"
+    startup_position_policy: str = "reject"   # "reject" | "restore"
     order_profile: OrderProfile = field(default_factory=OrderProfile)
 
     @classmethod
@@ -423,6 +450,7 @@ class KabuConfig:
             live_preflight_max_age_minutes=int(payload.get("live_preflight_max_age_minutes", 30)),
             live_arm_path=str(payload.get("live_arm_path", "live_arm.txt")),
             startup_open_order_policy=str(payload.get("startup_open_order_policy", "reject")),
+            startup_position_policy=str(payload.get("startup_position_policy", "reject")),
             order_profile=OrderProfile.from_dict(payload.get("order_profile")),
         )
 
@@ -440,6 +468,8 @@ class AppConfig:
     lollipop: LollipopConfig = field(default_factory=LollipopConfig)
     market_state: MarketStateConfig = field(default_factory=MarketStateConfig)
     kabu: KabuConfig = field(default_factory=KabuConfig)
+    # Cross-symbol account risk (P0-A): enabled=False by default for backward compat
+    account_risk: AccountRiskConfig = field(default_factory=AccountRiskConfig)
     # Trade journal: write trades.csv + markouts.csv to log_dir
     log_dir: str = "logs"
     enable_journal: bool = False
@@ -463,6 +493,7 @@ class AppConfig:
             lollipop=LollipopConfig.from_dict(payload.get("lollipop")),
             market_state=MarketStateConfig.from_dict(payload.get("market_state")),
             kabu=KabuConfig.from_dict(payload.get("kabu")),
+            account_risk=AccountRiskConfig.from_dict(payload.get("account_risk")),
             log_dir=str(payload.get("log_dir", "logs")),
             enable_journal=bool(payload.get("enable_journal", False)),
             enable_decision_trace=bool(payload.get("enable_decision_trace", False)),

@@ -26,6 +26,7 @@ from .models import (
     OrderIntent,
     PositionState,
 )
+from .volatility import ATREstimator
 
 
 class LollipopTPManager:
@@ -44,11 +45,18 @@ class LollipopTPManager:
                                                             TIMEOUT ──force-exit fills──► IDLE
     """
 
-    def __init__(self, config: LollipopConfig, tick_size: float, lot_size: int) -> None:
+    def __init__(
+        self,
+        config: LollipopConfig,
+        tick_size: float,
+        lot_size: int,
+        atr_estimator: ATREstimator | None = None,
+    ) -> None:
         self.config = config
         self.tick_size = max(tick_size, 1e-9)
         self.lot_size = max(lot_size, 1)
         self.state = LollipopState()
+        self._atr: ATREstimator | None = atr_estimator if config.atr_tp_enabled else None
 
     # ------------------------------------------------------------------
     # Public event API
@@ -268,9 +276,15 @@ class LollipopTPManager:
     # ------------------------------------------------------------------
 
     def _calc_tp_price(self, avg_price: float, entry_mode: str, entry_side: int = 1) -> float:
-        tp_ticks = (
+        base_ticks = (
             self.config.maker_tp_ticks if entry_mode == "maker" else self.config.taker_tp_ticks
         )
+        if self._atr is not None and self._atr.atr_ticks > 0.0:
+            atr_ticks = self._atr.atr_ticks * self.config.atr_tp_multiplier
+            max_ticks = self.config.atr_tp_max_ticks if self.config.atr_tp_max_ticks > 0 else atr_ticks
+            tp_ticks = min(max(base_ticks, atr_ticks), max_ticks)
+        else:
+            tp_ticks = base_ticks
         if entry_side >= 0:
             raw = avg_price + tp_ticks * self.tick_size
             exit_side = -1

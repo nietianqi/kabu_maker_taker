@@ -23,12 +23,52 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from .config import RiskConfig
+from .latency_tracker import LatencyHistogram
 from .models import BoardSnapshot, EntryDecision, MarketState, PositionState
 
 JST = timezone(timedelta(hours=9))
 ONE_MINUTE_NS = 60_000_000_000
 URGENT_CANCEL_REASONS = {"abnormal_market", "spread_expanded", "stale_board"}
 LATENCY_REQUEST_KINDS = ("submit", "cancel", "poll")
+
+
+class RequoteBudget:
+    """Cap maker-order reprices within a rolling 1-minute window.
+
+    When ``max_per_minute`` requotes are consumed, all further requotes are
+    blocked for ``requote_cooldown_ms`` to prevent burst repricing.
+    Set ``max_per_minute=0`` to disable.
+    """
+
+    __slots__ = ("_max_per_minute", "_cooldown_ns", "_times", "_blocked_until_ns")
+
+    def __init__(self, max_per_minute: int, requote_cooldown_ms: int) -> None:
+        self._max_per_minute = max_per_minute
+        self._cooldown_ns = requote_cooldown_ms * 1_000_000
+        self._times: deque[int] = deque()
+        self._blocked_until_ns: int = 0
+
+    def is_blocked(self, now_ns: int) -> bool:
+        if self._max_per_minute <= 0:
+            return False
+        if self._blocked_until_ns > 0:
+            if now_ns < self._blocked_until_ns:
+                return True
+            self._blocked_until_ns = 0
+        self._trim(now_ns)
+        return len(self._times) >= self._max_per_minute
+
+    def record_requote(self, now_ns: int) -> None:
+        if self._max_per_minute <= 0 or now_ns <= 0:
+            return
+        self._trim(now_ns)
+        self._times.append(now_ns)
+        if len(self._times) >= self._max_per_minute and self._cooldown_ns > 0:
+            self._blocked_until_ns = now_ns + self._cooldown_ns
+
+    def _trim(self, now_ns: int) -> None:
+        while self._times and now_ns - self._times[0] >= ONE_MINUTE_NS:
+            self._times.popleft()
 
 
 class RiskManager:
@@ -47,8 +87,15 @@ class RiskManager:
         self._latency_last_ms: dict[str, float] = {kind: 0.0 for kind in LATENCY_REQUEST_KINDS}
         self._latency_breach_counts: dict[str, int] = {kind: 0 for kind in LATENCY_REQUEST_KINDS}
         self._latency_circuit_open_until_ns: int = 0
+        self._latency_histograms: dict[str, LatencyHistogram] = {
+            kind: LatencyHistogram() for kind in LATENCY_REQUEST_KINDS
+        }
         self._soft_kill_active: bool = False
         self._last_board_ts_ns: int = 0
+        self._requote_budget = RequoteBudget(
+            max_per_minute=config.max_requotes_per_minute,
+            requote_cooldown_ms=config.requote_cooldown_ms,
+        )
 
     def update_board_ts(self, ts_ns: int) -> None:
         """Record the latest board timestamp for inter-board gap tracking."""
@@ -132,11 +179,14 @@ class RiskManager:
         self._entry_order_times.append(now_ns)
 
     def can_send_cancel_signal(self, reason: str, now_ns: int) -> tuple[bool, str]:
-        if not reason or reason in URGENT_CANCEL_REASONS or self.config.max_cancel_requests_per_minute <= 0:
+        if not reason or reason in URGENT_CANCEL_REASONS:
             return True, ""
-        self._trim_window(self._cancel_request_times, now_ns)
-        if len(self._cancel_request_times) >= self.config.max_cancel_requests_per_minute:
-            return False, "cancel_rate_limit"
+        if self.config.max_cancel_requests_per_minute > 0:
+            self._trim_window(self._cancel_request_times, now_ns)
+            if len(self._cancel_request_times) >= self.config.max_cancel_requests_per_minute:
+                return False, "cancel_rate_limit"
+        if self._requote_budget.is_blocked(now_ns):
+            return False, "requote_budget_exhausted"
         return True, ""
 
     def record_cancel_request(self, reason: str, now_ns: int) -> None:
@@ -144,6 +194,7 @@ class RiskManager:
             return
         self._trim_window(self._cancel_request_times, now_ns)
         self._cancel_request_times.append(now_ns)
+        self._requote_budget.record_requote(now_ns)
 
     def record_api_error(self, now_ns: int) -> bool:
         if self.config.api_error_limit <= 0:
@@ -170,6 +221,7 @@ class RiskManager:
 
         was_open = self._latency_circuit_open(now_ns)
         self._latency_last_ms[kind] = max(float(latency_ms), 0.0)
+        self._latency_histograms[kind].record(float(latency_ms))
         if was_open:
             return False
 
@@ -277,6 +329,14 @@ class RiskManager:
 
     def last_latency_ms(self, request_kind: str) -> float:
         return self._latency_last_ms.get(request_kind.strip().lower(), 0.0)
+
+    def latency_p95_ms(self, request_kind: str) -> float:
+        hist = self._latency_histograms.get(request_kind.strip().lower())
+        return hist.p95 if hist else 0.0
+
+    def latency_p99_ms(self, request_kind: str) -> float:
+        hist = self._latency_histograms.get(request_kind.strip().lower())
+        return hist.p99 if hist else 0.0
 
     def _api_circuit_open(self, now_ns: int) -> bool:
         if self.config.api_error_limit <= 0:

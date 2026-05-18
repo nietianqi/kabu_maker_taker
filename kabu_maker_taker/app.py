@@ -304,7 +304,13 @@ def main(argv: list[str] | None = None) -> int:
             if halt_reason:
                 return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
         result = strategy.on_board(snapshot, now_ns=now_ns)
-        tracer.record(result, strategy.position, now_ns)
+        tracer.record(
+            result,
+            strategy.position,
+            now_ns,
+            latency_p95_submit_ms=strategy.risk.latency_p95_ms("submit"),
+            latency_p99_submit_ms=strategy.risk.latency_p99_ms("submit"),
+        )
         if result.exit_cancel_signal:
             halt_reason = _handle_exit_cancel_signal(
                 strategy,
