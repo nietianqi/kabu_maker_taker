@@ -15,6 +15,7 @@
     "order_rate_per_sec": 1.0,
     "poll_rate_per_sec": 2.0,
     "poll_interval_ms": 500,
+    "register_exchange": 0,
     "websocket_url": "",
     "websocket_reconnect_attempts": 1,
     "websocket_preflight_messages": 3,
@@ -53,8 +54,8 @@
     "adaptive_taker_urgency_score": 2
   },
   "risk": {
-    "max_inventory_qty": 100,
-    "max_notional": 300000,
+    "max_inventory_qty": 400,
+    "max_notional": 450000,
     "max_spread_ticks": 3.0,
     "stale_quote_ms": 2000,
     "enforce_session": true,
@@ -75,7 +76,8 @@
     "poll_latency_limit_ms": 3000,
     "latency_breach_limit": 2,
     "fee_per_share": 0.0,
-    "slippage_ticks_default": 0.0
+    "slippage_ticks_default": 0.0,
+    "prevent_loss_exit": true
   },
   "signals": {
     "book_depth_levels": 5,
@@ -85,7 +87,7 @@
     "mid_std_window": 60,
     "min_best_volume": 1,
     "use_microprice_tilt": true,
-    "kabu_bidask_reversed": false,
+    "kabu_bidask_reversed": true,
     "auto_fix_negative_spread": true
   },
   "lollipop": {

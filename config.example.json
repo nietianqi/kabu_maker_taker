@@ -114,7 +114,8 @@
     "poll_latency_limit_ms": 3000,
     "latency_breach_limit": 3,
     "fee_per_share": 0.0,
-    "slippage_ticks_default": 0.0
+    "slippage_ticks_default": 0.0,
+    "prevent_loss_exit": false
   },
   "signals": {
     "book_depth_levels": 5,

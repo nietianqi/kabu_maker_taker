@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,7 @@ from pathlib import Path
 from kabu_maker_taker.app import _handle_live_execution, _validate_live_config
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
 from kabu_maker_taker.config import AppConfig, KabuConfig, OrderProfile, RiskConfig, StrategyConfig
+from kabu_maker_taker.execution.client import SHARED_KABU_TOKEN_ENABLED_ENV, SHARED_KABU_TOKEN_ENV
 from kabu_maker_taker.kabu_rest import (
     KabuApiError,
     KabuRestClient,
@@ -64,6 +67,7 @@ class KabuConfigTests(unittest.TestCase):
                     "poll_interval_ms": 0,
                     "websocket_url": "ws://localhost:18081/kabusapi/websocket",
                     "websocket_reconnect_attempts": 5,
+                    "register_exchange": 3,
                     "order_profile": {
                         "mode": "cash",
                         "front_order_type_market": 120,
@@ -78,6 +82,7 @@ class KabuConfigTests(unittest.TestCase):
         self.assertEqual(config.kabu.api_password, "secret")
         self.assertEqual(config.kabu.websocket_url, "ws://localhost:18081/kabusapi/websocket")
         self.assertEqual(config.kabu.websocket_reconnect_attempts, 5)
+        self.assertEqual(config.kabu.register_exchange, 3)
         self.assertEqual(config.kabu.startup_open_order_policy, "reject")
         self.assertEqual(config.kabu.order_profile.mode, "cash")
         self.assertEqual(config.kabu.order_profile.front_order_type_market, 120)
@@ -230,6 +235,8 @@ class KabuRestExecutorTests(unittest.TestCase):
     class FakeClient:
         def __init__(self) -> None:
             self.sent_entry = False
+            self.register_calls: list[tuple[str, int]] = []
+            self.unregister_calls: list[tuple[str, int]] = []
 
         def get_token(self, password: str) -> str:
             if not password:
@@ -245,6 +252,14 @@ class KabuRestExecutorTests(unittest.TestCase):
 
         def cancel_order(self, _order_id: str):
             return {"ResultCode": 0}
+
+        def register_symbol(self, symbol: str, exchange: int):
+            self.register_calls.append((symbol, exchange))
+            return {"RegistList": []}
+
+        def unregister_symbol(self, symbol: str, exchange: int):
+            self.unregister_calls.append((symbol, exchange))
+            return {"RegistList": []}
 
         def get_orders(self, order_id=None, product=0, lane="poll"):
             _ = (product, lane)
@@ -315,6 +330,174 @@ class KabuRestExecutorTests(unittest.TestCase):
 
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0].entry_mode, "broker_unknown")
+
+    def test_start_uses_shared_launcher_token_without_reissuing(self) -> None:
+        class SharedTokenClient(self.FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.used_token = ""
+                self.used_password = ""
+                self.get_token_called = False
+
+            def use_token(self, token: str, *, password: str | None = None) -> str:
+                self.used_token = token
+                self.used_password = password or ""
+                return token
+
+            def get_token(self, password: str) -> str:
+                self.get_token_called = True
+                return super().get_token(password)
+
+        old_enabled = os.environ.get(SHARED_KABU_TOKEN_ENABLED_ENV)
+        old_token = os.environ.get(SHARED_KABU_TOKEN_ENV)
+        os.environ[SHARED_KABU_TOKEN_ENABLED_ENV] = "1"
+        os.environ[SHARED_KABU_TOKEN_ENV] = "SHARED-TOKEN"
+        try:
+            client = SharedTokenClient()
+            config = AppConfig(kabu=KabuConfig(api_password="pw", poll_interval_ms=0))
+            executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+
+            token = executor.start()
+        finally:
+            if old_enabled is None:
+                os.environ.pop(SHARED_KABU_TOKEN_ENABLED_ENV, None)
+            else:
+                os.environ[SHARED_KABU_TOKEN_ENABLED_ENV] = old_enabled
+            if old_token is None:
+                os.environ.pop(SHARED_KABU_TOKEN_ENV, None)
+            else:
+                os.environ[SHARED_KABU_TOKEN_ENV] = old_token
+
+        self.assertEqual(token, "SHARED-TOKEN")
+        self.assertEqual(client.used_token, "SHARED-TOKEN")
+        self.assertEqual(client.used_password, "pw")
+        self.assertFalse(client.get_token_called)
+
+    def test_snapshot_retries_once_with_worker_token_after_shared_401(self) -> None:
+        class Shared401Client(self.FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.token = ""
+                self.get_token_calls = 0
+                self.get_orders_calls = 0
+
+            def use_token(self, token: str, *, password: str | None = None) -> str:
+                _ = password
+                self.token = token
+                return token
+
+            def get_token(self, password: str) -> str:
+                self.get_token_calls += 1
+                self.token = "WORKER-TOKEN"
+                return self.token
+
+            def get_orders(self, order_id=None, product=0, lane="poll"):
+                _ = (order_id, product, lane)
+                self.get_orders_calls += 1
+                if self.token == "SHARED-TOKEN":
+                    raise KabuApiError(
+                        "GET /kabusapi/orders failed with status 401",
+                        status=401,
+                        payload={"Code": 4001009, "Message": "APIキー不一致"},
+                    )
+                return []
+
+        old_enabled = os.environ.get(SHARED_KABU_TOKEN_ENABLED_ENV)
+        old_token = os.environ.get(SHARED_KABU_TOKEN_ENV)
+        os.environ[SHARED_KABU_TOKEN_ENABLED_ENV] = "1"
+        os.environ[SHARED_KABU_TOKEN_ENV] = "SHARED-TOKEN"
+        try:
+            client = Shared401Client()
+            config = AppConfig(kabu=KabuConfig(api_password="pw", startup_open_order_policy="ignore"))
+            executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+            executor.start()
+
+            snapshot = executor.snapshot()
+        finally:
+            if old_enabled is None:
+                os.environ.pop(SHARED_KABU_TOKEN_ENABLED_ENV, None)
+            else:
+                os.environ[SHARED_KABU_TOKEN_ENABLED_ENV] = old_enabled
+            if old_token is None:
+                os.environ.pop(SHARED_KABU_TOKEN_ENV, None)
+            else:
+                os.environ[SHARED_KABU_TOKEN_ENV] = old_token
+
+        self.assertEqual(snapshot.positions, ())
+        self.assertEqual(client.get_orders_calls, 2)
+        self.assertEqual(client.get_token_calls, 1)
+        self.assertEqual(executor.auth_context()["token_source"], "worker_retry_after_shared_401")
+        self.assertEqual(
+            executor.auth_context()["token_sha256_8"],
+            hashlib.sha256(b"WORKER-TOKEN").hexdigest()[:8],
+        )
+
+    def test_start_ignores_shared_token_without_launcher_enable_flag(self) -> None:
+        class TokenClient(self.FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.use_token_called = False
+
+            def use_token(self, token: str, *, password: str | None = None) -> str:
+                _ = (token, password)
+                self.use_token_called = True
+                return token
+
+            def get_token(self, password: str) -> str:
+                _ = password
+                return "NEW-TOKEN"
+
+        old_enabled = os.environ.get(SHARED_KABU_TOKEN_ENABLED_ENV)
+        old_token = os.environ.get(SHARED_KABU_TOKEN_ENV)
+        os.environ.pop(SHARED_KABU_TOKEN_ENABLED_ENV, None)
+        os.environ[SHARED_KABU_TOKEN_ENV] = "STALE-TOKEN"
+        try:
+            client = TokenClient()
+            config = AppConfig(kabu=KabuConfig(api_password="pw", poll_interval_ms=0))
+            executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+
+            token = executor.start()
+        finally:
+            if old_enabled is None:
+                os.environ.pop(SHARED_KABU_TOKEN_ENABLED_ENV, None)
+            else:
+                os.environ[SHARED_KABU_TOKEN_ENABLED_ENV] = old_enabled
+            if old_token is None:
+                os.environ.pop(SHARED_KABU_TOKEN_ENV, None)
+            else:
+                os.environ[SHARED_KABU_TOKEN_ENV] = old_token
+
+        self.assertEqual(token, "NEW-TOKEN")
+        self.assertFalse(client.use_token_called)
+
+    def test_market_data_register_uses_tse_for_tse_family_trading_exchange(self) -> None:
+        for trade_exchange in (9, 27):
+            client = self.FakeClient()
+            config = AppConfig(
+                symbol="9984",
+                exchange=trade_exchange,
+                kabu=KabuConfig(api_password="pw", poll_interval_ms=0),
+            )
+            executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+
+            executor.register_market_data()
+            executor.unregister_market_data()
+
+            self.assertEqual(client.register_calls, [("9984", 1)])
+            self.assertEqual(client.unregister_calls, [("9984", 1)])
+
+    def test_market_data_register_uses_explicit_register_exchange(self) -> None:
+        client = self.FakeClient()
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            kabu=KabuConfig(api_password="pw", poll_interval_ms=0, register_exchange=3),
+        )
+        executor = KabuRestExecutor(config, client=client)  # type: ignore[arg-type]
+
+        executor.register_market_data()
+
+        self.assertEqual(client.register_calls, [("9984", 3)])
 
     def test_submit_taker_entry_maps_to_ioc_limit(self) -> None:
         class CapturingClient(self.FakeClient):
@@ -981,6 +1164,14 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
         errors = _validate_live_config(config, raw_config=config_payload)
 
         self.assertIn("kabu.startup_open_order_policy valid", errors)
+
+    def test_live_rejects_invalid_register_exchange(self) -> None:
+        config_payload = self._live_safe_config(kabu={"api_password": "pw", "register_exchange": 9})
+        config = AppConfig.from_dict(config_payload)
+
+        errors = _validate_live_config(config, raw_config=config_payload)
+
+        self.assertIn("kabu.register_exchange valid", errors)
 
     def test_live_accepts_supported_entry_selection_policies(self) -> None:
         for policy in ("adaptive", "taker_priority", "maker_priority"):

@@ -201,8 +201,20 @@ class CombinedMakerTakerStrategy:
         )
         exit_cancel_signal = ""
         exit_intent = None
+        exit_blocked_reason = ""
         if lollipop_action.intent is not None:
-            if lollipop_action.action == "force_exit" and self.orders.active_by_role(ORDER_ROLE_EXIT):
+            exit_allowed, maybe_exit_blocked_reason = self.risk.can_exit_without_loss(
+                intent=lollipop_action.intent,
+                position=self.position,
+                max_slip_ticks=self.config.strategy.max_slip_ticks,
+                snapshot=snapshot,
+            )
+            if not exit_allowed:
+                exit_blocked_reason = maybe_exit_blocked_reason
+                self.metrics.record_risk_block("loss_exit_blocked")
+                if lollipop_action.action == "force_exit":
+                    self.lollipop.reset_force_exit()
+            elif lollipop_action.action == "force_exit" and self.orders.active_by_role(ORDER_ROLE_EXIT):
                 exit_cancel_signal = "replace_active_exit_before_force_exit"
             else:
                 exit_intent = self._track_intent(lollipop_action.intent, role=ORDER_ROLE_EXIT, now_ns=ts)
@@ -274,9 +286,9 @@ class CombinedMakerTakerStrategy:
         if self.position.qty > 0 and self.lollipop.is_busy:
             result = StrategyResult(
                 None,
-                EntryDecision(False, "lollipop_active"),
+                EntryDecision(False, exit_blocked_reason or "lollipop_active"),
                 signal,
-                blocked_reason="lollipop_active",
+                blocked_reason=exit_blocked_reason or "lollipop_active",
                 exit_intent=exit_intent,
                 exit_cancel_signal=exit_cancel_signal,
                 **market_fields,
@@ -660,6 +672,16 @@ class CombinedMakerTakerStrategy:
             exchange=self.config.exchange,
         )
         if action.action != "force_exit" or action.intent is None:
+            return None
+        exit_allowed, _reason = self.risk.can_exit_without_loss(
+            intent=action.intent,
+            position=self.position,
+            max_slip_ticks=self.config.strategy.max_slip_ticks,
+            snapshot=snapshot,
+        )
+        if not exit_allowed:
+            self.metrics.record_risk_block("loss_exit_blocked")
+            self.lollipop.reset_force_exit()
             return None
         intent = self._track_intent(action.intent, role=ORDER_ROLE_EXIT, now_ns=now_ns)
         self.metrics.record_exit_intent(intent)

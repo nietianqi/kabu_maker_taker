@@ -213,6 +213,29 @@ class DryRunHaltTests(unittest.TestCase):
         # The simulator should have received a market sell — position should be flat
         self.assertEqual(strategy.position.qty, 0)
 
+    def test_dry_run_halt_does_not_flatten_loss_when_prevent_loss_exit_enabled(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            tick_size=1.0,
+            lot_size=100,
+            risk=RiskConfig(max_spread_ticks=5.0, prevent_loss_exit=True),
+            lollipop=LollipopConfig(tp_delay_ms=0, maker_max_hold_seconds=300, taker_max_hold_seconds=300),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        simulator = DryRunSimulator(tick_size=1.0, slippage_ticks=0)
+        snapshot = _make_snap(bid=99.0, ask=100.0)
+        now_ns = snapshot.ts_ns
+
+        strategy.position.side = 1
+        strategy.position.qty = 100
+        strategy.position.avg_price = 100.0
+        strategy.lollipop.on_entry_fill(100.0, "maker", now_ns=now_ns, entry_side=1)
+
+        _emergency_flatten_simulator(strategy, simulator, snapshot, now_ns)
+
+        self.assertEqual(strategy.position.qty, 100)
+
 
 if __name__ == "__main__":
     unittest.main()

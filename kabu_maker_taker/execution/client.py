@@ -38,6 +38,8 @@ _POLLING_PATHS: frozenset[str] = frozenset(
 _REQUEST_LANE_ORDER = "order"
 _REQUEST_LANE_POLL = "poll"
 _TSE_PLUS_RETRY_CODES: frozenset[int] = frozenset({100368, 100378})
+SHARED_KABU_TOKEN_ENABLED_ENV = "KABU_MAKER_TAKER_USE_SHARED_KABU_TOKEN"
+SHARED_KABU_TOKEN_ENV = "KABU_MAKER_TAKER_SHARED_KABU_TOKEN"
 
 
 class _TokenBucket:
@@ -73,6 +75,15 @@ class KabuRestClient:
     @property
     def token(self) -> str | None:
         return self._token
+
+    def use_token(self, token: str, *, password: str | None = None) -> str:
+        token = str(token or "").strip()
+        if not token:
+            raise KabuApiError("shared kabu token is empty")
+        self._token = token
+        if password is not None:
+            self._password = password
+        return token
 
     def get_token(self, password: str) -> str:
         data = self._request_json(

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from kabu_maker_taker.config import LollipopConfig
+from kabu_maker_taker.combined import CombinedMakerTakerStrategy
+from kabu_maker_taker.config import AppConfig, LollipopConfig, RiskConfig, StrategyConfig
 from kabu_maker_taker.lollipop import LollipopTPManager
 from kabu_maker_taker.models import BoardSnapshot, Level, LollipopPhase, PositionState
 
@@ -807,6 +808,41 @@ class TpPriceGuardTests(unittest.TestCase):
         else:
             self.assertEqual(action.action, "none",
                              "zero tp_price must not produce a submit_tp action")
+
+
+class LossExitProtectionTests(unittest.TestCase):
+    def _strategy(self) -> CombinedMakerTakerStrategy:
+        return CombinedMakerTakerStrategy(
+            AppConfig(
+                symbol="9984",
+                tick_size=1.0,
+                lot_size=100,
+                strategy=StrategyConfig(max_slip_ticks=0.0),
+                risk=RiskConfig(max_spread_ticks=5.0, prevent_loss_exit=True),
+                lollipop=LollipopConfig(tp_delay_ms=0, maker_max_hold_seconds=1, taker_max_hold_seconds=1),
+            )
+        )
+
+    def test_timeout_loss_does_not_emit_exit_intent(self) -> None:
+        strategy = self._strategy()
+        strategy.restore_position(side=1, qty=100, avg_price=100.0, entry_mode="maker", now_ns=0, manage_exit=False)
+        strategy.lollipop.restore_active_exit(tp_price=102.0, entry_mode="maker", entry_side=1, entry_ts_ns=0)
+
+        result = strategy.on_board(_snap(bid=99.0, ask=100.0), now_ns=2_000_000_000)
+
+        self.assertIsNone(result.exit_intent)
+        self.assertTrue(result.blocked_reason.startswith("loss_exit_blocked"))
+
+    def test_timeout_non_loss_can_emit_exit_intent(self) -> None:
+        strategy = self._strategy()
+        strategy.restore_position(side=1, qty=100, avg_price=100.0, entry_mode="maker", now_ns=0, manage_exit=False)
+        strategy.lollipop.restore_active_exit(tp_price=102.0, entry_mode="maker", entry_side=1, entry_ts_ns=0)
+
+        result = strategy.on_board(_snap(bid=100.0, ask=101.0), now_ns=2_000_000_000)
+
+        self.assertIsNotNone(result.exit_intent)
+        assert result.exit_intent is not None
+        self.assertEqual(result.exit_intent.reason, "timeout_exit")
 
 
 if __name__ == "__main__":

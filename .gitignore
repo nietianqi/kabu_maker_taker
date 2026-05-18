@@ -15,6 +15,7 @@ env/
 *.log
 logs/
 config.json
+config.live.multi.json
 
 .claude/
 .idea/

@@ -19,11 +19,12 @@ partial exits.
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from .config import RiskConfig
-from .models import BoardSnapshot, EntryDecision, MarketState, PositionState
+from .models import BoardSnapshot, EntryDecision, MarketState, OrderIntent, PositionState
 
 JST = timezone(timedelta(hours=9))
 ONE_MINUTE_NS = 60_000_000_000
@@ -138,6 +139,56 @@ class RiskManager:
         if len(self._cancel_request_times) >= self.config.max_cancel_requests_per_minute:
             return False, "cancel_rate_limit"
         return True, ""
+
+    def can_exit_without_loss(
+        self,
+        *,
+        intent: OrderIntent,
+        position: PositionState,
+        max_slip_ticks: float,
+        snapshot: BoardSnapshot | None = None,
+    ) -> tuple[bool, str]:
+        if not self.config.prevent_loss_exit:
+            return True, "ok"
+        if position.qty <= 0 or position.side not in {-1, 1} or position.avg_price <= 0:
+            return False, "loss_exit_blocked:no_position"
+        if intent.side != -position.side:
+            return False, "loss_exit_blocked:not_reducing_position"
+
+        exit_price = self._worst_exit_price(intent, max_slip_ticks=max_slip_ticks, snapshot=snapshot)
+        if exit_price <= 0:
+            return False, "loss_exit_blocked:missing_exit_price"
+
+        eps = self.tick_size * 1e-9
+        if position.side > 0 and exit_price + eps < position.avg_price:
+            return False, f"loss_exit_blocked:exit_price={exit_price:g}<avg_price={position.avg_price:g}"
+        if position.side < 0 and exit_price - eps > position.avg_price:
+            return False, f"loss_exit_blocked:exit_price={exit_price:g}>avg_price={position.avg_price:g}"
+        return True, "ok"
+
+    def _worst_exit_price(
+        self,
+        intent: OrderIntent,
+        *,
+        max_slip_ticks: float,
+        snapshot: BoardSnapshot | None,
+    ) -> float:
+        if not intent.is_market:
+            return intent.price if intent.price > 0 else intent.reference_price
+
+        reference_price = intent.reference_price
+        if reference_price <= 0 and snapshot is not None:
+            reference_price = snapshot.bid if intent.side < 0 else snapshot.ask
+        if reference_price <= 0:
+            return 0.0
+
+        slip_ticks = intent.max_slip_ticks if intent.max_slip_ticks > 0 else max(max_slip_ticks, 0.0)
+        raw = reference_price + intent.side * slip_ticks * self.tick_size
+        if raw <= 0:
+            return 0.0
+        steps = raw / self.tick_size
+        snapped = math.ceil(steps - 1e-9) if intent.side > 0 else math.floor(steps + 1e-9)
+        return round(snapped * self.tick_size, 10)
 
     def record_cancel_request(self, reason: str, now_ns: int) -> None:
         if not reason or reason in URGENT_CANCEL_REASONS or now_ns <= 0:

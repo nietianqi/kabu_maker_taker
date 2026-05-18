@@ -24,6 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+VALID_REGISTER_EXCHANGES: frozenset[int] = frozenset({1, 2, 3, 5, 6, 23, 24})
+TSE_FAMILY_EXCHANGES: frozenset[int] = frozenset({1, 9, 27})
+
 
 @dataclass(frozen=True, slots=True)
 class SignalWeights:
@@ -274,6 +277,8 @@ class RiskConfig:
     # Cost model for dry-run accounting/backtest estimates
     fee_per_share: float = 0.0
     slippage_ticks_default: float = 0.0
+    # Live safety: when true, block automatic exit orders that can realize a loss.
+    prevent_loss_exit: bool = False
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "RiskConfig":
@@ -302,6 +307,7 @@ class RiskConfig:
             stale_board_ms=int(payload.get("stale_board_ms", 0)),
             fee_per_share=float(payload.get("fee_per_share", 0.0)),
             slippage_ticks_default=float(payload.get("slippage_ticks_default", 0.0)),
+            prevent_loss_exit=bool(payload.get("prevent_loss_exit", False)),
         )
 
 
@@ -398,6 +404,7 @@ class KabuConfig:
     order_rate_per_sec: float = 4.0
     poll_rate_per_sec: float = 4.0
     poll_interval_ms: int = 250
+    register_exchange: int = 0
     websocket_url: str = ""
     websocket_reconnect_attempts: int = 3
     websocket_preflight_messages: int = 3
@@ -416,6 +423,7 @@ class KabuConfig:
             order_rate_per_sec=float(payload.get("order_rate_per_sec", 4.0)),
             poll_rate_per_sec=float(payload.get("poll_rate_per_sec", 4.0)),
             poll_interval_ms=int(payload.get("poll_interval_ms", 250)),
+            register_exchange=int(payload.get("register_exchange", 0)),
             websocket_url=str(payload.get("websocket_url", "")),
             websocket_reconnect_attempts=int(payload.get("websocket_reconnect_attempts", 3)),
             websocket_preflight_messages=int(payload.get("websocket_preflight_messages", 3)),
@@ -476,3 +484,30 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         return AppConfig()
     with Path(path).open("r", encoding="utf-8") as handle:
         return AppConfig.from_dict(json.load(handle))
+
+
+def effective_register_exchange(trade_exchange: int, register_exchange: int = 0) -> int:
+    """Resolve the kabu PUSH registration exchange for a trading exchange.
+
+    kabu uses SOR/TSE+ codes on the order API, but PUSH registration expects
+    the venue code. For TSE-family stock routing, register the TSE venue.
+    """
+    explicit = int(register_exchange)
+    if explicit > 0:
+        return explicit
+    exchange = int(trade_exchange)
+    if exchange in {9, 27}:
+        return 1
+    return exchange
+
+
+def is_valid_register_exchange(exchange: int) -> bool:
+    return int(exchange) in VALID_REGISTER_EXCHANGES
+
+
+def market_data_exchange_compatible(trade_exchange: int, market_data_exchange: int) -> bool:
+    trade = int(trade_exchange)
+    market = int(market_data_exchange)
+    if trade == market:
+        return True
+    return trade in TSE_FAMILY_EXCHANGES and market in TSE_FAMILY_EXCHANGES

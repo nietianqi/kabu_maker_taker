@@ -28,7 +28,8 @@ python -m unittest discover -s tests -p "test_*.py"
 
 `python main.py` is now the multi-symbol live launcher. It reads
 `config.live.multi.json` by default, generates one single-symbol worker config per stock, runs
-preflight first when `preflight_before_real=true`, then starts the real live workers.
+preflight first when `preflight_before_real=true`, arms the workers for that launcher run when
+`auto_arm_after_preflight=true`, then starts the real live workers.
 
 ```powershell
 copy config.live.multi.example.json config.live.multi.json
@@ -99,6 +100,10 @@ Requirements:
 - Live mode without `--events` registers the configured symbol with kabu Station and consumes the
   `/kabusapi/websocket` board stream. Set `kabu.websocket_url` only when the endpoint differs from
   the URL derived from `kabu.base_url`.
+- kabu order routing exchange and PUSH registration exchange are not the same. `exchange=9` is
+  SOR for stock orders, while `/kabusapi/register` expects a market-data venue such as `1` for
+  TSE. Leave `kabu.register_exchange=0` to auto-register TSE-family `exchange=9/27` as `1`, or set
+  `kabu.register_exchange` explicitly for non-TSE symbols.
 - Live mode requires the safety profile to be fully enabled: session enforcement, daily loss
   limit, entry/cancel rate limits, stale quote and stale board guards, API and latency circuits,
   decision trace, trade journal, and abnormal-market detection.
@@ -107,11 +112,23 @@ Requirements:
 - `--preflight-live` validates token retrieval, broker flatness, log writability, symbol
   registration, WebSocket connectivity, and fresh board messages, then writes a same-day
   `live_preflight_stamp.json` in `log_dir`.
+- kabu PUSH can be quiet when a symbol has no price/board update. If preflight receives at least
+  one valid board but fewer than `kabu.websocket_preflight_messages` before timeout, it reports
+  `preflight_partial=true` and allows startup. If the board timestamp is stale, it reports
+  `stale_boards`; live risk and market-state gates still block new entries until a fresh quote
+  arrives.
 - `--live --shadow` requires a fresh preflight stamp and a flat broker account for the configured
   symbol. It records `shadow_would_submit` / `shadow_would_cancel` events and marks local orders
   as `shadow_not_sent`; it never calls kabu `sendorder` or `cancelorder`.
 - `--live` without `--shadow` is rejected unless `--allow-real-orders` is provided, the preflight
   stamp is still fresh, and the configured `kabu.live_arm_path` file exists.
+- The multi-symbol launcher creates missing `live_arm_SYMBOL.txt` files automatically only after
+  every symbol passes preflight in the same `python main.py` run. Files created by the launcher are
+  removed when the launcher exits; pre-existing manual arm files are left untouched.
+- For multiple live workers, the launcher issues one kabu Station token per `kabu.base_url` after
+  preflight/arm validation and passes that shared token to the workers. This avoids kabu Station's
+  behavior where issuing a new token invalidates the previous token, which otherwise causes
+  `401 APIキー不一致` during parallel startup.
 - `kabu.startup_open_order_policy` defaults to `reject`. Set it to `ignore` only when you want
   startup to skip existing manual/broker orders without adopting, cancelling, or tracking them.
   Ignored orders are written as `ignored_broker_open_orders` in startup/preflight output.
@@ -126,6 +143,10 @@ Requirements:
   within `risk.stale_quote_ms` of the local wall clock; stale or future JSONL events are rejected
   before live startup.
 
+If preflight fails with kabu code `4001018` during `PUT /kabusapi/register`, first check the
+registration exchange. The common mistake is sending SOR `9` to PUSH registration; use
+`kabu.register_exchange=0` or an explicit venue code instead.
+
 The live adapter starts by fetching a kabu Station token, checking broker positions/orders, and
 reconciling positions into the strategy. It refuses to start if kabu Station already has active
 orders that this process cannot safely own.
@@ -133,6 +154,8 @@ orders that this process cannot safely own.
 The WebSocket live loop treats disconnects and message timeouts as market-data faults. If the
 strategy has any local exposure it halts and runs emergency flatten; if flat, it attempts the
 configured number of reconnects and reconciles with the broker before resubscribing.
+The live receive timeout follows `risk.stale_board_ms`, not `risk.stale_quote_ms`, so an otherwise
+healthy but quiet PUSH stream does not stop after only a couple of seconds.
 
 Live execution has two independent stop circuits. API failures trip the existing API circuit,
 while slow `submit`, `cancel`, or order-poll REST calls trip the latency circuit after consecutive

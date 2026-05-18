@@ -9,7 +9,7 @@ from typing import Any
 
 from .broker import JsonBrokerSnapshotAdapter
 from .combined import CombinedMakerTakerStrategy
-from .config import AppConfig
+from .config import AppConfig, effective_register_exchange, is_valid_register_exchange
 from .execution import KabuApiError, KabuRestExecutor
 from .journal import TradeJournal
 from .live_runtime import (
@@ -19,7 +19,9 @@ from .live_runtime import (
     ignored_broker_open_orders_summary as _ignored_broker_open_orders_summary,
     live_event_freshness_error as _runtime_live_event_freshness_error,
     live_halted as _live_halted,
+    loss_exit_block_reason as _loss_exit_block_reason,
     poll_live as _poll_live,
+    record_loss_exit_block as _record_loss_exit_block,
     run_live_preflight as _run_live_preflight,
     run_websocket_live as _run_websocket_live,
     sleep_before_live_poll as _sleep_before_live_poll,
@@ -179,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         except KabuApiError as exc:
             print(
                 json.dumps(
-                    {"status": "live_preflight_failed", "reason": str(exc)},
+                    {"status": "live_preflight_failed", "reason": str(exc), "auth": live_executor.auth_context()},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -200,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         except KabuApiError as exc:
             print(
                 json.dumps(
-                    {"status": "live_start_failed", "reason": str(exc)},
+                    {"status": "live_start_failed", "reason": str(exc), "auth": live_executor.auth_context()},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -352,7 +354,14 @@ def main(argv: list[str] | None = None) -> int:
                     return _halt_live(strategy, live_executor, config, snapshot, halt_reason, now_ns)
         if result.exit_intent is not None:
             if live_executor is None:
-                _submit_to_simulator(strategy, simulator, result.exit_intent, snapshot, snapshot.ts_ns)
+                _submit_to_simulator(
+                    strategy,
+                    simulator,
+                    result.exit_intent,
+                    snapshot,
+                    snapshot.ts_ns,
+                    role=ORDER_ROLE_EXIT,
+                )
             else:
                 halt_reason = _submit_to_live(
                     strategy,
@@ -388,7 +397,13 @@ def _submit_to_simulator(
     intent: OrderIntent,
     snapshot: BoardSnapshot,
     now_ns: int,
+    role: str = "",
 ) -> None:
+    if role == ORDER_ROLE_EXIT:
+        block_reason = _loss_exit_block_reason(strategy, intent, strategy.config)
+        if block_reason:
+            _record_loss_exit_block(strategy, intent, role=role, now_ns=now_ns, reason=block_reason)
+            return
     for event in simulator.submit(intent, snapshot, now_ns):
         if isinstance(event, BrokerOrderEvent):
             strategy.on_broker_order_event(event)
@@ -414,7 +429,7 @@ def _handle_exit_cancel_signal(
         deferred = strategy.release_deferred_force_exit(snapshot, now_ns=now_ns)
         if deferred is None:
             return ""
-        _submit_to_simulator(strategy, simulator, deferred, snapshot, now_ns)
+        _submit_to_simulator(strategy, simulator, deferred, snapshot, now_ns, role=ORDER_ROLE_EXIT)
         return ""
 
     for oid in list(strategy.working_exit_ids):
@@ -465,7 +480,7 @@ def _emergency_flatten_simulator(
         )
         if action.intent is not None:
             tracked = strategy.orders.add_intent(action.intent, role=ORDER_ROLE_EXIT, now_ns=now_ns)
-            _submit_to_simulator(strategy, simulator, tracked.intent, snapshot, now_ns)
+            _submit_to_simulator(strategy, simulator, tracked.intent, snapshot, now_ns, role=ORDER_ROLE_EXIT)
 
 
 def _halt_live(
@@ -543,6 +558,9 @@ def _validate_live_config(config: AppConfig, *, raw_config: dict[str, Any] | Non
         missing.append("kabu.live_arm_path")
     if config.kabu.startup_open_order_policy.strip().lower() not in {"reject", "ignore"}:
         missing.append("kabu.startup_open_order_policy valid")
+    register_exchange = effective_register_exchange(config.exchange, config.kabu.register_exchange)
+    if not is_valid_register_exchange(register_exchange):
+        missing.append("kabu.register_exchange valid")
     if raw_config is not None:
         strategy_payload = raw_config.get("strategy")
         if not isinstance(strategy_payload, dict) or "entry_selection_policy" not in strategy_payload:

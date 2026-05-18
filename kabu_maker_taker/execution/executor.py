@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import time
 from typing import Any
 
 from ..broker import BrokerOpenOrderSnapshot, BrokerPositionSnapshot, BrokerReconciliationSnapshot
-from ..config import AppConfig
+from ..config import AppConfig, effective_register_exchange
 from ..models import BrokerFillEvent, BrokerOrderEvent, OrderIntent, OrderState, OrderStatus
 from ..strategy import ORDER_ROLE_ENTRY
-from .client import KabuRestClient, _REQUEST_LANE_POLL
+from .client import KabuRestClient, SHARED_KABU_TOKEN_ENABLED_ENV, SHARED_KABU_TOKEN_ENV, _REQUEST_LANE_POLL
 from .models import KabuApiError, KabuOrderSnapshot, LiveExecutionResult
 from .parsers import _aggressive_limit_price, _elapsed_ms, _find_order_snapshot, order_snapshot, position_lot
+
+
+def _token_fingerprint(token: str) -> str:
+    token = str(token or "")
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8] if token else ""
 
 
 class KabuRestExecutor:
@@ -20,11 +27,32 @@ class KabuRestExecutor:
             order_rate_per_sec=config.kabu.order_rate_per_sec,
             poll_rate_per_sec=config.kabu.poll_rate_per_sec,
         )
+        self._using_shared_token = False
+        self._token_fingerprint = ""
+        self._token_source = ""
 
     def start(self) -> str:
         if not self.config.kabu.api_password:
             raise KabuApiError("kabu.api_password is required for --live")
-        return self.client.get_token(self.config.kabu.api_password)
+        if os.environ.get(SHARED_KABU_TOKEN_ENABLED_ENV, "").strip() == "1":
+            shared_token = os.environ.get(SHARED_KABU_TOKEN_ENV, "").strip()
+            token = self.client.use_token(shared_token, password=self.config.kabu.api_password)
+            self._using_shared_token = True
+            self._token_source = "shared"
+            self._token_fingerprint = _token_fingerprint(token)
+            return token
+        token = self.client.get_token(self.config.kabu.api_password)
+        self._using_shared_token = False
+        self._token_source = "worker"
+        self._token_fingerprint = _token_fingerprint(token)
+        return token
+
+    def auth_context(self) -> dict[str, object]:
+        return {
+            "shared_token": self._using_shared_token,
+            "token_source": self._token_source,
+            "token_sha256_8": self._token_fingerprint,
+        }
 
     def submit(self, intent: OrderIntent, *, role: str, now_ns: int = 0) -> LiveExecutionResult:
         started_ns = time.perf_counter_ns()
@@ -251,6 +279,14 @@ class KabuRestExecutor:
         )
 
     def snapshot(self) -> BrokerReconciliationSnapshot:
+        try:
+            return self._snapshot()
+        except KabuApiError as exc:
+            if self._refresh_shared_token_after_unauthorized(exc):
+                return self._snapshot()
+            raise
+
+    def _snapshot(self) -> BrokerReconciliationSnapshot:
         positions = self._position_snapshot()
         raw_orders = self.client.get_orders(product=0, lane=_REQUEST_LANE_POLL)
         active_orders = [
@@ -274,11 +310,50 @@ class KabuRestExecutor:
             ignored_open_orders=ignored_orders,
         )
 
+    def _refresh_shared_token_after_unauthorized(self, exc: KabuApiError) -> bool:
+        if exc.status != 401 or not self._using_shared_token or not self.config.kabu.api_password:
+            return False
+        token = self.client.get_token(self.config.kabu.api_password)
+        self._using_shared_token = False
+        self._token_source = "worker_retry_after_shared_401"
+        self._token_fingerprint = _token_fingerprint(token)
+        return True
+
     def register_market_data(self) -> None:
-        self.client.register_symbol(self.config.symbol, self.config.exchange)
+        exchange = self.market_data_exchange
+        try:
+            self.client.register_symbol(self.config.symbol, exchange)
+        except KabuApiError as exc:
+            raise KabuApiError(
+                (
+                    "market data register failed "
+                    f"symbol={self.config.symbol} "
+                    f"trade_exchange={self.config.exchange} "
+                    f"register_exchange={exchange}"
+                ),
+                status=exc.status,
+                payload=exc.payload,
+            ) from exc
 
     def unregister_market_data(self) -> None:
-        self.client.unregister_symbol(self.config.symbol, self.config.exchange)
+        exchange = self.market_data_exchange
+        try:
+            self.client.unregister_symbol(self.config.symbol, exchange)
+        except KabuApiError as exc:
+            raise KabuApiError(
+                (
+                    "market data unregister failed "
+                    f"symbol={self.config.symbol} "
+                    f"trade_exchange={self.config.exchange} "
+                    f"register_exchange={exchange}"
+                ),
+                status=exc.status,
+                payload=exc.payload,
+            ) from exc
+
+    @property
+    def market_data_exchange(self) -> int:
+        return effective_register_exchange(self.config.exchange, self.config.kabu.register_exchange)
 
     def open_order_snapshots(self) -> tuple[KabuOrderSnapshot, ...]:
         raw_orders = self.client.get_orders(product=0, lane=_REQUEST_LANE_POLL)

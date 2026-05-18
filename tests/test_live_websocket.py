@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 
 from kabu_maker_taker.broker import BrokerOpenOrderSnapshot, BrokerPositionSnapshot, BrokerReconciliationSnapshot
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
-from kabu_maker_taker.config import AppConfig, KabuConfig, RiskConfig, StrategyConfig
+from kabu_maker_taker.config import AppConfig, KabuConfig, MarketStateConfig, RiskConfig, StrategyConfig
 from kabu_maker_taker.kabu_rest import LiveExecutionResult
 from kabu_maker_taker.live_runtime import (
     perform_live_preflight,
@@ -163,11 +163,11 @@ class SequenceWebSocket:
         self.closed = True
 
 
-def _websocket_payload(ts_ns: int) -> str:
+def _websocket_payload(ts_ns: int, *, symbol: str = "9984", exchange: int = 27) -> str:
     return json.dumps(
         {
-            "Symbol": "9984",
-            "Exchange": 27,
+            "Symbol": symbol,
+            "Exchange": exchange,
             "BidPrice": 100.0,
             "AskPrice": 101.0,
             "BidQty": 500,
@@ -256,6 +256,143 @@ class LiveWebSocketTests(unittest.TestCase):
         self.assertEqual(executor.submitted, [])
         self.assertEqual(executor.canceled, [])
         self.assertTrue(ws.closed)
+
+    def test_preflight_ignores_other_symbol_boards(self) -> None:
+        config = _config(websocket_preflight_messages=1, websocket_preflight_timeout_s=1.0)
+        executor = FakeExecutor()
+        now_ns = time.time_ns()
+        ws = SequenceWebSocket(
+            [
+                _websocket_payload(now_ns, symbol="7203"),
+                _websocket_payload(now_ns + 1_000_000, symbol="9984"),
+            ]
+        )
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertTrue(ok, summary)
+        self.assertEqual(summary["received_boards"], 1)
+        self.assertEqual(summary["ignored_boards"], 1)
+
+    def test_preflight_accepts_tse_board_for_sor_trading_exchange(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            exchange=9,
+            tick_size=1.0,
+            lot_size=100,
+            risk=RiskConfig(max_spread_ticks=5.0, stale_quote_ms=2_000),
+            kabu=KabuConfig(api_password="pw", poll_interval_ms=0, websocket_preflight_messages=1),
+        )
+        executor = FakeExecutor()
+        ws = SequenceWebSocket([_websocket_payload(time.time_ns(), exchange=1)])
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertTrue(ok, summary)
+        self.assertEqual(summary["trade_exchange"], 9)
+        self.assertEqual(summary["register_exchange"], 1)
+
+    def test_preflight_accepts_stale_quote_as_connectivity_warning(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            tick_size=1.0,
+            lot_size=100,
+            risk=RiskConfig(max_spread_ticks=5.0, stale_quote_ms=2_000),
+            market_state=MarketStateConfig(enabled=True),
+            kabu=KabuConfig(api_password="pw", poll_interval_ms=0, websocket_preflight_messages=1),
+        )
+        executor = FakeExecutor()
+        old_ts = time.time_ns() - 10_000_000_000
+        ws = SequenceWebSocket([_websocket_payload(old_ts)])
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertTrue(ok, summary)
+        self.assertEqual(summary["received_boards"], 1)
+        self.assertEqual(summary["stale_boards"], 1)
+        self.assertEqual(summary["market_state_reason"], "stale_quote")
+
+    def test_preflight_allows_partial_board_count_after_first_valid_board(self) -> None:
+        config = _config(websocket_preflight_messages=3, websocket_preflight_timeout_s=1.0)
+        executor = FakeExecutor()
+        ws = SequenceWebSocket([_websocket_payload(time.time_ns())])
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertTrue(ok, summary)
+        self.assertTrue(summary["preflight_partial"])
+        self.assertEqual(summary["received_boards"], 1)
+        self.assertEqual(summary["required_boards"], 3)
+
+    def test_websocket_live_accepts_tse_board_for_sor_trading_exchange(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            exchange=9,
+            tick_size=1.0,
+            lot_size=100,
+            strategy=StrategyConfig(trade_qty=100, maker_confirm_ticks=1, taker_confirm_ticks=1),
+            risk=RiskConfig(max_spread_ticks=5.0, stale_quote_ms=2_000),
+            kabu=KabuConfig(api_password="pw", poll_interval_ms=0, websocket_reconnect_attempts=0),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(snapshot.ts_ns)
+        strategy._choose_decision = lambda snapshot, sig, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            False,
+            "no_entry",
+        )
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+        ws = SequenceWebSocket([_websocket_payload(time.time_ns(), exchange=1)])
+
+        with redirect_stdout(io.StringIO()):
+            code = run_websocket_live(strategy, executor, config, tracer, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertEqual(code, 3)
+        self.assertEqual(tracer.rows, 1)
+        self.assertEqual(executor.submitted, [])
+
+    def test_websocket_live_processes_stale_quote_without_immediate_halt(self) -> None:
+        config = _config(websocket_reconnect_attempts=0)
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(snapshot.ts_ns)
+        strategy._choose_decision = lambda snapshot, sig, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            False,
+            "no_entry",
+        )
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+        old_ts = time.time_ns() - 10_000_000_000
+        ws = SequenceWebSocket([_websocket_payload(old_ts)])
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            code = run_websocket_live(strategy, executor, config, tracer, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertEqual(code, 3)
+        self.assertEqual(tracer.rows, 1)
+        self.assertIn("websocket_reconnect_exhausted", stdout.getvalue())
+        self.assertNotIn("websocket_stale", stdout.getvalue())
+
+    def test_websocket_live_timeout_uses_stale_board_window(self) -> None:
+        config = AppConfig(
+            symbol="9984",
+            exchange=27,
+            risk=RiskConfig(max_spread_ticks=5.0, stale_quote_ms=2_000, stale_board_ms=30_000),
+            kabu=KabuConfig(api_password="pw", poll_interval_ms=0, websocket_reconnect_attempts=0),
+        )
+        strategy = CombinedMakerTakerStrategy(config)
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+        timeouts = []
+
+        def factory(_url, timeout=0):
+            timeouts.append(timeout)
+            return RaisingWebSocket()
+
+        with redirect_stdout(io.StringIO()):
+            run_websocket_live(strategy, executor, config, tracer, websocket_factory=factory)
+
+        self.assertEqual(timeouts, [30.0])
 
     def test_preflight_rejects_broker_position(self) -> None:
         config = _config()

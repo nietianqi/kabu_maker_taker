@@ -10,7 +10,7 @@ from urllib.parse import urlparse, urlunparse
 
 from .broker import BrokerOpenOrderSnapshot, BrokerReconciliationSnapshot
 from .combined import CombinedMakerTakerStrategy
-from .config import AppConfig
+from .config import AppConfig, effective_register_exchange, market_data_exchange_compatible
 from .execution import KabuApiError, KabuRestExecutor, LiveExecutionResult
 from .models import (
     BoardSnapshot,
@@ -20,6 +20,7 @@ from .models import (
     OrderIntent,
     OrderState,
     OrderStatus,
+    PositionState,
     _to_ns_value,
 )
 from .strategy import MarketStateDetector, ORDER_ROLE_ENTRY, ORDER_ROLE_EXIT
@@ -36,6 +37,11 @@ def submit_to_live(
     now_ns: int,
     config: AppConfig,
 ) -> str:
+    if role == ORDER_ROLE_EXIT:
+        block_reason = loss_exit_block_reason(strategy, intent, config)
+        if block_reason:
+            record_loss_exit_block(strategy, intent, role=role, now_ns=now_ns, reason=block_reason)
+            return ""
     halt_reason = handle_live_execution(
         strategy,
         executor.submit(intent, role=role, now_ns=now_ns),
@@ -53,6 +59,51 @@ def poll_live(strategy: CombinedMakerTakerStrategy, executor: KabuRestExecutor, 
         executor.poll_order_events(strategy.orders.active(), now_ns=now_ns),
         now_ns=now_ns,
     )
+
+
+def loss_exit_block_reason(strategy: CombinedMakerTakerStrategy, intent: OrderIntent, config: AppConfig) -> str:
+    allowed, reason = strategy.risk.can_exit_without_loss(
+        intent=intent,
+        position=strategy.position,
+        max_slip_ticks=config.strategy.max_slip_ticks,
+    )
+    return "" if allowed else reason
+
+
+def record_loss_exit_block(
+    strategy: CombinedMakerTakerStrategy,
+    intent: OrderIntent,
+    *,
+    role: str,
+    now_ns: int,
+    reason: str,
+) -> None:
+    print(
+        json.dumps(
+            {
+                "status": "loss_exit_blocked",
+                "role": role,
+                "reason": reason,
+                "intent": intent.to_dict(),
+                "position": {
+                    "side": strategy.position.side,
+                    "qty": strategy.position.qty,
+                    "avg_price": strategy.position.avg_price,
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    if intent.client_order_id:
+        strategy.on_broker_order_event(
+            BrokerOrderEvent(
+                order_id=intent.client_order_id,
+                status=OrderStatus.REJECTED,
+                ts_ns=now_ns,
+                reason=reason,
+            )
+        )
 
 
 def handle_live_execution(
@@ -173,6 +224,9 @@ def perform_live_preflight(
         stale_quote_ms=config.risk.stale_quote_ms,
     )
     seen = 0
+    ignored_boards = 0
+    stale_boards = 0
+    last_stale_ms = 0.0
     last_summary: dict[str, object] = {}
     ws = None
     registered = False
@@ -193,22 +247,59 @@ def perform_live_preflight(
                 kabu_bidask_reversed=config.signals.kabu_bidask_reversed,
                 auto_fix_negative_spread=config.signals.auto_fix_negative_spread,
             )
+            target_error = _snapshot_target_error(snapshot, config)
+            if target_error == "symbol_mismatch":
+                ignored_boards += 1
+                continue
+            if target_error:
+                return False, {
+                    "reason": target_error,
+                    "received_boards": seen,
+                    "ignored_boards": ignored_boards,
+                    "symbol": snapshot.symbol,
+                    "exchange": snapshot.exchange,
+                    "trade_exchange": config.exchange,
+                    "register_exchange": effective_register_exchange(
+                        config.exchange,
+                        config.kabu.register_exchange,
+                    ),
+                }
+            stale_detail, stale_ms = _websocket_snapshot_stale_warning(snapshot, config, now_ns=now_ns)
+            if stale_detail:
+                stale_boards += 1
+                last_stale_ms = stale_ms
             error = _preflight_snapshot_error(snapshot, config, now_ns=now_ns)
             if error:
-                return False, {"reason": error, "received_boards": seen}
+                return False, {
+                    "reason": error,
+                    "received_boards": seen,
+                    "ignored_boards": ignored_boards,
+                    "stale_boards": stale_boards,
+                    "last_stale_ms": last_stale_ms,
+                }
             market_state = detector.update(snapshot, now_ns)
             diagnostics = detector.last_diagnostics
-            if market_state == MarketState.ABNORMAL:
+            if market_state == MarketState.ABNORMAL and not (
+                diagnostics.reason == "stale_quote" and bool(stale_detail)
+            ):
                 return False, {
                     "reason": "market_state_abnormal",
                     "market_state_reason": diagnostics.reason,
                     "received_boards": seen,
+                    "ignored_boards": ignored_boards,
+                    "stale_boards": stale_boards,
+                    "last_stale_ms": last_stale_ms,
                 }
             seen += 1
             last_summary = {
                 "received_boards": seen,
+                "ignored_boards": ignored_boards,
+                "stale_boards": stale_boards,
+                "last_stale_ms": last_stale_ms,
                 "symbol": snapshot.symbol,
                 "exchange": snapshot.exchange,
+                "trade_exchange": config.exchange,
+                "register_exchange": effective_register_exchange(config.exchange, config.kabu.register_exchange),
                 "bid": snapshot.bid,
                 "ask": snapshot.ask,
                 "market_state": market_state.value,
@@ -216,19 +307,58 @@ def perform_live_preflight(
                 "ts_ns": snapshot.ts_ns,
             }
         if seen < required:
-            return False, {"reason": "websocket_preflight_timeout", "received_boards": seen, "required_boards": required}
+            if seen > 0:
+                return True, {
+                    "required_boards": required,
+                    "preflight_partial": True,
+                    **ignored_summary,
+                    **last_summary,
+                }
+            return False, {
+                "reason": "websocket_preflight_timeout",
+                "received_boards": seen,
+                "ignored_boards": ignored_boards,
+                "stale_boards": stale_boards,
+                "last_stale_ms": last_stale_ms,
+                "required_boards": required,
+            }
         return True, {"required_boards": required, **ignored_summary, **last_summary}
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        return False, {"reason": "websocket_bad_message", "detail": str(exc), "received_boards": seen}
+        return False, {
+            "reason": "websocket_bad_message",
+            "detail": str(exc),
+            "received_boards": seen,
+            "ignored_boards": ignored_boards,
+            "stale_boards": stale_boards,
+            "last_stale_ms": last_stale_ms,
+        }
     except TimeoutError as exc:
+        if seen > 0:
+            return True, {
+                "required_boards": required,
+                "preflight_partial": True,
+                "detail": str(exc),
+                **ignored_summary,
+                **last_summary,
+            }
         return False, {
             "reason": "websocket_preflight_timeout",
             "detail": str(exc),
             "received_boards": seen,
+            "ignored_boards": ignored_boards,
+            "stale_boards": stale_boards,
+            "last_stale_ms": last_stale_ms,
             "required_boards": required,
         }
     except Exception as exc:  # websocket-client transport classes are optional imports in tests.
-        return False, {"reason": "websocket_preflight_failed", "detail": str(exc), "received_boards": seen}
+        return False, {
+            "reason": "websocket_preflight_failed",
+            "detail": str(exc),
+            "received_boards": seen,
+            "ignored_boards": ignored_boards,
+            "stale_boards": stale_boards,
+            "last_stale_ms": last_stale_ms,
+        }
     finally:
         if ws is not None:
             try:
@@ -309,6 +439,7 @@ def run_websocket_live(
     attempts = max(config.kabu.websocket_reconnect_attempts, 0) + 1
     last_snapshot = _empty_snapshot(config, time.time_ns())
     last_error = ""
+    ignored_boards = 0
     for attempt in range(attempts):
         ws = None
         registered = False
@@ -332,8 +463,29 @@ def run_websocket_live(
                     kabu_bidask_reversed=config.signals.kabu_bidask_reversed,
                     auto_fix_negative_spread=config.signals.auto_fix_negative_spread,
                 )
+                target_error = _snapshot_target_error(snapshot, config)
+                if target_error == "symbol_mismatch":
+                    ignored_boards += 1
+                    continue
+                if target_error:
+                    cleanup = _fault_cleanup(
+                        strategy,
+                        executor,
+                        config,
+                        snapshot,
+                        now_ns=now_ns,
+                        reason=f"websocket_{target_error}",
+                        shadow=shadow,
+                        detail=(
+                            f"snapshot_exchange={snapshot.exchange} "
+                            f"trade_exchange={config.exchange} "
+                            f"register_exchange={effective_register_exchange(config.exchange, config.kabu.register_exchange)}"
+                        ),
+                    )
+                    cleanup["ignored_boards"] = ignored_boards
+                    return live_halted(strategy, f"websocket_{target_error}", cleanup=cleanup)
                 last_snapshot = snapshot
-                freshness_error = _live_snapshot_freshness_error(snapshot, config, now_ns=now_ns)
+                freshness_error = _websocket_snapshot_fatal_time_error(snapshot, config, now_ns=now_ns)
                 if freshness_error:
                     reason = f"websocket_{_reason_token(freshness_error)}"
                     cleanup = _fault_cleanup(
@@ -394,7 +546,7 @@ def run_websocket_live(
                 return live_halted(
                     strategy,
                     "websocket_reconnect_exhausted",
-                    cleanup={"last_error": last_error},
+                    cleanup={"last_error": last_error, "ignored_boards": ignored_boards},
                 )
             reconnect_error = _reconcile_before_reconnect(strategy, executor)
             if reconnect_error:
@@ -441,7 +593,11 @@ def run_websocket_live(
                     executor.unregister_market_data()
                 except KabuApiError:
                     pass
-    return live_halted(strategy, "websocket_reconnect_exhausted", cleanup={"last_error": last_error})
+    return live_halted(
+        strategy,
+        "websocket_reconnect_exhausted",
+        cleanup={"last_error": last_error, "ignored_boards": ignored_boards},
+    )
 
 
 def process_live_board(
@@ -559,6 +715,11 @@ def _handle_live_exit_cancel_signal(
 
 def shadow_submit(strategy: CombinedMakerTakerStrategy, intent: OrderIntent, role: str, now_ns: int) -> str:
     """Record a would-submit event and finalize the local order without touching the broker."""
+    if role == ORDER_ROLE_EXIT:
+        block_reason = loss_exit_block_reason(strategy, intent, strategy.config)
+        if block_reason:
+            record_loss_exit_block(strategy, intent, role=role, now_ns=now_ns, reason=block_reason)
+            return ""
     print(
         json.dumps(
             {"status": "shadow_would_submit", "role": role, "intent": intent.to_dict()},
@@ -646,7 +807,7 @@ def _open_websocket(
         import websocket
 
         factory = websocket.create_connection
-    resolved_timeout_s = timeout_s if timeout_s is not None else config.risk.stale_quote_ms / 1000.0
+    resolved_timeout_s = timeout_s if timeout_s is not None else _websocket_recv_timeout_s(config)
     return factory(_websocket_url(config), timeout=max(resolved_timeout_s, 0.1))
 
 
@@ -695,6 +856,54 @@ def _live_snapshot_freshness_error(snapshot: BoardSnapshot, config: AppConfig, *
     return live_event_freshness_error({"ts_ns": snapshot.ts_ns}, config, now_ns=now_ns)
 
 
+def _websocket_snapshot_fatal_time_error(snapshot: BoardSnapshot, config: AppConfig, *, now_ns: int) -> str:
+    status, diff_ms = _websocket_snapshot_time_status(snapshot, config, now_ns=now_ns)
+    if status == "missing":
+        return "missing or invalid ts_ns"
+    if status == "invalid_config":
+        return "risk.stale_quote_ms must be positive"
+    if status == "future":
+        return f"future event ts_ns outside risk.stale_quote_ms ({diff_ms:.0f}ms)"
+    return ""
+
+
+def _websocket_snapshot_stale_warning(
+    snapshot: BoardSnapshot,
+    config: AppConfig,
+    *,
+    now_ns: int,
+) -> tuple[str, float]:
+    status, diff_ms = _websocket_snapshot_time_status(snapshot, config, now_ns=now_ns)
+    if status == "stale":
+        return f"stale event ts_ns outside risk.stale_quote_ms ({diff_ms:.0f}ms)", diff_ms
+    return "", 0.0
+
+
+def _websocket_snapshot_time_status(
+    snapshot: BoardSnapshot,
+    config: AppConfig,
+    *,
+    now_ns: int,
+) -> tuple[str, float]:
+    if snapshot.ts_ns <= 0:
+        return "missing", 0.0
+    tolerance_ns = config.risk.stale_quote_ms * 1_000_000
+    if tolerance_ns <= 0:
+        return "invalid_config", 0.0
+    diff_ns = snapshot.ts_ns - now_ns
+    if diff_ns > tolerance_ns:
+        return "future", abs(diff_ns) / 1_000_000
+    if -diff_ns > tolerance_ns:
+        return "stale", abs(diff_ns) / 1_000_000
+    return "fresh", abs(diff_ns) / 1_000_000
+
+
+def _websocket_recv_timeout_s(config: AppConfig) -> float:
+    board_timeout_ms = config.risk.stale_board_ms if config.risk.stale_board_ms > 0 else 0
+    quote_timeout_ms = config.risk.stale_quote_ms if config.risk.stale_quote_ms > 0 else 0
+    return max(board_timeout_ms, quote_timeout_ms, 1000) / 1000.0
+
+
 def _empty_snapshot(config: AppConfig, ts_ns: int) -> BoardSnapshot:
     return BoardSnapshot(
         symbol=config.symbol,
@@ -708,17 +917,21 @@ def _empty_snapshot(config: AppConfig, ts_ns: int) -> BoardSnapshot:
 
 
 def _preflight_snapshot_error(snapshot: BoardSnapshot, config: AppConfig, *, now_ns: int) -> str:
-    if snapshot.symbol != config.symbol:
-        return "symbol_mismatch"
-    if snapshot.exchange != config.exchange:
-        return "exchange_mismatch"
-    freshness_error = _live_snapshot_freshness_error(snapshot, config, now_ns=now_ns)
+    freshness_error = _websocket_snapshot_fatal_time_error(snapshot, config, now_ns=now_ns)
     if freshness_error:
         return f"websocket_{_reason_token(freshness_error)}"
     if not snapshot.valid:
         return "invalid_quote"
     if snapshot.spread > config.risk.max_spread_ticks * config.tick_size:
         return "spread_too_wide"
+    return ""
+
+
+def _snapshot_target_error(snapshot: BoardSnapshot, config: AppConfig) -> str:
+    if snapshot.symbol != config.symbol:
+        return "symbol_mismatch"
+    if not market_data_exchange_compatible(config.exchange, snapshot.exchange):
+        return "exchange_mismatch"
     return ""
 
 
@@ -807,6 +1020,7 @@ def emergency_flatten(
         "unresolved_order_ids": [],
         "local_unknown_order_ids": [],
         "unresolved_position": None,
+        "flatten_blocked_reason": "",
         "errors": [],
     }
     active_orders = list(strategy.orders.active())
@@ -900,7 +1114,6 @@ def emergency_flatten(
         cleanup["errors"].append("missing reference price for emergency flatten")
         return cleanup
 
-    cleanup["flatten_attempts"] = int(cleanup["flatten_attempts"]) + 1
     intent = OrderIntent(
         symbol=position.symbol,
         exchange=position.exchange,
@@ -913,6 +1126,24 @@ def emergency_flatten(
         score=0,
         reference_price=reference_price,
     )
+    exit_allowed, block_reason = strategy.risk.can_exit_without_loss(
+        intent=intent,
+        position=PositionState(
+            side=position.side,
+            qty=position.qty,
+            avg_price=position.avg_price,
+            entry_mode=position.entry_mode,
+        ),
+        max_slip_ticks=config.strategy.max_slip_ticks,
+        snapshot=snapshot,
+    )
+    if not exit_allowed:
+        cleanup["cleanup_status"] = "unresolved"
+        cleanup["flatten_blocked_reason"] = block_reason
+        cleanup["errors"].append(block_reason)
+        return cleanup
+
+    cleanup["flatten_attempts"] = int(cleanup["flatten_attempts"]) + 1
     try:
         tracked_order = strategy.orders.add_intent(intent, role=ORDER_ROLE_EXIT, now_ns=now_ns)
         strategy.metrics.record_exit_intent(tracked_order.intent)
