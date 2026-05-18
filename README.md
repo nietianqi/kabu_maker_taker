@@ -12,8 +12,8 @@ without coupling strategy logic to a broker gateway.
   limit order.
 - `TakerStrategy` only fires on stronger breakout conditions and returns an aggressive market
   intent.
-- `CombinedMakerTakerStrategy` gives taker priority, falls back to maker, applies confirmation
-  counters, position sizing, and risk gates, then emits one `OrderIntent`.
+- `CombinedMakerTakerStrategy` uses adaptive maker/taker selection, applies confirmation counters,
+  position sizing, and risk gates, then emits one `OrderIntent`.
 
 By default this project emits dry-run order intents. The optional live kabu REST adapter sits at
 the `OrderIntent` boundary, so the strategy layer stays testable.
@@ -45,9 +45,20 @@ python main.py --config config.example.json --events events.jsonl
 
 Live mode is explicit and guarded:
 
+For the first live day, use preflight + shadow mode. This connects to real kabu Station market
+data and broker snapshots, but never submits or cancels real orders:
+
 ```powershell
-python main.py --config config.json --live
-python main.py --config config.json --events events.jsonl --live  # fresh JSONL validation mode
+copy config.live.shadow.example.json config.live.shadow.json
+python main.py --config config.live.shadow.json --preflight-live
+python main.py --config config.live.shadow.json --live --shadow
+```
+
+Real order submission is locked behind two explicit controls and is not recommended for the
+first validation day:
+
+```powershell
+python main.py --config config.json --live --allow-real-orders
 ```
 
 Requirements:
@@ -62,6 +73,14 @@ Requirements:
   decision trace, trade journal, and abnormal-market detection.
 - Live mode requires `strategy.entry_selection_policy` to be explicit (`adaptive`,
   `taker_priority`, or `maker_priority`) so old configs do not silently change entry routing.
+- `--preflight-live` validates token retrieval, broker flatness, log writability, symbol
+  registration, WebSocket connectivity, and fresh board messages, then writes a same-day
+  `live_preflight_stamp.json` in `log_dir`.
+- `--live --shadow` requires a fresh preflight stamp and a flat broker account for the configured
+  symbol. It records `shadow_would_submit` / `shadow_would_cancel` events and marks local orders
+  as `shadow_not_sent`; it never calls kabu `sendorder` or `cancelorder`.
+- `--live` without `--shadow` is rejected unless `--allow-real-orders` is provided, the preflight
+  stamp is still fresh, and the configured `kabu.live_arm_path` file exists.
 - `risk.order_latency_limit_ms`, `risk.cancel_latency_limit_ms`, `risk.poll_latency_limit_ms`,
   and `risk.latency_breach_limit` protect live mode from slow REST responses. The default is
   `3000ms` for each request class and `3` consecutive breaches.

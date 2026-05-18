@@ -3,14 +3,21 @@ from __future__ import annotations
 import io
 import json
 import time
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 
-from kabu_maker_taker.broker import BrokerReconciliationSnapshot
+from kabu_maker_taker.broker import BrokerPositionSnapshot, BrokerReconciliationSnapshot
 from kabu_maker_taker.combined import CombinedMakerTakerStrategy
 from kabu_maker_taker.config import AppConfig, KabuConfig, RiskConfig, StrategyConfig
 from kabu_maker_taker.kabu_rest import LiveExecutionResult
-from kabu_maker_taker.live_runtime import process_live_board, run_websocket_live
+from kabu_maker_taker.live_runtime import (
+    perform_live_preflight,
+    process_live_board,
+    run_websocket_live,
+    validate_live_preflight_stamp,
+    write_live_preflight_stamp,
+)
 from kabu_maker_taker.models import (
     BoardSnapshot,
     BrokerOrderEvent,
@@ -78,12 +85,14 @@ class FakeTracer:
 
 
 class FakeExecutor:
-    def __init__(self) -> None:
+    def __init__(self, *, positions=()) -> None:
         self.polled = 0
         self.submitted = []
+        self.canceled = []
         self.registered = 0
         self.unregistered = 0
         self.snapshots = 0
+        self.positions = tuple(positions)
 
     def register_market_data(self) -> None:
         self.registered += 1
@@ -107,6 +116,7 @@ class FakeExecutor:
         return LiveExecutionResult(events=(event,), api_success=True)
 
     def cancel(self, order, *, now_ns: int = 0) -> LiveExecutionResult:
+        self.canceled.append(order)
         event = BrokerOrderEvent(
             order_id=order.client_order_id,
             broker_order_id=order.broker_order_id,
@@ -117,7 +127,7 @@ class FakeExecutor:
 
     def snapshot(self) -> BrokerReconciliationSnapshot:
         self.snapshots += 1
-        return BrokerReconciliationSnapshot(ts_ns=time.time_ns())
+        return BrokerReconciliationSnapshot(ts_ns=time.time_ns(), positions=self.positions)
 
     def open_order_snapshots(self):
         return ()
@@ -132,6 +142,34 @@ class RaisingWebSocket:
 
     def close(self) -> None:
         pass
+
+
+class SequenceWebSocket:
+    def __init__(self, payloads) -> None:
+        self.payloads = list(payloads)
+        self.closed = False
+
+    def recv(self):
+        if not self.payloads:
+            raise TimeoutError("no more websocket messages")
+        return self.payloads.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _websocket_payload(ts_ns: int) -> str:
+    return json.dumps(
+        {
+            "Symbol": "9984",
+            "Exchange": 27,
+            "BidPrice": 100.0,
+            "AskPrice": 101.0,
+            "BidQty": 500,
+            "AskQty": 200,
+            "BidTimeNs": ts_ns,
+        }
+    )
 
 
 class LiveWebSocketTests(unittest.TestCase):
@@ -197,6 +235,92 @@ class LiveWebSocketTests(unittest.TestCase):
         snapshot = BoardSnapshot.from_dict(payload)
 
         self.assertEqual(snapshot.ts_ns, now_ns)
+
+    def test_preflight_success_reads_fresh_boards_without_orders(self) -> None:
+        config = _config(websocket_preflight_messages=2, websocket_preflight_timeout_s=1.0)
+        executor = FakeExecutor()
+        now_ns = time.time_ns()
+        ws = SequenceWebSocket([_websocket_payload(now_ns), _websocket_payload(now_ns + 1_000_000)])
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertTrue(ok, summary)
+        self.assertEqual(summary["received_boards"], 2)
+        self.assertEqual(executor.registered, 1)
+        self.assertEqual(executor.unregistered, 1)
+        self.assertEqual(executor.submitted, [])
+        self.assertEqual(executor.canceled, [])
+        self.assertTrue(ws.closed)
+
+    def test_preflight_rejects_broker_position(self) -> None:
+        config = _config()
+        executor = FakeExecutor(
+            positions=(
+                BrokerPositionSnapshot(
+                    symbol="9984",
+                    exchange=27,
+                    side=1,
+                    qty=100,
+                    avg_price=100.0,
+                    entry_mode="broker_unknown",
+                ),
+            )
+        )
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: RaisingWebSocket())
+
+        self.assertFalse(ok)
+        self.assertEqual(summary["reason"], "broker_position_not_flat")
+        self.assertEqual(executor.registered, 0)
+
+    def test_preflight_stamp_must_be_today_and_recent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                symbol="9984",
+                exchange=27,
+                log_dir=tmp,
+                kabu=KabuConfig(live_preflight_max_age_minutes=30),
+            )
+            now_ns = time.time_ns()
+            write_live_preflight_stamp(config, now_ns, {"received_boards": 3})
+
+            self.assertEqual(validate_live_preflight_stamp(config, now_ns=now_ns), "")
+            old_ns = now_ns + 31 * 60 * 1_000_000_000
+            self.assertIn("too old", validate_live_preflight_stamp(config, now_ns=old_ns))
+
+    def test_shadow_process_live_board_does_not_submit_and_clears_local_order(self) -> None:
+        config = _config()
+        strategy = CombinedMakerTakerStrategy(config)
+        strategy.signals.on_board = lambda snapshot: _signal(snapshot.ts_ns)
+        strategy._choose_decision = lambda snapshot, sig, now_ns=0, market_state=MarketState.NORMAL: EntryDecision(
+            True,
+            "",
+            entry_mode="maker",
+            side=1,
+            entry_score=8,
+            required_confirm=1,
+        )
+        executor = FakeExecutor()
+        tracer = FakeTracer()
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            halt = process_live_board(
+                strategy,
+                executor,
+                config,
+                tracer,
+                _snapshot(time.time_ns()),
+                time.time_ns(),
+                shadow=True,
+            )
+
+        self.assertEqual(halt, "")
+        self.assertEqual(executor.submitted, [])
+        self.assertEqual(strategy.orders.active(), [])
+        self.assertFalse(strategy.entry_order_active)
+        output = stdout.getvalue()
+        self.assertIn("shadow_would_submit", output)
+        self.assertIn("shadow_not_sent", json.dumps(strategy.orders.snapshot()))
 
 
 if __name__ == "__main__":

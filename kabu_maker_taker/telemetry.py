@@ -24,7 +24,7 @@ JST = timezone(timedelta(hours=9))
 class DecisionTraceWriter:
     """Appends one JSONL line per board tick to ``decisions.jsonl``."""
 
-    def __init__(self, log_dir: str, symbol: str, *, enabled: bool = True) -> None:
+    def __init__(self, log_dir: str, symbol: str, *, enabled: bool = True, strict: bool = False) -> None:
         self.enabled = enabled
         self._fh = None
         if not enabled:
@@ -34,6 +34,8 @@ class DecisionTraceWriter:
             log_path.mkdir(parents=True, exist_ok=True)
             self._fh = (log_path / "decisions.jsonl").open("a", encoding="utf-8")
         except OSError:
+            if strict:
+                raise
             self.enabled = False  # degrade gracefully — tracing is optional
 
     def record(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
@@ -14,12 +15,16 @@ from .models import (
     BoardSnapshot,
     BrokerFillEvent,
     BrokerOrderEvent,
+    MarketState,
     OrderIntent,
     OrderState,
     OrderStatus,
     _to_ns_value,
 )
-from .strategy import ORDER_ROLE_ENTRY, ORDER_ROLE_EXIT
+from .strategy import MarketStateDetector, ORDER_ROLE_ENTRY, ORDER_ROLE_EXIT
+
+JST = timezone(timedelta(hours=9))
+PREFLIGHT_STAMP_FILENAME = "live_preflight_stamp.json"
 
 
 def submit_to_live(
@@ -114,6 +119,171 @@ def live_event_freshness_error(event: dict[str, Any], config: AppConfig, *, now_
     return ""
 
 
+def run_live_preflight(
+    config: AppConfig,
+    executor: KabuRestExecutor,
+    *,
+    websocket_factory: Callable[..., object] | None = None,
+) -> int:
+    ok, summary = perform_live_preflight(config, executor, websocket_factory=websocket_factory)
+    if not ok:
+        print(json.dumps({"status": "live_preflight_failed", **summary}, ensure_ascii=False, separators=(",", ":")))
+        return 2
+    write_live_preflight_stamp(config, time.time_ns(), summary)
+    print(json.dumps({"status": "live_preflight_ok", **summary}, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def perform_live_preflight(
+    config: AppConfig,
+    executor: KabuRestExecutor,
+    *,
+    websocket_factory: Callable[..., object] | None = None,
+) -> tuple[bool, dict[str, object]]:
+    """Validate broker snapshot, PUSH registration, and fresh board messages without placing orders."""
+    try:
+        broker_snapshot = executor.snapshot()
+    except KabuApiError as exc:
+        return False, {"reason": "broker_snapshot_failed", "detail": str(exc)}
+    if broker_snapshot.positions:
+        return False, {
+            "reason": "broker_position_not_flat",
+            "positions": [
+                {
+                    "symbol": p.symbol,
+                    "exchange": p.exchange,
+                    "side": p.side,
+                    "qty": p.qty,
+                    "avg_price": p.avg_price,
+                    "entry_mode": p.entry_mode,
+                }
+                for p in broker_snapshot.positions
+            ],
+        }
+    if broker_snapshot.open_orders:
+        return False, {"reason": "broker_open_orders_present"}
+
+    required = max(config.kabu.websocket_preflight_messages, 1)
+    deadline = time.monotonic() + max(config.kabu.websocket_preflight_timeout_s, 0.1)
+    detector = MarketStateDetector(
+        config.market_state,
+        config.tick_size,
+        stale_quote_ms=config.risk.stale_quote_ms,
+    )
+    seen = 0
+    last_summary: dict[str, object] = {}
+    ws = None
+    registered = False
+    try:
+        executor.register_market_data()
+        registered = True
+        ws = _open_websocket(
+            config,
+            websocket_factory=websocket_factory,
+            timeout_s=max(config.kabu.websocket_preflight_timeout_s, 0.1),
+        )
+        while seen < required and time.monotonic() <= deadline:
+            raw = ws.recv()  # type: ignore[attr-defined]
+            now_ns = time.time_ns()
+            event = _decode_websocket_message(raw)
+            snapshot = BoardSnapshot.from_dict(
+                event,
+                kabu_bidask_reversed=config.signals.kabu_bidask_reversed,
+                auto_fix_negative_spread=config.signals.auto_fix_negative_spread,
+            )
+            error = _preflight_snapshot_error(snapshot, config, now_ns=now_ns)
+            if error:
+                return False, {"reason": error, "received_boards": seen}
+            market_state = detector.update(snapshot, now_ns)
+            diagnostics = detector.last_diagnostics
+            if market_state == MarketState.ABNORMAL:
+                return False, {
+                    "reason": "market_state_abnormal",
+                    "market_state_reason": diagnostics.reason,
+                    "received_boards": seen,
+                }
+            seen += 1
+            last_summary = {
+                "received_boards": seen,
+                "symbol": snapshot.symbol,
+                "exchange": snapshot.exchange,
+                "bid": snapshot.bid,
+                "ask": snapshot.ask,
+                "market_state": market_state.value,
+                "market_state_reason": diagnostics.reason,
+                "ts_ns": snapshot.ts_ns,
+            }
+        if seen < required:
+            return False, {"reason": "websocket_preflight_timeout", "received_boards": seen, "required_boards": required}
+        return True, {"required_boards": required, **last_summary}
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        return False, {"reason": "websocket_bad_message", "detail": str(exc), "received_boards": seen}
+    except TimeoutError as exc:
+        return False, {
+            "reason": "websocket_preflight_timeout",
+            "detail": str(exc),
+            "received_boards": seen,
+            "required_boards": required,
+        }
+    except Exception as exc:  # websocket-client transport classes are optional imports in tests.
+        return False, {"reason": "websocket_preflight_failed", "detail": str(exc), "received_boards": seen}
+    finally:
+        if ws is not None:
+            try:
+                ws.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if registered:
+            try:
+                executor.unregister_market_data()
+            except KabuApiError:
+                pass
+
+
+def validate_live_preflight_stamp(config: AppConfig, *, now_ns: int | None = None) -> str:
+    now = now_ns or time.time_ns()
+    path = live_preflight_stamp_path(config)
+    if not path.exists():
+        return f"{path}: missing preflight stamp"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"{path}: unreadable preflight stamp: {exc}"
+    if str(payload.get("symbol", "")) != config.symbol or int(payload.get("exchange", 0)) != config.exchange:
+        return f"{path}: symbol/exchange mismatch"
+    ts_ns = int(payload.get("ts_ns", 0))
+    if ts_ns <= 0:
+        return f"{path}: invalid preflight timestamp"
+    if ts_ns - now > config.risk.stale_quote_ms * 1_000_000:
+        return f"{path}: preflight stamp is from the future"
+    if _jst_date(ts_ns) != _jst_date(now):
+        return f"{path}: preflight stamp is not from today"
+    max_age_ns = max(config.kabu.live_preflight_max_age_minutes, 1) * 60 * 1_000_000_000
+    if now - ts_ns > max_age_ns:
+        age_minutes = (now - ts_ns) / 60_000_000_000
+        return f"{path}: preflight stamp too old ({age_minutes:.1f}m)"
+    return ""
+
+
+def write_live_preflight_stamp(config: AppConfig, ts_ns: int, summary: dict[str, object] | None = None) -> Path:
+    path = live_preflight_stamp_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": "live_preflight_ok",
+        **(summary or {}),
+        "symbol": config.symbol,
+        "exchange": config.exchange,
+        "ts_ns": ts_ns,
+        "ts_jst": datetime.fromtimestamp(ts_ns / 1e9, tz=JST).strftime("%Y-%m-%dT%H:%M:%S.%f"),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+    return path
+
+
+def live_preflight_stamp_path(config: AppConfig) -> Path:
+    return Path(config.log_dir) / PREFLIGHT_STAMP_FILENAME
+
+
 def run_websocket_live(
     strategy: CombinedMakerTakerStrategy,
     executor: KabuRestExecutor,
@@ -121,6 +291,7 @@ def run_websocket_live(
     tracer,
     *,
     websocket_factory: Callable[..., object] | None = None,
+    shadow: bool = False,
 ) -> int:
     attempts = max(config.kabu.websocket_reconnect_attempts, 0) + 1
     last_snapshot = _empty_snapshot(config, time.time_ns())
@@ -152,38 +323,42 @@ def run_websocket_live(
                 freshness_error = _live_snapshot_freshness_error(snapshot, config, now_ns=now_ns)
                 if freshness_error:
                     reason = f"websocket_{_reason_token(freshness_error)}"
-                    cleanup = (
-                        emergency_flatten(strategy, executor, config, snapshot, now_ns=now_ns, reason=reason)
-                        if _has_live_exposure(strategy)
-                        else {"detail": freshness_error}
+                    cleanup = _fault_cleanup(
+                        strategy,
+                        executor,
+                        config,
+                        snapshot,
+                        now_ns=now_ns,
+                        reason=reason,
+                        shadow=shadow,
+                        detail=freshness_error,
                     )
                     return live_halted(strategy, reason, cleanup=cleanup)
-                halt_reason = process_live_board(strategy, executor, config, tracer, snapshot, now_ns)
+                halt_reason = process_live_board(strategy, executor, config, tracer, snapshot, now_ns, shadow=shadow)
                 if halt_reason:
                     return live_halted(
                         strategy,
                         halt_reason,
-                        cleanup=emergency_flatten(
+                        cleanup=_fault_cleanup(
                             strategy,
                             executor,
                             config,
                             snapshot,
                             now_ns=now_ns,
                             reason=halt_reason,
+                            shadow=shadow,
                         ),
                     )
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            cleanup = (
-                emergency_flatten(
-                    strategy,
-                    executor,
-                    config,
-                    last_snapshot,
-                    now_ns=time.time_ns(),
-                    reason="websocket_bad_message",
-                )
-                if _has_live_exposure(strategy)
-                else {"error": str(exc)}
+            cleanup = _fault_cleanup(
+                strategy,
+                executor,
+                config,
+                last_snapshot,
+                now_ns=time.time_ns(),
+                reason="websocket_bad_message",
+                shadow=shadow,
+                detail=str(exc),
             )
             return live_halted(strategy, "websocket_bad_message", cleanup=cleanup)
         except Exception as exc:  # websocket-client raises several transport-specific exception classes.
@@ -192,13 +367,14 @@ def run_websocket_live(
                 return live_halted(
                     strategy,
                     "websocket_disconnected",
-                    cleanup=emergency_flatten(
+                    cleanup=_fault_cleanup(
                         strategy,
                         executor,
                         config,
                         last_snapshot,
                         now_ns=time.time_ns(),
                         reason="websocket_disconnected",
+                        shadow=shadow,
                     ),
                 )
             if attempt >= attempts - 1:
@@ -209,13 +385,14 @@ def run_websocket_live(
                 )
             reconnect_error = _reconcile_before_reconnect(strategy, executor)
             if reconnect_error:
-                cleanup = emergency_flatten(
+                cleanup = _fault_cleanup(
                     strategy,
                     executor,
                     config,
                     last_snapshot,
                     now_ns=time.time_ns(),
                     reason=reconnect_error,
+                    shadow=shadow,
                 )
                 cleanup["last_error"] = last_error
                 return live_halted(strategy, reconnect_error, cleanup=cleanup)
@@ -223,13 +400,14 @@ def run_websocket_live(
                 return live_halted(
                     strategy,
                     "websocket_disconnected_with_exposure",
-                    cleanup=emergency_flatten(
+                    cleanup=_fault_cleanup(
                         strategy,
                         executor,
                         config,
                         last_snapshot,
                         now_ns=time.time_ns(),
                         reason="websocket_disconnected_with_exposure",
+                        shadow=shadow,
                     ),
                 )
             print(
@@ -260,6 +438,8 @@ def process_live_board(
     tracer,
     snapshot: BoardSnapshot,
     now_ns: int,
+    *,
+    shadow: bool = False,
 ) -> str:
     ks = check_kill_switch(config)
     if ks == "hard":
@@ -272,27 +452,47 @@ def process_live_board(
     result = strategy.on_board(snapshot, now_ns=now_ns)
     tracer.record(result, strategy.position, now_ns)
     if result.exit_cancel_signal:
-        halt_reason = _handle_live_exit_cancel_signal(
-            strategy,
-            executor,
-            config,
-            result.exit_cancel_signal,
-            snapshot,
-            now_ns,
-        )
+        if shadow:
+            halt_reason = _handle_shadow_exit_cancel_signal(
+                strategy,
+                result.exit_cancel_signal,
+                snapshot,
+                now_ns,
+            )
+        else:
+            halt_reason = _handle_live_exit_cancel_signal(
+                strategy,
+                executor,
+                config,
+                result.exit_cancel_signal,
+                snapshot,
+                now_ns,
+            )
         if halt_reason:
             return halt_reason
     if result.entry_cancel_signal:
-        halt_reason = _handle_live_entry_cancel_signal(strategy, executor, config, result.entry_cancel_signal, now_ns)
+        halt_reason = (
+            _handle_shadow_entry_cancel_signal(strategy, result.entry_cancel_signal, now_ns)
+            if shadow
+            else _handle_live_entry_cancel_signal(strategy, executor, config, result.entry_cancel_signal, now_ns)
+        )
         if halt_reason:
             return halt_reason
     if result.intent is not None:
         print(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
-        halt_reason = submit_to_live(strategy, executor, result.intent, ORDER_ROLE_ENTRY, now_ns, config)
+        halt_reason = (
+            shadow_submit(strategy, result.intent, ORDER_ROLE_ENTRY, now_ns)
+            if shadow
+            else submit_to_live(strategy, executor, result.intent, ORDER_ROLE_ENTRY, now_ns, config)
+        )
         if halt_reason:
             return halt_reason
     if result.exit_intent is not None:
-        halt_reason = submit_to_live(strategy, executor, result.exit_intent, ORDER_ROLE_EXIT, now_ns, config)
+        halt_reason = (
+            shadow_submit(strategy, result.exit_intent, ORDER_ROLE_EXIT, now_ns)
+            if shadow
+            else submit_to_live(strategy, executor, result.exit_intent, ORDER_ROLE_EXIT, now_ns, config)
+        )
         if halt_reason:
             return halt_reason
     return ""
@@ -344,14 +544,97 @@ def _handle_live_exit_cancel_signal(
     return submit_to_live(strategy, executor, deferred, ORDER_ROLE_EXIT, now_ns, config)
 
 
-def _open_websocket(config: AppConfig, *, websocket_factory: Callable[..., object] | None = None) -> object:
+def shadow_submit(strategy: CombinedMakerTakerStrategy, intent: OrderIntent, role: str, now_ns: int) -> str:
+    """Record a would-submit event and finalize the local order without touching the broker."""
+    print(
+        json.dumps(
+            {"status": "shadow_would_submit", "role": role, "intent": intent.to_dict()},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    strategy.on_broker_order_event(
+        BrokerOrderEvent(
+            order_id=intent.client_order_id,
+            status=OrderStatus.REJECTED,
+            ts_ns=now_ns,
+            reason="shadow_not_sent",
+        )
+    )
+    return ""
+
+
+def _handle_shadow_entry_cancel_signal(
+    strategy: CombinedMakerTakerStrategy,
+    reason: str,
+    now_ns: int,
+) -> str:
+    for oid in list(strategy.working_entry_ids):
+        order = strategy.request_cancel(oid, reason=reason, now_ns=now_ns)
+        if order is None:
+            continue
+        _shadow_cancel_order(strategy, order, reason, now_ns)
+    return ""
+
+
+def _handle_shadow_exit_cancel_signal(
+    strategy: CombinedMakerTakerStrategy,
+    reason: str,
+    snapshot: BoardSnapshot,
+    now_ns: int,
+) -> str:
+    for oid in list(strategy.working_exit_ids):
+        order = strategy.request_cancel(oid, reason=reason, now_ns=now_ns)
+        if order is None:
+            continue
+        _shadow_cancel_order(strategy, order, reason, now_ns)
+    deferred = strategy.release_deferred_force_exit(snapshot, now_ns=now_ns)
+    if deferred is not None:
+        return shadow_submit(strategy, deferred, ORDER_ROLE_EXIT, now_ns)
+    return ""
+
+
+def _shadow_cancel_order(
+    strategy: CombinedMakerTakerStrategy,
+    order: OrderState,
+    reason: str,
+    now_ns: int,
+) -> None:
+    print(
+        json.dumps(
+            {
+                "status": "shadow_would_cancel",
+                "order_id": order.client_order_id,
+                "role": order.role,
+                "reason": reason,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    strategy.on_broker_order_event(
+        BrokerOrderEvent(
+            order_id=order.client_order_id,
+            status=OrderStatus.CANCELED,
+            ts_ns=now_ns,
+            reason=f"shadow_cancel:{reason}",
+        )
+    )
+
+
+def _open_websocket(
+    config: AppConfig,
+    *,
+    websocket_factory: Callable[..., object] | None = None,
+    timeout_s: float | None = None,
+) -> object:
     factory = websocket_factory
     if factory is None:
         import websocket
 
         factory = websocket.create_connection
-    timeout_s = max(config.risk.stale_quote_ms / 1000.0, 0.1)
-    return factory(_websocket_url(config), timeout=timeout_s)
+    resolved_timeout_s = timeout_s if timeout_s is not None else config.risk.stale_quote_ms / 1000.0
+    return factory(_websocket_url(config), timeout=max(resolved_timeout_s, 0.1))
 
 
 def _websocket_url(config: AppConfig) -> str:
@@ -409,6 +692,64 @@ def _empty_snapshot(config: AppConfig, ts_ns: int) -> BoardSnapshot:
         bid_size=0,
         ask_size=0,
     )
+
+
+def _preflight_snapshot_error(snapshot: BoardSnapshot, config: AppConfig, *, now_ns: int) -> str:
+    if snapshot.symbol != config.symbol:
+        return "symbol_mismatch"
+    if snapshot.exchange != config.exchange:
+        return "exchange_mismatch"
+    freshness_error = _live_snapshot_freshness_error(snapshot, config, now_ns=now_ns)
+    if freshness_error:
+        return f"websocket_{_reason_token(freshness_error)}"
+    if not snapshot.valid:
+        return "invalid_quote"
+    if snapshot.spread > config.risk.max_spread_ticks * config.tick_size:
+        return "spread_too_wide"
+    return ""
+
+
+def _fault_cleanup(
+    strategy: CombinedMakerTakerStrategy,
+    executor: KabuRestExecutor,
+    config: AppConfig,
+    snapshot: BoardSnapshot,
+    *,
+    now_ns: int,
+    reason: str,
+    shadow: bool,
+    detail: str = "",
+) -> dict[str, object]:
+    if shadow:
+        return _shadow_cleanup(strategy, reason, now_ns, detail=detail)
+    if _has_live_exposure(strategy):
+        return emergency_flatten(strategy, executor, config, snapshot, now_ns=now_ns, reason=reason)
+    return {"detail": detail} if detail else {"cleanup_status": "not_required"}
+
+
+def _shadow_cleanup(
+    strategy: CombinedMakerTakerStrategy,
+    reason: str,
+    now_ns: int,
+    *,
+    detail: str = "",
+) -> dict[str, object]:
+    for order in list(strategy.orders.active()):
+        _shadow_cancel_order(strategy, order, reason, now_ns)
+    cleanup: dict[str, object] = {
+        "cleanup_status": "shadow_noop",
+        "reason": reason,
+        "live_orders_sent": 0,
+        "active_orders_after_cleanup": len(strategy.orders.active()),
+        "position_qty": strategy.position.qty,
+    }
+    if detail:
+        cleanup["detail"] = detail
+    return cleanup
+
+
+def _jst_date(ts_ns: int) -> str:
+    return datetime.fromtimestamp(ts_ns / 1e9, tz=JST).strftime("%Y-%m-%d")
 
 
 def _has_live_exposure(strategy: CombinedMakerTakerStrategy) -> bool:

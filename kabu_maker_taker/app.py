@@ -19,9 +19,11 @@ from .live_runtime import (
     live_event_freshness_error as _runtime_live_event_freshness_error,
     live_halted as _live_halted,
     poll_live as _poll_live,
+    run_live_preflight as _run_live_preflight,
     run_websocket_live as _run_websocket_live,
     sleep_before_live_poll as _sleep_before_live_poll,
     submit_to_live as _submit_to_live,
+    validate_live_preflight_stamp as _validate_live_preflight_stamp,
 )
 from .models import BoardSnapshot, BrokerFillEvent, BrokerOrderEvent, OrderIntent, TradePrint
 from .simulator import DryRunSimulator
@@ -42,6 +44,21 @@ def main(argv: list[str] | None = None) -> int:
         "--live",
         action="store_true",
         help="Send intents to kabu Station REST instead of dry-run simulation.",
+    )
+    parser.add_argument(
+        "--preflight-live",
+        action="store_true",
+        help="Validate live kabu token, broker flatness, logs, and fresh WebSocket boards without trading.",
+    )
+    parser.add_argument(
+        "--shadow",
+        action="store_true",
+        help="Run live market data and strategy decisions but never submit/cancel real orders.",
+    )
+    parser.add_argument(
+        "--allow-real-orders",
+        action="store_true",
+        help="Explicitly unlock real --live order submission when the arm file and preflight stamp are present.",
     )
     parser.add_argument(
         "--evolve",
@@ -67,20 +84,59 @@ def main(argv: list[str] | None = None) -> int:
 
     raw_config = _load_config_payload(args.config)
     config = AppConfig.from_dict(raw_config)
+    if args.preflight_live and args.live:
+        parser.error("--preflight-live cannot be combined with --live")
+    if args.preflight_live and (args.sample or args.events or args.broker_snapshot):
+        parser.error("--preflight-live cannot be combined with --sample, --events, or --broker-snapshot")
+    if args.shadow and not args.live:
+        parser.error("--shadow requires --live")
+    if args.allow_real_orders and not args.live:
+        parser.error("--allow-real-orders requires --live")
     if args.live and args.sample:
         parser.error("--live cannot be used with --sample")
     if args.live and config.dry_run:
         parser.error("--live requires config.dry_run=false")
+    if args.preflight_live and config.dry_run:
+        parser.error("--preflight-live requires config.dry_run=false")
     if args.live and args.broker_snapshot:
         parser.error("--broker-snapshot cannot be combined with --live")
-    if args.live:
+    if args.live and args.shadow and args.events:
+        parser.error("--shadow cannot be combined with --events")
+    if args.live or args.preflight_live:
         live_config_errors = _validate_live_config(config, raw_config=raw_config)
         if live_config_errors:
-            parser.error("--live safety config incomplete: " + ", ".join(live_config_errors))
+            label = "--preflight-live" if args.preflight_live else "--live"
+            parser.error(f"{label} safety config incomplete: " + ", ".join(live_config_errors))
+        if not config.kabu.api_password:
+            print(
+                json.dumps(
+                    {
+                        "status": "live_preflight_failed" if args.preflight_live else "live_start_failed",
+                        "reason": "kabu.api_password is required for --live",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            return 2
+    if args.live:
         if args.events:
             event_error = _validate_live_events_file(Path(args.events), config, now_ns=time.time_ns())
             if event_error:
                 parser.error("--live --events requires fresh events: " + event_error)
+        if args.shadow:
+            stamp_error = _validate_live_preflight_stamp(config, now_ns=time.time_ns())
+            if stamp_error:
+                parser.error("--live --shadow requires fresh preflight: " + stamp_error)
+        elif not args.allow_real_orders:
+            parser.error("--live real orders require --allow-real-orders; use --shadow for tomorrow validation")
+        else:
+            stamp_error = _validate_live_preflight_stamp(config, now_ns=time.time_ns())
+            if stamp_error:
+                parser.error("--live real orders require fresh preflight: " + stamp_error)
+            arm_path = Path(config.kabu.live_arm_path)
+            if not arm_path.exists():
+                parser.error(f"--live real orders require arm file: {arm_path}")
 
     strategy = CombinedMakerTakerStrategy(config)
     simulator = DryRunSimulator(
@@ -88,20 +144,51 @@ def main(argv: list[str] | None = None) -> int:
         slippage_ticks=config.risk.slippage_ticks_default,
     )
 
-    # Optional journal (trades.csv + markouts.csv)
-    if config.enable_journal:
-        strategy.journal = TradeJournal(
+    try:
+        # Optional journal (trades.csv + markouts.csv)
+        if config.enable_journal:
+            strategy.journal = TradeJournal(
+                log_dir=config.log_dir,
+                symbol=config.symbol,
+                tick_size=config.tick_size,
+            )
+
+        # Optional decision trace (decisions.jsonl)
+        tracer = DecisionTraceWriter(
             log_dir=config.log_dir,
             symbol=config.symbol,
-            tick_size=config.tick_size,
+            enabled=config.enable_decision_trace,
+            strict=args.live or args.preflight_live,
         )
+    except OSError as exc:
+        print(
+            json.dumps(
+                {"status": "live_log_init_failed", "reason": str(exc)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        return 2
 
-    # Optional decision trace (decisions.jsonl)
-    tracer = DecisionTraceWriter(
-        log_dir=config.log_dir,
-        symbol=config.symbol,
-        enabled=config.enable_decision_trace,
-    )
+    if args.preflight_live:
+        live_executor = KabuRestExecutor(config)
+        try:
+            live_executor.start()
+            return _run_live_preflight(config, live_executor)
+        except KabuApiError as exc:
+            print(
+                json.dumps(
+                    {"status": "live_preflight_failed", "reason": str(exc)},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            return 2
+        finally:
+            if strategy.journal is not None:
+                strategy.journal.flush()
+                strategy.journal.close()
+            tracer.close()
 
     live_executor: KabuRestExecutor | None = None
     if args.live:
@@ -113,6 +200,18 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 json.dumps(
                     {"status": "live_start_failed", "reason": str(exc)},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            return 2
+        if args.shadow and broker_snapshot.positions:
+            print(
+                json.dumps(
+                    {
+                        "status": "live_start_failed",
+                        "reason": "shadow mode requires flat broker position",
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -131,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not args.events:
             try:
-                return _run_websocket_live(strategy, live_executor, config, tracer)
+                return _run_websocket_live(strategy, live_executor, config, tracer, shadow=args.shadow)
             finally:
                 if strategy.journal is not None:
                     strategy.journal.flush()
@@ -432,6 +531,14 @@ def _validate_live_config(config: AppConfig, *, raw_config: dict[str, Any] | Non
         missing.append("enable_decision_trace=true")
     if not config.market_state.enabled:
         missing.append("market_state.enabled=true")
+    if config.kabu.websocket_preflight_messages <= 0:
+        missing.append("kabu.websocket_preflight_messages>0")
+    if config.kabu.websocket_preflight_timeout_s <= 0:
+        missing.append("kabu.websocket_preflight_timeout_s>0")
+    if config.kabu.live_preflight_max_age_minutes <= 0:
+        missing.append("kabu.live_preflight_max_age_minutes>0")
+    if not config.kabu.live_arm_path:
+        missing.append("kabu.live_arm_path")
     if raw_config is not None:
         strategy_payload = raw_config.get("strategy")
         if not isinstance(strategy_payload, dict) or "entry_selection_policy" not in strategy_payload:

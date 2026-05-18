@@ -225,6 +225,15 @@ class TelemetryInitFallbackTests(unittest.TestCase):
         # close() must be a no-op — no exception
         writer.close()
 
+    def test_strict_mode_raises_on_unwritable_dir(self) -> None:
+        """Live/preflight strict mode must hard-fail when decision trace cannot open."""
+        import unittest.mock as mock
+
+        with mock.patch.object(Path, "mkdir", return_value=None):
+            with mock.patch.object(Path, "open", side_effect=OSError("permission denied")):
+                with self.assertRaises(OSError):
+                    DecisionTraceWriter(log_dir="fake_dir", symbol="9984", enabled=True, strict=True)
+
 
 if __name__ == "__main__":
     unittest.main()

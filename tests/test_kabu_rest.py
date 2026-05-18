@@ -881,6 +881,45 @@ class KabuLiveCliSafetyTests(unittest.TestCase):
             self.assertNotIn("strategy.entry_selection_policy explicit", errors)
             self.assertNotIn("strategy.entry_selection_policy valid", errors)
 
+    def test_live_without_shadow_or_allow_real_orders_is_rejected_before_network_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp).joinpath("config.json")
+            config_path.write_text(json.dumps(self._live_safe_config()), encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-m", "kabu_maker_taker.app", "--config", str(config_path), "--live"],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("--live real orders require --allow-real-orders", completed.stderr)
+
+    def test_live_shadow_requires_fresh_preflight_stamp_before_network_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp).joinpath("config.json")
+            config = self._live_safe_config(log_dir=str(Path(tmp).joinpath("logs")))
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "kabu_maker_taker.app",
+                    "--config",
+                    str(config_path),
+                    "--live",
+                    "--shadow",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("--live --shadow requires fresh preflight", completed.stderr)
+
     def test_live_events_reject_stale_timestamp_before_network_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

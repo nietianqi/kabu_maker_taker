@@ -400,6 +400,10 @@ class KabuConfig:
     poll_interval_ms: int = 250
     websocket_url: str = ""
     websocket_reconnect_attempts: int = 3
+    websocket_preflight_messages: int = 3
+    websocket_preflight_timeout_s: float = 15.0
+    live_preflight_max_age_minutes: int = 30
+    live_arm_path: str = "live_arm.txt"
     order_profile: OrderProfile = field(default_factory=OrderProfile)
 
     @classmethod
@@ -413,6 +417,10 @@ class KabuConfig:
             poll_interval_ms=int(payload.get("poll_interval_ms", 250)),
             websocket_url=str(payload.get("websocket_url", "")),
             websocket_reconnect_attempts=int(payload.get("websocket_reconnect_attempts", 3)),
+            websocket_preflight_messages=int(payload.get("websocket_preflight_messages", 3)),
+            websocket_preflight_timeout_s=float(payload.get("websocket_preflight_timeout_s", 15.0)),
+            live_preflight_max_age_minutes=int(payload.get("live_preflight_max_age_minutes", 30)),
+            live_arm_path=str(payload.get("live_arm_path", "live_arm.txt")),
             order_profile=OrderProfile.from_dict(payload.get("order_profile")),
         )
 
