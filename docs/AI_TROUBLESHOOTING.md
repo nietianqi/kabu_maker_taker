@@ -138,8 +138,36 @@ This document records live-trading issues found during the kabu maker/taker work
 - Kept tracked examples with empty `api_password`.
 - `KabuConfig` defaults `api_password` to an empty string.
 
+## 2026-05-18: WebSocket preflight failed on null quote fields
+
+### Symptom
+- Launcher stopped during preflight with:
+- `live_preflight_failed reason=websocket_bad_message`
+- Detail: `float() argument must be a string or a real number, not 'NoneType'`
+- Summary showed `received_boards=0`, meaning no valid board was accepted before failure.
+
+### Cause
+- kabu PUSH Board messages can contain `null` in price/quantity fields such as `BidPrice`, `AskPrice`, `BidQty`, `AskQty`, or `CurrentPrice`.
+- `BoardSnapshot.from_dict()` previously called `float(...)` / `int(...)` directly, so a `null` quote became a parser exception instead of an invalid board.
+
+### Fix
+- Added safe numeric parsing in `BoardSnapshot.from_dict()` and `Level.from_any()`.
+- `None` or empty numeric fields now become `0`.
+- Such snapshots have `snapshot.valid=false` rather than raising.
+- Preflight and live WebSocket loops now count invalid quote boards as `ignored_boards` and continue waiting for the next valid board.
+
+### Files
+- `kabu_maker_taker/models.py`
+- `kabu_maker_taker/live_runtime.py`
+- `tests/test_models.py`
+- `tests/test_live_websocket.py`
+
+### Expected Behavior
+- A null/empty quote board no longer produces `websocket_bad_message`.
+- If a later valid board arrives before timeout, preflight succeeds and reports the invalid board in `ignored_boards`.
+- If only null/invalid boards arrive, preflight times out with `websocket_preflight_timeout` and a nonzero `ignored_boards` count.
+
 ## Verification
 - `python -m json.tool config.live.multi.json`
 - `python -m unittest discover -s tests -p "test_*.py"`
-- Latest full result: 394 tests OK.
-
+- Latest full result: 396 tests OK.

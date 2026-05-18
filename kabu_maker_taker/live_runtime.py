@@ -264,6 +264,9 @@ def perform_live_preflight(
                         config.kabu.register_exchange,
                     ),
                 }
+            if not snapshot.valid:
+                ignored_boards += 1
+                continue
             stale_detail, stale_ms = _websocket_snapshot_stale_warning(snapshot, config, now_ns=now_ns)
             if stale_detail:
                 stale_boards += 1
@@ -484,6 +487,9 @@ def run_websocket_live(
                     )
                     cleanup["ignored_boards"] = ignored_boards
                     return live_halted(strategy, f"websocket_{target_error}", cleanup=cleanup)
+                if not snapshot.valid:
+                    ignored_boards += 1
+                    continue
                 last_snapshot = snapshot
                 freshness_error = _websocket_snapshot_fatal_time_error(snapshot, config, now_ns=now_ns)
                 if freshness_error:

@@ -20,6 +20,24 @@ from enum import Enum
 from typing import Any
 
 
+def _float_value(value: Any, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(frozen=True, slots=True)
 class Level:
     price: float
@@ -30,9 +48,12 @@ class Level:
         if isinstance(value, Level):
             return value
         if isinstance(value, dict):
-            return cls(price=float(value.get("price", value.get("Price", 0.0))), size=int(value.get("size", value.get("Qty", 0))))
+            return cls(
+                price=_float_value(value.get("price", value.get("Price", 0.0))),
+                size=_int_value(value.get("size", value.get("Qty", 0))),
+            )
         price, size = value
-        return cls(price=float(price), size=int(size))
+        return cls(price=_float_value(price), size=_int_value(size))
 
 
 @dataclass(slots=True)
@@ -83,7 +104,7 @@ class BoardSnapshot:
         auto_fix_negative_spread: bool = True,
     ) -> "BoardSnapshot":
         symbol = str(payload.get("symbol", payload.get("Symbol", "")))
-        exchange = int(payload.get("exchange", payload.get("Exchange", 27)))
+        exchange = _int_value(payload.get("exchange", payload.get("Exchange", 27)), 27)
         ts_ns = _to_ns_value(
             payload.get(
                 "ts_ns",
@@ -99,15 +120,15 @@ class BoardSnapshot:
             ts_ns = max(bid_ts_ns, ask_ts_ns, current_ts_ns)
 
         if "bid" in payload or "ask" in payload:
-            bid = float(payload.get("bid", 0.0))
-            ask = float(payload.get("ask", 0.0))
-            bid_size = int(payload.get("bid_size", 0))
-            ask_size = int(payload.get("ask_size", 0))
+            bid = _float_value(payload.get("bid", 0.0))
+            ask = _float_value(payload.get("ask", 0.0))
+            bid_size = _int_value(payload.get("bid_size", 0))
+            ask_size = _int_value(payload.get("ask_size", 0))
         else:
-            raw_ask_price = float(payload.get("AskPrice", payload.get("Ask", 0.0)))
-            raw_bid_price = float(payload.get("BidPrice", payload.get("Bid", 0.0)))
-            raw_ask_qty = int(payload.get("AskQty", payload.get("AskSize", 0)))
-            raw_bid_qty = int(payload.get("BidQty", payload.get("BidSize", 0)))
+            raw_ask_price = _float_value(payload.get("AskPrice", payload.get("Ask", 0.0)))
+            raw_bid_price = _float_value(payload.get("BidPrice", payload.get("Bid", 0.0)))
+            raw_ask_qty = _int_value(payload.get("AskQty", payload.get("AskSize", 0)))
+            raw_bid_qty = _int_value(payload.get("BidQty", payload.get("BidSize", 0)))
             if kabu_bidask_reversed:
                 bid, ask = raw_ask_price, raw_bid_price
                 bid_size, ask_size = raw_ask_qty, raw_bid_qty
@@ -132,7 +153,7 @@ class BoardSnapshot:
             ask_size=ask_size,
             bids=bids,
             asks=asks,
-            last=float(payload.get("last", payload.get("CurrentPrice", 0.0))),
+            last=_float_value(payload.get("last", payload.get("CurrentPrice", 0.0))),
             duplicate=bool(payload.get("duplicate", False)),
             out_of_order=bool(payload.get("out_of_order", False)),
             bid_sign=str(payload.get("bid_sign", payload.get("BidSign", ""))),
@@ -140,7 +161,7 @@ class BoardSnapshot:
             bid_ts_ns=bid_ts_ns,
             ask_ts_ns=ask_ts_ns,
             current_ts_ns=current_ts_ns,
-            last_size=int(payload.get("last_size", payload.get("LastSize", payload.get("CurrentPriceSize", 0)))),
+            last_size=_int_value(payload.get("last_size", payload.get("LastSize", payload.get("CurrentPriceSize", 0)))),
         )
 
 

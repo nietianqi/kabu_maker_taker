@@ -28,6 +28,28 @@ class BoardSnapshotKabuBidAskTests(unittest.TestCase):
         self.assertEqual(snapshot.ask_size, 100)
         self.assertTrue(snapshot.valid)
 
+    def test_null_kabu_quote_fields_become_invalid_snapshot_without_exception(self) -> None:
+        snapshot = BoardSnapshot.from_dict(
+            {
+                "Symbol": "9984",
+                "Exchange": 1,
+                "BidQty": None,
+                "BidPrice": None,
+                "AskQty": None,
+                "AskPrice": None,
+                "CurrentPrice": None,
+                "Sell1": {"Price": None, "Qty": None},
+                "Buy1": {"Price": None, "Qty": None},
+            },
+            kabu_bidask_reversed=True,
+        )
+
+        self.assertEqual(snapshot.bid, 0.0)
+        self.assertEqual(snapshot.ask, 0.0)
+        self.assertEqual(snapshot.bid_size, 0)
+        self.assertEqual(snapshot.ask_size, 0)
+        self.assertFalse(snapshot.valid)
+
 
 if __name__ == "__main__":
     unittest.main()

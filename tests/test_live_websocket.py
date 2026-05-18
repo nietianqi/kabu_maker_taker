@@ -177,6 +177,21 @@ def _websocket_payload(ts_ns: int, *, symbol: str = "9984", exchange: int = 27) 
     )
 
 
+def _null_quote_websocket_payload(ts_ns: int, *, symbol: str = "9984", exchange: int = 27) -> str:
+    return json.dumps(
+        {
+            "Symbol": symbol,
+            "Exchange": exchange,
+            "BidPrice": None,
+            "AskPrice": None,
+            "BidQty": None,
+            "AskQty": None,
+            "CurrentPrice": None,
+            "BidTimeNs": ts_ns,
+        }
+    )
+
+
 class LiveWebSocketTests(unittest.TestCase):
     def test_process_live_board_polls_traces_and_submits_entry(self) -> None:
         config = _config()
@@ -265,6 +280,23 @@ class LiveWebSocketTests(unittest.TestCase):
             [
                 _websocket_payload(now_ns, symbol="7203"),
                 _websocket_payload(now_ns + 1_000_000, symbol="9984"),
+            ]
+        )
+
+        ok, summary = perform_live_preflight(config, executor, websocket_factory=lambda *_args, **_kwargs: ws)
+
+        self.assertTrue(ok, summary)
+        self.assertEqual(summary["received_boards"], 1)
+        self.assertEqual(summary["ignored_boards"], 1)
+
+    def test_preflight_ignores_null_quote_boards_until_valid_quote(self) -> None:
+        config = _config(websocket_preflight_messages=1, websocket_preflight_timeout_s=1.0)
+        executor = FakeExecutor()
+        now_ns = time.time_ns()
+        ws = SequenceWebSocket(
+            [
+                _null_quote_websocket_payload(now_ns),
+                _websocket_payload(now_ns + 1_000_000),
             ]
         )
 
